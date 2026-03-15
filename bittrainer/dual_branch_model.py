@@ -6,9 +6,10 @@ import timm
 import torch
 import torch.nn as nn
 
+from bittrainer.model import _MODEL_REGISTRY
+
 
 class DualBranchConvNeXt(nn.Module):
-    """Two independent ConvNeXt V2 backbones with late fusion."""
 
     def __init__(
         self,
@@ -17,7 +18,9 @@ class DualBranchConvNeXt(nn.Module):
         drop_rate: float = 0.3,
     ):
         super().__init__()
-        model_name = f"convnextv2_{backbone_variant}"
+        model_name = _MODEL_REGISTRY.get(backbone_variant)
+        if model_name is None:
+            raise ValueError(f"Unknown backbone_variant '{backbone_variant}'. Valid: {list(_MODEL_REGISTRY.keys())}")
 
         self.crop_branch = timm.create_model(
             model_name, pretrained=True, num_classes=0,
@@ -61,7 +64,7 @@ class DualBranchConvNeXt(nn.Module):
 
     @classmethod
     def from_checkpoint(cls, path: str, device: torch.device | None = None) -> DualBranchConvNeXt:
-        checkpoint = torch.load(path, map_location=device or "cpu", weights_only=False)
+        checkpoint = torch.load(path, map_location=device or "cpu", weights_only=True)
         meta = checkpoint["metadata"]
         model = cls(
             backbone_variant=meta["backbone_variant"],

@@ -8,6 +8,8 @@ import torch
 from PIL import Image
 from torch.utils.data import Dataset
 
+_IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tiff"}
+
 
 class DualCropDataset(Dataset):
     def __init__(
@@ -33,7 +35,7 @@ class DualCropDataset(Dataset):
             if not crop_split_dir.exists():
                 continue
             for crop_path in sorted(crop_split_dir.iterdir()):
-                if not crop_path.is_file():
+                if not crop_path.is_file() or crop_path.suffix.lower() not in _IMAGE_EXTENSIONS:
                     continue
                 ctx_path = ctx_split_dir / crop_path.name
                 if not ctx_path.exists():
