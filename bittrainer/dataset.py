@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import json
+import logging
 import math
+import os
 import random
 from pathlib import Path
 from typing import Any
@@ -13,48 +16,43 @@ from torch.utils.data import Dataset, Sampler
 from torchvision import transforms
 from torchvision.transforms import functional as TF
 
+from bittrainer.image_cache import load_or_resize
 from bittrainer.image_utils import is_supported_image
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# Target size computation (0.512 MP, multiples of 32)
+# Fixed aspect ratio buckets (9 named ratios, ~0.512 MP, 32px-aligned)
 # ---------------------------------------------------------------------------
 
 _TARGET_PIXELS = 262_144  # 0.512 MP = 512*512
 
+ASPECT_RATIO_BUCKETS: list[tuple[int, int]] = [
+    (512, 512),   # 1:1
+    (576, 448),   # 4:3
+    (448, 576),   # 3:4
+    (672, 384),   # 16:9
+    (384, 672),   # 9:16
+    (736, 352),   # 2:1
+    (352, 736),   # 1:2
+    (800, 320),   # 21:9
+    (320, 800),   # 9:21
+]
 
-def compute_target_size(orig_w: int, orig_h: int) -> tuple[int, int]:
-    """Resize to ~0.512MP preserving aspect ratio, dims rounded to 32."""
-    aspect = orig_w / orig_h
-    # Solve: w * h = TARGET_PIXELS, w/h = aspect
-    h = math.sqrt(_TARGET_PIXELS / aspect)
-    w = h * aspect
-    w = max(32, round(w / 32) * 32)
-    h = max(32, round(h / 32) * 32)
-    return int(w), int(h)
-
-
-# ---------------------------------------------------------------------------
-# Aspect ratio buckets (32px increments around 512x512)
-# ---------------------------------------------------------------------------
-
-def _generate_buckets() -> list[tuple[int, int]]:
-    """Generate aspect ratio buckets at 32px increments, ~0.512MP each."""
-    buckets = []
-    for w in range(320, 832, 32):
-        for h in range(320, 832, 32):
-            pixel_count = w * h
-            if 0.7 * _TARGET_PIXELS <= pixel_count <= 1.3 * _TARGET_PIXELS:
-                buckets.append((w, h))
-    return sorted(set(buckets))
+_BUCKET_RATIOS: list[float] = [w / h for w, h in ASPECT_RATIO_BUCKETS]
 
 
-ASPECT_RATIO_BUCKETS: list[tuple[int, int]] = _generate_buckets()
-
-
-def find_nearest_bucket(w: int, h: int) -> tuple[int, int]:
-    """Find the bucket closest to the given dimensions."""
-    return min(ASPECT_RATIO_BUCKETS, key=lambda b: abs(b[0] - w) + abs(b[1] - h))
+def find_nearest_bucket(orig_w: int, orig_h: int) -> tuple[int, int]:
+    ratio = orig_w / orig_h
+    best_idx = 0
+    best_diff = abs(ratio - _BUCKET_RATIOS[0])
+    for i, br in enumerate(_BUCKET_RATIOS[1:], 1):
+        diff = abs(ratio - br)
+        if diff < best_diff:
+            best_diff = diff
+            best_idx = i
+    return ASPECT_RATIO_BUCKETS[best_idx]
 
 
 # ---------------------------------------------------------------------------
@@ -91,6 +89,106 @@ def get_heavy_augment_transform() -> transforms.Compose:
 
 
 # ---------------------------------------------------------------------------
+# Skin-normalised transform variants
+# ---------------------------------------------------------------------------
+
+def get_skin_normalised_train_transform() -> transforms.Compose:
+    from bittrainer.skin_normalise import SkinNormalise
+    return transforms.Compose([
+        SkinNormalise(),
+        transforms.RandomHorizontalFlip(p=0.5),
+        transforms.ColorJitter(brightness=0.1, contrast=0.1, saturation=0.1, hue=0.02),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+    ])
+
+
+def get_skin_normalised_val_transform() -> transforms.Compose:
+    from bittrainer.skin_normalise import SkinNormalise
+    return transforms.Compose([
+        SkinNormalise(),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+    ])
+
+
+def get_skin_normalised_heavy_augment_transform() -> transforms.Compose:
+    from bittrainer.skin_normalise import SkinNormalise
+    return transforms.Compose([
+        SkinNormalise(),
+        transforms.RandomHorizontalFlip(p=0.5),
+        transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.05),
+        transforms.RandomResizedCrop(size=(512, 512), scale=(0.8, 1.0), ratio=(0.9, 1.1)),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+    ])
+
+
+# ---------------------------------------------------------------------------
+# Image dimension cache (persisted to disk, keyed by path + mtime)
+# ---------------------------------------------------------------------------
+
+class _DimensionCache:
+    """Caches image (width, height) keyed by absolute path + mtime.
+
+    Persisted as a JSON file so subsequent training runs skip all
+    PIL.Image.open() calls during dataset init.
+    """
+
+    def __init__(self, cache_path: Path):
+        self._cache_path = cache_path
+        self._data: dict[str, tuple[float, int, int]] = {}  # path -> (mtime, w, h)
+        self._dirty = False
+        self._load()
+
+    def _load(self) -> None:
+        if self._cache_path.exists():
+            try:
+                raw = json.loads(self._cache_path.read_text(encoding="utf-8"))
+                self._data = {k: tuple(v) for k, v in raw.items()}
+            except (json.JSONDecodeError, OSError, ValueError):
+                logger.warning("Corrupt dimension cache, rebuilding")
+                self._data = {}
+
+    def get(self, path: Path | str) -> tuple[int, int] | None:
+        """Return cached (w, h) if fresh, else None."""
+        key = str(path)
+        entry = self._data.get(key)
+        if entry is None:
+            return None
+        cached_mtime, w, h = entry
+        try:
+            current_mtime = os.path.getmtime(key)
+        except OSError:
+            return None
+        if abs(current_mtime - cached_mtime) > 0.01:
+            return None
+        return (w, h)
+
+    def put(self, path: Path | str, w: int, h: int) -> None:
+        key = str(path)
+        try:
+            mtime = os.path.getmtime(key)
+        except OSError:
+            return
+        self._data[key] = (mtime, w, h)
+        self._dirty = True
+
+    def flush(self) -> None:
+        if not self._dirty:
+            return
+        try:
+            self._cache_path.parent.mkdir(parents=True, exist_ok=True)
+            self._cache_path.write_text(
+                json.dumps(self._data, separators=(",", ":")),
+                encoding="utf-8",
+            )
+            self._dirty = False
+        except OSError:
+            logger.warning("Failed to write dimension cache", exc_info=True)
+
+
+# ---------------------------------------------------------------------------
 # Dataset
 # ---------------------------------------------------------------------------
 
@@ -117,6 +215,7 @@ class ConceptDataset(Dataset):
         neg_pos_ratio: float = 1.0,
         transform: Any | None = None,
         extra_positive_dirs: list[str] | None = None,
+        dim_cache: _DimensionCache | None = None,
     ):
         self.concept_folder = Path(concept_folder)
         self.split = split
@@ -135,22 +234,42 @@ class ConceptDataset(Dataset):
                     if p.is_file() and is_supported_image(p)
                 )
 
+        # Disk cache for resized images (survives across training runs)
+        self._cache_dir = self.concept_folder / ".resize_cache"
+
+        # Shared dimension cache (avoids 30k+ PIL opens during init)
+        self._dim_cache = dim_cache or _DimensionCache(self._cache_dir / "dimensions.json")
+
+        # Pre-compute bucket info for ALL known paths (once)
+        self._path_info: dict[str, dict] = {}
+        self._precompute_path_info(self._positive_paths, label=1)
+        self._precompute_path_info(self._all_negative_paths, label=0)
+        self._dim_cache.flush()
+
         # Build initial sample list
         self.samples: list[dict] = []
         self._build_samples()
 
+    def _precompute_path_info(self, paths: list[Path], label: int) -> None:
+        """Read dimensions for a list of paths, using the cache."""
+        for p in paths:
+            key = str(p)
+            if key in self._path_info:
+                continue
+            dims = self._dim_cache.get(p)
+            if dims is None:
+                dims = self._read_image_size(p)
+                self._dim_cache.put(p, dims[0], dims[1])
+            bucket = find_nearest_bucket(dims[0], dims[1])
+            self._path_info[key] = {
+                "path": key, "label": label,
+                "bucket": bucket,
+            }
+
     def _build_samples(self) -> None:
         """Build the sample list: all positives + sampled negatives."""
-        self.samples = []
+        self.samples = [self._path_info[str(p)] for p in self._positive_paths]
 
-        # All positives
-        for p in self._positive_paths:
-            w, h = self._get_image_size(p)
-            tw, th = compute_target_size(w, h)
-            bucket = find_nearest_bucket(tw, th)
-            self.samples.append({"path": str(p), "label": 1, "target_size": (tw, th), "bucket": bucket})
-
-        # Negatives: for train, sample at ratio; for val, use all
         if self.split == "val":
             neg_paths = self._all_negative_paths
         else:
@@ -158,13 +277,12 @@ class ConceptDataset(Dataset):
                 len(self._all_negative_paths),
                 max(1, round(len(self._positive_paths) * self.neg_pos_ratio)),
             )
-            neg_paths = random.sample(self._all_negative_paths, min(num_neg, len(self._all_negative_paths)))
+            neg_paths = random.sample(
+                self._all_negative_paths,
+                min(num_neg, len(self._all_negative_paths)),
+            )
 
-        for p in neg_paths:
-            w, h = self._get_image_size(p)
-            tw, th = compute_target_size(w, h)
-            bucket = find_nearest_bucket(tw, th)
-            self.samples.append({"path": str(p), "label": 0, "target_size": (tw, th), "bucket": bucket})
+        self.samples.extend(self._path_info[str(p)] for p in neg_paths)
 
     def reshuffle_negatives(self) -> None:
         """Re-randomise the negative subset (call once per epoch)."""
@@ -173,7 +291,7 @@ class ConceptDataset(Dataset):
         self._build_samples()
 
     @staticmethod
-    def _get_image_size(path: Path | str) -> tuple[int, int]:
+    def _read_image_size(path: Path | str) -> tuple[int, int]:
         """Get image dimensions without fully loading pixel data."""
         with Image.open(path) as img:
             return img.size  # (width, height)
@@ -183,16 +301,15 @@ class ConceptDataset(Dataset):
 
     def __getitem__(self, idx: int) -> tuple[torch.Tensor, int, tuple[int, int]]:
         sample = self.samples[idx]
-        img = Image.open(sample["path"]).convert("RGB")
-        tw, th = sample["target_size"]
-        img = img.resize((tw, th), Image.LANCZOS)
+        bucket = sample["bucket"]
+        img = load_or_resize(sample["path"], bucket, self._cache_dir)
 
         if self.transform is not None:
             img = self.transform(img)
         else:
             img = TF.to_tensor(img)
 
-        return img, sample["label"], sample["bucket"]
+        return img, sample["label"], bucket
 
 
 # ---------------------------------------------------------------------------
