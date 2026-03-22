@@ -26,8 +26,6 @@ logger = logging.getLogger(__name__)
 # Fixed aspect ratio buckets (9 named ratios, ~0.512 MP, 32px-aligned)
 # ---------------------------------------------------------------------------
 
-_TARGET_PIXELS = 262_144  # 0.512 MP = 512*512
-
 ASPECT_RATIO_BUCKETS: list[tuple[int, int]] = [
     (512, 512),   # 1:1
     (576, 448),   # 4:3

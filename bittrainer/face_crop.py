@@ -146,11 +146,11 @@ def face_aware_crop(
 
     if target_ratio > img_ratio:
         # Crop height (image is too tall)
-        new_h = int(img_w / target_ratio)
+        new_h = max(1, int(img_w / target_ratio))
         new_w = img_w
     else:
         # Crop width (image is too wide)
-        new_w = int(img_h * target_ratio)
+        new_w = max(1, int(img_h * target_ratio))
         new_h = img_h
 
     if face_bbox and len(face_bbox) == 4:

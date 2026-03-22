@@ -50,10 +50,16 @@ def probe_vram_batch_size(
 
     The model must already be on the target device.
     """
+    if device.type != "cuda":
+        logger.info("VRAM probe skipped (device=%s), defaulting to 32", device)
+        return 32
+
     total_vram = torch.cuda.get_device_properties(device).total_mem
     target_usage = int(total_vram * fraction)
 
     w, h = largest_bucket
+    was_training = model.training
+    model.eval()
 
     low, high, best = 1, 512, 4
     while low <= high:
@@ -77,10 +83,12 @@ def probe_vram_batch_size(
             torch.cuda.empty_cache()
             high = mid - 1
 
+    if was_training:
+        model.train()
+
     logger.info(
-        "VRAM probe: best=%d at %dx%d (%.1f/%.1f GB, %.0f%% target)",
+        "VRAM probe: best=%d at %dx%d (%.1f GB total, %.0f%% target)",
         best, w, h,
-        torch.cuda.max_memory_allocated(device) / 1e9,
         total_vram / 1e9,
         fraction * 100,
     )

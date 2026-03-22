@@ -166,32 +166,37 @@ def run_dual_branch_training(
         ).to(device)
 
     # --- Auto batch sizing (VRAM probe for dual-branch) ---
-    total_vram = torch.cuda.get_device_properties(device).total_mem
-    target_usage = int(total_vram * 0.75)
+    if device.type != "cuda":
+        eff_bs = 32
+    else:
+        total_vram = torch.cuda.get_device_properties(device).total_mem
+        target_usage = int(total_vram * 0.75)
 
-    low, high, best = 1, 256, 4
-    while low <= high:
-        mid = (low + high) // 2
-        try:
-            torch.cuda.reset_peak_memory_stats(device)
-            dummy_crop = torch.randn(mid, 3, 512, 512, device=device, dtype=dtype)
-            dummy_ctx = torch.randn(mid, 3, 512, 512, device=device, dtype=dtype)
-            with torch.no_grad():
-                with torch.amp.autocast(device_type=device.type, dtype=dtype, enabled=(dtype != torch.float32)):
-                    _ = model(dummy_crop, dummy_ctx)
-            peak = torch.cuda.max_memory_allocated(device)
-            del dummy_crop, dummy_ctx
-            torch.cuda.empty_cache()
-            if peak <= target_usage:
-                best = mid
-                low = mid + 1
-            else:
+        model.eval()
+        low, high, best = 1, 256, 4
+        while low <= high:
+            mid = (low + high) // 2
+            try:
+                torch.cuda.reset_peak_memory_stats(device)
+                dummy_crop = torch.randn(mid, 3, 512, 512, device=device, dtype=dtype)
+                dummy_ctx = torch.randn(mid, 3, 512, 512, device=device, dtype=dtype)
+                with torch.no_grad():
+                    with torch.amp.autocast(device_type=device.type, dtype=dtype, enabled=(dtype != torch.float32)):
+                        _ = model(dummy_crop, dummy_ctx)
+                peak = torch.cuda.max_memory_allocated(device)
+                del dummy_crop, dummy_ctx
+                torch.cuda.empty_cache()
+                if peak <= target_usage:
+                    best = mid
+                    low = mid + 1
+                else:
+                    high = mid - 1
+            except RuntimeError:
+                torch.cuda.empty_cache()
                 high = mid - 1
-        except RuntimeError:
-            torch.cuda.empty_cache()
-            high = mid - 1
+        model.train()
 
-    eff_bs = max(4, best)
+        eff_bs = max(4, best)
     cb({"type": "autobatch", "batch_size": eff_bs})
 
     optimizer = Prodigy_adv(
