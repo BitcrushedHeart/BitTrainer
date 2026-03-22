@@ -46,12 +46,14 @@ class GroupDataset(Dataset):
         *,
         transform: Any | None = None,
         multi_label: bool = False,
+        face_bboxes: dict[str, list[int]] | None = None,
     ):
         self.group_folder = Path(group_folder)
         self.class_names = class_names
         self.split = split
         self.transform = transform
         self.multi_label = multi_label
+        self._face_bboxes: dict[str, list[int]] = face_bboxes or {}
 
         # Gather images per class (index = class_index)
         self._class_paths: list[list[Path]] = []
@@ -155,7 +157,8 @@ class GroupDataset(Dataset):
     def __getitem__(self, idx: int) -> tuple[torch.Tensor, int | torch.Tensor, tuple[int, int]]:
         sample = self.samples[idx]
         bucket = sample["bucket"]
-        img = load_or_resize(sample["path"], bucket, self._cache_dir)
+        face_bbox = self._face_bboxes.get(sample["path"])
+        img = load_or_resize(sample["path"], bucket, self._cache_dir, face_bbox=face_bbox)
 
         if self.transform is not None:
             img = self.transform(img)

@@ -216,11 +216,13 @@ class ConceptDataset(Dataset):
         transform: Any | None = None,
         extra_positive_dirs: list[str] | None = None,
         dim_cache: _DimensionCache | None = None,
+        face_bboxes: dict[str, list[int]] | None = None,
     ):
         self.concept_folder = Path(concept_folder)
         self.split = split
         self.neg_pos_ratio = neg_pos_ratio
         self.transform = transform
+        self._face_bboxes: dict[str, list[int]] = face_bboxes or {}
 
         # Gather all available images
         self._positive_paths = _list_split_images(self.concept_folder, "positive", split)
@@ -302,7 +304,8 @@ class ConceptDataset(Dataset):
     def __getitem__(self, idx: int) -> tuple[torch.Tensor, int, tuple[int, int]]:
         sample = self.samples[idx]
         bucket = sample["bucket"]
-        img = load_or_resize(sample["path"], bucket, self._cache_dir)
+        face_bbox = self._face_bboxes.get(sample["path"])
+        img = load_or_resize(sample["path"], bucket, self._cache_dir, face_bbox=face_bbox)
 
         if self.transform is not None:
             img = self.transform(img)
