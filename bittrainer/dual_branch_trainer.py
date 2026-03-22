@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
@@ -28,12 +28,13 @@ class DualBranchTrainConfig:
     classifier_mode: str = "dual_branch"
     max_epochs: int = 50
     patience: int = 3
-    batch_size: int = 32
     backbone_variant: str = "nano"
     label_smoothing: float = 0.1
     device: str = "cuda"
     dtype: str = "bfloat16"
     from_scratch: bool = False
+    best_model_name: str = "best.pt"
+    checkpoint_dir: str | None = None
     progress_callback: Callable[[dict], None] | None = None
 
 
@@ -48,11 +49,6 @@ def _collate_dual(batch: list) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor
     return crops, contexts, labels
 
 
-def _compute_effective_batch_size(requested: int, total_samples: int) -> int:
-    cap = max(4, int(total_samples * 0.1))
-    return max(4, min(requested, cap))
-
-
 def _train_one_epoch(
     model: DualBranchConvNeXt,
     dataloader: DataLoader,
@@ -61,7 +57,6 @@ def _train_one_epoch(
     device: torch.device,
     dtype: torch.dtype,
     label_smoothing: float,
-    grad_accum_steps: int = 1,
 ) -> float:
     model.train()
     total_loss = 0.0
@@ -69,7 +64,7 @@ def _train_one_epoch(
     criterion = nn.CrossEntropyLoss(label_smoothing=label_smoothing)
 
     optimizer.zero_grad()
-    for step, (crops, contexts, labels) in enumerate(dataloader):
+    for crops, contexts, labels in dataloader:
         crops = crops.to(device=device, dtype=dtype)
         contexts = contexts.to(device=device, dtype=dtype)
         labels = labels.to(device=device)
@@ -77,15 +72,12 @@ def _train_one_epoch(
         with torch.amp.autocast(device_type=device.type, dtype=dtype, enabled=(dtype != torch.float32)):
             logits = model(crops, contexts)
             loss = criterion(logits, labels)
-            loss = loss / grad_accum_steps
 
         loss.backward()
+        optimizer.step()
+        optimizer.zero_grad()
 
-        if (step + 1) % grad_accum_steps == 0 or (step + 1) == len(dataloader):
-            optimizer.step()
-            optimizer.zero_grad()
-
-        total_loss += loss.item() * grad_accum_steps
+        total_loss += loss.item()
         num_batches += 1
 
     return total_loss / max(num_batches, 1)
@@ -136,7 +128,7 @@ def run_dual_branch_training(
     dtype = _get_dtype(config.dtype)
     crops_folder = Path(config.group_folder)
     context_folder = Path(config.context_folder)
-    checkpoint_dir = crops_folder / "checkpoints"
+    checkpoint_dir = Path(config.checkpoint_dir) if config.checkpoint_dir else crops_folder / "checkpoints"
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
     train_transform = get_train_transform()
@@ -155,11 +147,8 @@ def run_dual_branch_training(
     if total_samples == 0:
         raise RuntimeError("No training image pairs found")
 
-    eff_bs = _compute_effective_batch_size(config.batch_size, total_samples)
-    grad_accum = max(1, config.batch_size // eff_bs) if eff_bs < config.batch_size else 1
-
     # Build model — warm-start from existing checkpoint if available
-    existing_best = checkpoint_dir / "best.pt"
+    existing_best = checkpoint_dir / config.best_model_name
     if not config.from_scratch and existing_best.exists():
         try:
             model = DualBranchConvNeXt.from_checkpoint(str(existing_best), device=device)
@@ -175,6 +164,35 @@ def run_dual_branch_training(
             backbone_variant=config.backbone_variant,
             num_classes=config.num_classes,
         ).to(device)
+
+    # --- Auto batch sizing (VRAM probe for dual-branch) ---
+    total_vram = torch.cuda.get_device_properties(device).total_mem
+    target_usage = int(total_vram * 0.75)
+
+    low, high, best = 1, 256, 4
+    while low <= high:
+        mid = (low + high) // 2
+        try:
+            torch.cuda.reset_peak_memory_stats(device)
+            dummy_crop = torch.randn(mid, 3, 512, 512, device=device, dtype=dtype)
+            dummy_ctx = torch.randn(mid, 3, 512, 512, device=device, dtype=dtype)
+            with torch.no_grad():
+                with torch.amp.autocast(device_type=device.type, dtype=dtype, enabled=(dtype != torch.float32)):
+                    _ = model(dummy_crop, dummy_ctx)
+            peak = torch.cuda.max_memory_allocated(device)
+            del dummy_crop, dummy_ctx
+            torch.cuda.empty_cache()
+            if peak <= target_usage:
+                best = mid
+                low = mid + 1
+            else:
+                high = mid - 1
+        except RuntimeError:
+            torch.cuda.empty_cache()
+            high = mid - 1
+
+    eff_bs = max(4, best)
+    cb({"type": "autobatch", "batch_size": eff_bs})
 
     optimizer = Prodigy_adv(
         model.parameters(), lr=1.0, d_coef=0.9,
@@ -205,7 +223,6 @@ def run_dual_branch_training(
         train_loss = _train_one_epoch(
             model, train_loader, optimizer, config.num_classes,
             device, dtype, config.label_smoothing,
-            grad_accum_steps=grad_accum,
         )
         scheduler.step()
 
