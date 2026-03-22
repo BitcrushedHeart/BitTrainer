@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable
+from typing import Callable
 
 import torch
 import torch.nn as nn
@@ -15,8 +15,12 @@ from torch.utils.data import DataLoader
 
 from bittrainer.dataset import (
     ConceptDataset,
+    _DimensionCache,
     build_bucket_batch_sampler,
     get_heavy_augment_transform,
+    get_skin_normalised_heavy_augment_transform,
+    get_skin_normalised_train_transform,
+    get_skin_normalised_val_transform,
     get_train_transform,
     get_val_transform,
 )
@@ -40,20 +44,17 @@ class TrainConfig:
     concept_folder: str
     max_epochs: int = 50
     patience: int = 3
-    batch_size: int = 32
     neg_pos_ratio: float = 1.0
     model_size: str = "nano"
     device: str = "cuda"
     dtype: str = "bfloat16"
     from_scratch: bool = False
     extra_positive_dirs: list[str] = field(default_factory=list)
+    best_model_name: str = "best.pt"
+    checkpoint_dir: str | None = None
+    skin_normalise: bool = False
+    face_model_path: str = ""
     progress_callback: Callable[[dict], None] | None = None
-
-
-def compute_effective_batch_size(requested: int, total_samples: int) -> int:
-    """Cap batch size at 10% of total samples, floor of 4."""
-    cap = max(4, int(total_samples * 0.1))
-    return max(4, min(requested, cap))
 
 
 def _get_dtype(name: str) -> torch.dtype:
@@ -78,31 +79,25 @@ def train_one_epoch(
     criterion: nn.Module,
     device: torch.device,
     dtype: torch.dtype,
-    *,
-    grad_accum_steps: int = 1,
 ) -> float:
-    """Train for one epoch. Returns average loss."""
     model.train()
     total_loss = 0.0
     num_batches = 0
 
     optimizer.zero_grad()
-    for step, (images, labels) in enumerate(dataloader):
+    for images, labels in dataloader:
         images = images.to(device, dtype=dtype)
         labels = labels.to(device)
 
         with torch.amp.autocast(device_type=device.type, dtype=dtype, enabled=(dtype != torch.float32)):
             logits = model(images)
             loss = criterion(logits, labels)
-            loss = loss / grad_accum_steps
 
         loss.backward()
+        optimizer.step()
+        optimizer.zero_grad()
 
-        if (step + 1) % grad_accum_steps == 0 or (step + 1) == len(dataloader):
-            optimizer.step()
-            optimizer.zero_grad()
-
-        total_loss += loss.item() * grad_accum_steps
+        total_loss += loss.item()
         num_batches += 1
 
     return total_loss / max(num_batches, 1)
@@ -144,6 +139,45 @@ def evaluate(
     }
 
 
+def _rebalance_val_negatives(train_ds: ConceptDataset, val_ds: ConceptDataset) -> None:
+    """Ensure the val set has enough negatives for meaningful evaluation.
+
+    Target: at least as many negatives as positives in val.
+    Cap: never take more than 40% of total negatives (training still needs them).
+    """
+    val_pos = len(val_ds._positive_paths)
+    val_neg = len(val_ds._all_negative_paths)
+    target = max(5, val_pos)
+
+    if val_neg >= target:
+        return
+
+    needed = target - val_neg
+    total_neg = len(train_ds._all_negative_paths) + val_neg
+    max_donate = max(0, int(total_neg * 0.4) - val_neg)
+    to_donate = min(needed, max_donate, len(train_ds._all_negative_paths))
+
+    if to_donate <= 0:
+        return
+
+    donated = train_ds._all_negative_paths[:to_donate]
+    train_ds._all_negative_paths = train_ds._all_negative_paths[to_donate:]
+    val_ds._all_negative_paths = val_ds._all_negative_paths + donated
+
+    # Ensure val_ds has bucket info for donated paths (they were precomputed by train_ds)
+    val_ds._path_info.update(
+        {str(p): train_ds._path_info[str(p)] for p in donated if str(p) in train_ds._path_info}
+    )
+
+    train_ds._build_samples()
+    val_ds._build_samples()
+
+    logger.info(
+        "Rebalanced val set: donated %d negatives from train → val (val now %d neg / %d pos)",
+        to_donate, len(val_ds._all_negative_paths), val_pos,
+    )
+
+
 def run_training(
     config: TrainConfig,
     *,
@@ -154,35 +188,67 @@ def run_training(
     device = torch.device(config.device)
     dtype = _get_dtype(config.dtype)
     concept_folder = Path(config.concept_folder)
-    checkpoint_dir = concept_folder / "checkpoints"
+    checkpoint_dir = Path(config.checkpoint_dir) if config.checkpoint_dir else concept_folder / "checkpoints"
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
+    # Shared dimension cache — avoids reading image headers twice
+    cache_dir = concept_folder / ".resize_cache"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    dim_cache = _DimensionCache(cache_dir / "dimensions.json")
+
     # Build datasets
+    train_transform = get_skin_normalised_train_transform() if config.skin_normalise else get_train_transform()
     train_ds = ConceptDataset(
         concept_folder, split="train",
         neg_pos_ratio=config.neg_pos_ratio,
-        transform=get_train_transform(),
+        transform=train_transform,
         extra_positive_dirs=config.extra_positive_dirs,
+        dim_cache=dim_cache,
     )
     # Apply heavy augmentation if negatives < positives
     if len(train_ds._all_negative_paths) < len(train_ds._positive_paths):
-        train_ds.transform = get_heavy_augment_transform()
+        train_ds.transform = (
+            get_skin_normalised_heavy_augment_transform() if config.skin_normalise
+            else get_heavy_augment_transform()
+        )
 
+    val_transform = get_skin_normalised_val_transform() if config.skin_normalise else get_val_transform()
     val_ds = ConceptDataset(
         concept_folder, split="val",
-        transform=get_val_transform(),
+        transform=val_transform,
         extra_positive_dirs=config.extra_positive_dirs,
+        dim_cache=dim_cache,
     )
 
-    num_positives = len(train_ds._positive_paths)
-    total_samples = len(train_ds)
+    _rebalance_val_negatives(train_ds, val_ds)
 
-    # Effective batch size
-    eff_bs = compute_effective_batch_size(config.batch_size, total_samples)
-    grad_accum = max(1, config.batch_size // eff_bs) if eff_bs < config.batch_size else 1
+    num_positives = len(train_ds._positive_paths)
+
+    # --- Face-aware cropping pre-computation ---
+    face_bboxes: dict[str, list[int]] = {}
+    if config.face_model_path:
+        from bittrainer.face_crop import FaceBBoxCache, precompute_face_bboxes
+        face_cache = FaceBBoxCache(cache_dir / "face_bboxes.json")
+        all_image_paths = [s["path"] for s in train_ds.samples] + [s["path"] for s in val_ds.samples]
+        precompute_face_bboxes(
+            all_image_paths, face_cache, config.face_model_path,
+            device=config.device,
+        )
+        for p in all_image_paths:
+            bbox = face_cache.get(p)
+            if bbox:
+                face_bboxes[p] = bbox
+        train_ds._face_bboxes = face_bboxes
+        val_ds._face_bboxes = face_bboxes
+
+    # --- Count samples per bucket ---
+    bucket_counts: dict[tuple[int, int], int] = {}
+    for s in train_ds.samples:
+        b = s["bucket"]
+        bucket_counts[b] = bucket_counts.get(b, 0) + 1
 
     # Create model — warm-start from best.pt unless from_scratch is set
-    existing_best = checkpoint_dir / "best.pt"
+    existing_best = checkpoint_dir / config.best_model_name
     if not config.from_scratch and existing_best.exists():
         try:
             model = load_checkpoint(
@@ -197,6 +263,11 @@ def run_training(
         model = create_model(model_size=config.model_size, pretrained=True, dtype=dtype).to(device)
     freeze_backbone(model)
     use_gradual_unfreeze = num_positives < 50
+
+    from bittrainer.autobatch import determine_batch_size
+    auto_result = determine_batch_size(model, bucket_counts, device, dtype=dtype)
+    eff_bs = auto_result["batch_size"]
+    cb({"type": "autobatch", **auto_result})
 
     # Optimiser: Prodigy_adv with kourkoutas beta and cautious weight decay
     optimizer = Prodigy_adv(
@@ -221,6 +292,23 @@ def run_training(
     best_checkpoint_path = None
     best_metrics: dict = {}
 
+    # Create DataLoaders ONCE — BucketBatchSampler reads dataset.samples
+    # live in __iter__, so reshuffle_negatives() is picked up automatically.
+    # Avoids respawning worker processes every epoch (very expensive on Windows).
+    _use_workers = 4
+    train_sampler = build_bucket_batch_sampler(train_ds, batch_size=eff_bs)
+    train_loader = DataLoader(
+        train_ds, batch_sampler=train_sampler, collate_fn=_collate_bucket_batch,
+        num_workers=_use_workers, pin_memory=(device.type == "cuda"),
+        persistent_workers=(_use_workers > 0), prefetch_factor=3,
+    )
+    val_sampler = build_bucket_batch_sampler(val_ds, batch_size=eff_bs)
+    val_loader = DataLoader(
+        val_ds, batch_sampler=val_sampler, collate_fn=_collate_bucket_batch,
+        num_workers=_use_workers, pin_memory=(device.type == "cuda"),
+        persistent_workers=(_use_workers > 0), prefetch_factor=3,
+    )
+
     for epoch in range(config.max_epochs):
         # Unfreezing logic
         if epoch == 1:
@@ -243,25 +331,12 @@ def run_training(
             if 0 <= stage_idx < _NUM_STAGES:
                 unfreeze_stage(model, stage_idx)
 
-        # Reshuffle negatives each epoch
+        # Reshuffle negatives each epoch (sampler picks this up via __iter__)
         train_ds.reshuffle_negatives()
-
-        # Build dataloaders with bucket sampling
-        train_sampler = build_bucket_batch_sampler(train_ds, batch_size=eff_bs)
-        train_loader = DataLoader(
-            train_ds, batch_sampler=train_sampler, collate_fn=_collate_bucket_batch,
-            num_workers=0, pin_memory=(device.type == "cuda"),
-        )
-        val_sampler = build_bucket_batch_sampler(val_ds, batch_size=eff_bs)
-        val_loader = DataLoader(
-            val_ds, batch_sampler=val_sampler, collate_fn=_collate_bucket_batch,
-            num_workers=0, pin_memory=(device.type == "cuda"),
-        )
 
         # Train
         train_loss = train_one_epoch(
             model, train_loader, optimizer, criterion, device, dtype,
-            grad_accum_steps=grad_accum,
         )
         scheduler.step()
 
@@ -309,7 +384,7 @@ def run_training(
     # Compare candidate checkpoint against existing best.pt on the CURRENT val set.
     # This ensures a fair apples-to-apples comparison even when the val set has
     # changed between training runs.
-    existing_best = checkpoint_dir / "best.pt"
+    existing_best = checkpoint_dir / config.best_model_name
     optimal_threshold = 0.5
 
     if best_checkpoint_path:
