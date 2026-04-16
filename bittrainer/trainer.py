@@ -338,22 +338,32 @@ def run_training(
 
     # DataLoaders with num_workers=0 — tensor cache makes CPU workers unnecessary.
     # Images load as uint8 from disk cache; normalize + augment on GPU.
-    train_sampler = build_bucket_batch_sampler(train_ds, batch_size=eff_bs)
-    train_loader = DataLoader(
-        train_ds, batch_sampler=train_sampler, collate_fn=_collate_bucket_batch,
-        num_workers=0, pin_memory=False,
-    )
     val_sampler = build_bucket_batch_sampler(val_ds, batch_size=eff_bs)
     val_loader = DataLoader(
         val_ds, batch_sampler=val_sampler, collate_fn=_collate_bucket_batch,
         num_workers=0, pin_memory=False,
     )
 
+    def _rebuild_train_loader() -> DataLoader:
+        sampler = build_bucket_batch_sampler(train_ds, batch_size=eff_bs)
+        return DataLoader(
+            train_ds, batch_sampler=sampler, collate_fn=_collate_bucket_batch,
+            num_workers=0, pin_memory=False,
+        )
+
+    train_loader = _rebuild_train_loader()
+
     for epoch in range(config.max_epochs):
         if stop_event is not None and stop_event.is_set():
             logger.info("Graceful stop requested after epoch %d — running final comparison", epoch)
             cb({"type": "graceful_stop", "epoch": epoch, "max_epochs": config.max_epochs})
             break
+
+        # Resample cross-concept negatives so the model sees different
+        # negatives each epoch (no-op for legacy per-concept negatives)
+        if epoch > 0:
+            train_ds.resample_negatives()
+            train_loader = _rebuild_train_loader()
 
         # Unfreezing logic
         if epoch == 1:

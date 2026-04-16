@@ -191,8 +191,16 @@ class _DimensionCache:
 # ---------------------------------------------------------------------------
 
 def _list_split_images(folder: Path, label: str, split: str) -> list[Path]:
-    """List image files in folder/{label}/{split}/."""
+    """List image files in folder/{label}/{split}/ (legacy layout)."""
     d = folder / label / split
+    if not d.is_dir():
+        return []
+    return sorted(f for f in d.iterdir() if f.is_file() and is_supported_image(f))
+
+
+def _list_split_images_flat(folder: Path, split: str) -> list[Path]:
+    """List image files in folder/{split}/ (new flat layout)."""
+    d = folder / split
     if not d.is_dir():
         return []
     return sorted(f for f in d.iterdir() if f.is_file() and is_supported_image(f))
@@ -201,8 +209,19 @@ def _list_split_images(folder: Path, label: str, split: str) -> list[Path]:
 class ConceptDataset(Dataset):
     """Dataset for a single concept's training or validation split.
 
-    For training: uses all positives + random negative subset (reshuffled per epoch).
-    For validation: uses all images.
+    Supports two layouts:
+    - **Flat** (new): ``concept_folder/{split}/`` for positives,
+      ``negative_dirs`` for cross-concept negatives.
+    - **Legacy**: ``concept_folder/positive/{split}/`` and
+      ``concept_folder/negative/{split}/``.
+
+    When ``negative_dirs`` is provided, negatives are randomly resampled
+    each epoch via ``resample_negatives()`` so the model sees different
+    negatives every pass — prevents overfitting on a fixed negative set.
+
+    When ``use_tensor_cache=True``, images are pre-cached as uint8 CHW
+    raw bytes on disk.  ``__getitem__`` returns uint8 tensors (no
+    transform applied) — augmentation is handled on GPU by the caller.
     """
 
     def __init__(
@@ -213,26 +232,51 @@ class ConceptDataset(Dataset):
         neg_pos_ratio: float = 1.0,
         transform: Any | None = None,
         extra_positive_dirs: list[str] | None = None,
+        negative_dirs: list[str] | None = None,
         dim_cache: _DimensionCache | None = None,
         face_bboxes: dict[str, list[int]] | None = None,
+        use_tensor_cache: bool = False,
+        skin_normalise: bool = False,
+        cache_progress_fn: Any | None = None,
     ):
         self.concept_folder = Path(concept_folder)
         self.split = split
-        self.neg_pos_ratio = neg_pos_ratio
         self.transform = transform
         self._face_bboxes: dict[str, list[int]] = face_bboxes or {}
+        self._use_tensor_cache = use_tensor_cache
+        self._skin_normalise = skin_normalise
+        self._neg_pos_ratio = neg_pos_ratio
+        self._has_cross_concept_negatives = bool(negative_dirs)
 
-        # Gather all available images
-        self._positive_paths = _list_split_images(self.concept_folder, "positive", split)
-        self._all_negative_paths = _list_split_images(self.concept_folder, "negative", split)
+        # Positives: flat layout first, fall back to legacy
+        self._positive_paths = _list_split_images_flat(self.concept_folder, split)
+        if not self._positive_paths:
+            self._positive_paths = _list_split_images(self.concept_folder, "positive", split)
 
+        # Extra positive dirs (child concepts)
         for extra_dir in (extra_positive_dirs or []):
-            extra_split_dir = Path(extra_dir) / "positive" / split
-            if extra_split_dir.is_dir():
-                self._positive_paths.extend(
-                    p for p in sorted(extra_split_dir.iterdir())
-                    if p.is_file() and is_supported_image(p)
-                )
+            extra_folder = Path(extra_dir)
+            extra_paths = _list_split_images_flat(extra_folder, split)
+            if not extra_paths:
+                extra_paths = _list_split_images(extra_folder, "positive", split)
+            self._positive_paths.extend(extra_paths)
+
+        # Negatives: cross-concept dirs or legacy per-concept folder
+        self._all_negative_paths: list[Path] = []
+        self._negative_tensor_cache_dirs: list[Path] = []
+        if negative_dirs:
+            for neg_dir in negative_dirs:
+                neg_folder = Path(neg_dir)
+                paths = _list_split_images_flat(neg_folder, split)
+                if not paths:
+                    paths = _list_split_images(neg_folder, "positive", split)
+                self._all_negative_paths.extend(paths)
+                # Track tensor cache dirs for cross-concept cache reuse
+                tc_dir = neg_folder / ".tensor_cache"
+                if tc_dir.is_dir():
+                    self._negative_tensor_cache_dirs.append(tc_dir)
+        else:
+            self._all_negative_paths = _list_split_images(self.concept_folder, "negative", split)
 
         # Disk cache for resized images (survives across training runs)
         self._cache_dir = self.concept_folder / ".resize_cache"
@@ -246,9 +290,22 @@ class ConceptDataset(Dataset):
         self._precompute_path_info(self._all_negative_paths, label=0)
         self._dim_cache.flush()
 
-        # Build initial sample list
+        # Build initial sample list (with ratio-capped negatives)
         self.samples: list[dict] = []
         self._build_samples()
+
+        # Build tensor cache if requested
+        if self._use_tensor_cache:
+            from bittrainer.tensor_cache import build_tensor_cache
+            self._tensor_cache_dir = self.concept_folder / ".tensor_cache"
+            build_tensor_cache(
+                self.samples,
+                self._tensor_cache_dir,
+                self._cache_dir,
+                self._skin_normalise,
+                self._face_bboxes,
+                progress_fn=cache_progress_fn,
+            )
 
     def _precompute_path_info(self, paths: list[Path], label: int) -> None:
         """Read dimensions for a list of paths, using the cache."""
@@ -267,26 +324,26 @@ class ConceptDataset(Dataset):
             }
 
     def _build_samples(self) -> None:
-        """Build the sample list: all positives + sampled negatives."""
+        """Build the sample list: all positives + ratio-capped negatives."""
         self.samples = [self._path_info[str(p)] for p in self._positive_paths]
 
-        if self.split == "val":
-            neg_paths = self._all_negative_paths
-        else:
-            num_neg = min(
-                len(self._all_negative_paths),
-                max(1, round(len(self._positive_paths) * self.neg_pos_ratio)),
-            )
-            neg_paths = random.sample(
-                self._all_negative_paths,
-                min(num_neg, len(self._all_negative_paths)),
-            )
+        neg_samples = [self._path_info[str(p)] for p in self._all_negative_paths]
 
-        self.samples.extend(self._path_info[str(p)] for p in neg_paths)
+        # Cap negatives by ratio
+        num_pos = len(self._positive_paths)
+        max_neg = int(num_pos * self._neg_pos_ratio) if self._neg_pos_ratio > 0 else len(neg_samples)
+        if len(neg_samples) > max_neg:
+            neg_samples = random.sample(neg_samples, max_neg)
 
-    def reshuffle_negatives(self) -> None:
-        """Re-randomise the negative subset (call once per epoch)."""
-        if self.split != "train":
+        self.samples.extend(neg_samples)
+
+    def resample_negatives(self) -> None:
+        """Re-roll which negatives are included (cross-concept mode).
+
+        Called between epochs so the model sees a different random subset
+        of negatives each pass. No-op when using legacy per-concept negatives.
+        """
+        if not self._has_cross_concept_negatives:
             return
         self._build_samples()
 
@@ -302,6 +359,25 @@ class ConceptDataset(Dataset):
     def __getitem__(self, idx: int) -> tuple[torch.Tensor, int, tuple[int, int]]:
         sample = self.samples[idx]
         bucket = sample["bucket"]
+
+        if self._use_tensor_cache:
+            from bittrainer.tensor_cache import load_cached_tensor, tensor_cache_key
+            key = tensor_cache_key(sample["path"], bucket, self._skin_normalise)
+            bw, bh = bucket
+
+            # Check own cache first
+            tensor = load_cached_tensor(self._tensor_cache_dir, key, 3, bh, bw)
+            if tensor is not None:
+                return tensor, sample["label"], bucket
+
+            # For cross-concept negatives, check source concepts' caches
+            if sample["label"] == 0 and self._negative_tensor_cache_dirs:
+                for ext_cache_dir in self._negative_tensor_cache_dirs:
+                    tensor = load_cached_tensor(ext_cache_dir, key, 3, bh, bw)
+                    if tensor is not None:
+                        return tensor, sample["label"], bucket
+
+        # Fallback: PIL loading path
         face_bbox = self._face_bboxes.get(sample["path"])
         img = load_or_resize(sample["path"], bucket, self._cache_dir, face_bbox=face_bbox)
 
