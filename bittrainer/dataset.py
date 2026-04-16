@@ -233,6 +233,8 @@ class ConceptDataset(Dataset):
         transform: Any | None = None,
         extra_positive_dirs: list[str] | None = None,
         negative_dirs: list[str] | None = None,
+        hard_negative_paths: list[str] | None = None,
+        hard_negative_weight: int = 3,
         dim_cache: _DimensionCache | None = None,
         face_bboxes: dict[str, list[int]] | None = None,
         use_tensor_cache: bool = False,
@@ -246,6 +248,7 @@ class ConceptDataset(Dataset):
         self._use_tensor_cache = use_tensor_cache
         self._skin_normalise = skin_normalise
         self._neg_pos_ratio = neg_pos_ratio
+        self._hard_negative_weight = hard_negative_weight
         self._has_cross_concept_negatives = bool(negative_dirs)
 
         # Positives: flat layout first, fall back to legacy
@@ -271,12 +274,16 @@ class ConceptDataset(Dataset):
                 if not paths:
                     paths = _list_split_images(neg_folder, "positive", split)
                 self._all_negative_paths.extend(paths)
-                # Track tensor cache dirs for cross-concept cache reuse
                 tc_dir = neg_folder / ".tensor_cache"
                 if tc_dir.is_dir():
                     self._negative_tensor_cache_dirs.append(tc_dir)
         else:
             self._all_negative_paths = _list_split_images(self.concept_folder, "negative", split)
+
+        # Hard negatives: user-curated explicit negatives, oversampled for emphasis
+        self._hard_negative_paths: list[Path] = [
+            Path(p) for p in (hard_negative_paths or []) if Path(p).is_file()
+        ]
 
         # Disk cache for resized images (survives across training runs)
         self._cache_dir = self.concept_folder / ".resize_cache"
@@ -288,6 +295,7 @@ class ConceptDataset(Dataset):
         self._path_info: dict[str, dict] = {}
         self._precompute_path_info(self._positive_paths, label=1)
         self._precompute_path_info(self._all_negative_paths, label=0)
+        self._precompute_path_info(self._hard_negative_paths, label=0)
         self._dim_cache.flush()
 
         # Build initial sample list (with ratio-capped negatives)
@@ -324,16 +332,28 @@ class ConceptDataset(Dataset):
             }
 
     def _build_samples(self) -> None:
-        """Build the sample list: all positives + ratio-capped negatives."""
+        """Build the sample list: all positives + hard negatives + ratio-capped cross-concept negatives.
+
+        Hard negatives (user-curated) are oversampled by ``_hard_negative_weight``
+        and always included. Cross-concept negatives are randomly sampled up to
+        the ratio cap, minus hard negative slots.
+        """
         self.samples = [self._path_info[str(p)] for p in self._positive_paths]
 
-        neg_samples = [self._path_info[str(p)] for p in self._all_negative_paths]
+        # Hard negatives: always included, oversampled for emphasis
+        hard_neg_samples = [self._path_info[str(p)] for p in self._hard_negative_paths]
+        for _ in range(self._hard_negative_weight):
+            self.samples.extend(hard_neg_samples)
 
-        # Cap negatives by ratio
+        # Cross-concept negatives: ratio-capped, minus hard negative slots
         num_pos = len(self._positive_paths)
-        max_neg = int(num_pos * self._neg_pos_ratio) if self._neg_pos_ratio > 0 else len(neg_samples)
-        if len(neg_samples) > max_neg:
-            neg_samples = random.sample(neg_samples, max_neg)
+        max_neg = int(num_pos * self._neg_pos_ratio) if self._neg_pos_ratio > 0 else len(self._all_negative_paths)
+        hard_slots = len(hard_neg_samples) * self._hard_negative_weight
+        remaining = max(0, max_neg - hard_slots)
+
+        neg_samples = [self._path_info[str(p)] for p in self._all_negative_paths]
+        if len(neg_samples) > remaining:
+            neg_samples = random.sample(neg_samples, remaining)
 
         self.samples.extend(neg_samples)
 

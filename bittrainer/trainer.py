@@ -46,6 +46,8 @@ class TrainConfig:
     from_scratch: bool = False
     extra_positive_dirs: list[str] = field(default_factory=list)
     negative_dirs: list[str] = field(default_factory=list)
+    hard_negative_paths: list[str] = field(default_factory=list)
+    hard_negative_weight: int = 3
     label_smoothing: float = 0.1
     best_model_name: str = "best.pt"
     checkpoint_dir: str | None = None
@@ -229,12 +231,16 @@ def run_training(
         neg_pos_ratio=config.neg_pos_ratio,
         extra_positive_dirs=config.extra_positive_dirs,
         negative_dirs=config.negative_dirs,
+        hard_negative_paths=config.hard_negative_paths,
+        hard_negative_weight=config.hard_negative_weight,
         dim_cache=dim_cache,
     )
     val_ds = ConceptDataset(
         concept_folder, split="val",
         extra_positive_dirs=config.extra_positive_dirs,
         negative_dirs=config.negative_dirs,
+        hard_negative_paths=config.hard_negative_paths,
+        hard_negative_weight=1,
         dim_cache=dim_cache,
     )
 
