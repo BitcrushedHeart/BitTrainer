@@ -41,56 +41,75 @@ def probe_vram_batch_size(
     largest_bucket: tuple[int, int],
     device: torch.device,
     dtype: torch.dtype = torch.bfloat16,
-    fraction: float = 0.75,
+    fraction: float = 0.6,
 ) -> int:
-    """Binary search for the largest batch size fitting within VRAM fraction.
+    """Binary search for the largest batch size fitting within free VRAM.
 
-    Uses the largest bucket dimensions (worst case per sample) to ensure
-    no OOM regardless of which bucket is being processed.
-
-    The model must already be on the target device.
+    Targets ``fraction`` of *currently free* VRAM, not total. Total-based
+    sizing is unsafe on Windows: NVIDIA's CUDA sysmem fallback policy spills
+    over-allocations into system RAM via PCIe instead of OOMing, which stalls
+    the process for tens of minutes. Free-based sizing also leaves room for
+    the desktop compositor, browser, and any other GPU consumers.
     """
     if device.type != "cuda":
         logger.info("VRAM probe skipped (device=%s), defaulting to 32", device)
         return 32
 
-    total_vram = torch.cuda.get_device_properties(device).total_mem
-    target_usage = int(total_vram * fraction)
+    torch.cuda.empty_cache()
+    free_vram, total_vram = torch.cuda.mem_get_info(device)
+    target_usage = int(free_vram * fraction)
 
     w, h = largest_bucket
     was_training = model.training
-    model.eval()
+    model.train()
 
-    low, high, best = 1, 512, 4
+    # Cap the upper bound at a batch size whose dummy tensor alone wouldn't
+    # exceed half of target — anything larger is guaranteed not to fit once
+    # activations + gradients land on top.
+    bytes_per_elem = torch.tensor([], dtype=dtype).element_size()
+    bytes_per_sample = 3 * h * w * bytes_per_elem
+    upper_cap = max(4, min(512, target_usage // (2 * max(1, bytes_per_sample))))
+
+    low, high, best = 1, int(upper_cap), 4
     while low <= high:
         mid = (low + high) // 2
         try:
             torch.cuda.reset_peak_memory_stats(device)
+            free_before, _ = torch.cuda.mem_get_info(device)
             dummy = torch.randn(mid, 3, h, w, device=device, dtype=dtype)
-            with torch.no_grad():
-                with torch.amp.autocast(device_type=device.type, dtype=dtype, enabled=(dtype != torch.float32)):
-                    _ = model(dummy)
+            with torch.amp.autocast(device_type=device.type, dtype=dtype, enabled=(dtype != torch.float32)):
+                logits = model(dummy)
+                loss = logits.sum()
+            loss.backward()
+            model.zero_grad(set_to_none=True)
             peak = torch.cuda.max_memory_allocated(device)
-            del dummy
+            free_after, _ = torch.cuda.mem_get_info(device)
+            del dummy, logits, loss
             torch.cuda.empty_cache()
 
-            if peak <= target_usage:
+            # On Windows the sysmem fallback may keep allocations succeeding
+            # past true VRAM exhaustion. If free memory dropped to near zero,
+            # treat as effective OOM regardless of what max_memory_allocated says.
+            sysmem_overflow = free_after < (total_vram * 0.05)
+            if sysmem_overflow or peak > target_usage:
+                high = mid - 1
+            else:
                 best = mid
                 low = mid + 1
-            else:
-                high = mid - 1
         except RuntimeError:
+            model.zero_grad(set_to_none=True)
             torch.cuda.empty_cache()
             high = mid - 1
 
-    if was_training:
-        model.train()
+    model.train(was_training)
 
     logger.info(
-        "VRAM probe: best=%d at %dx%d (%.1f GB total, %.0f%% target)",
+        "VRAM probe: best=%d at %dx%d (%.1f GB free / %.1f GB total, %.0f%% of free targeted, upper_cap=%d)",
         best, w, h,
+        free_vram / 1e9,
         total_vram / 1e9,
         fraction * 100,
+        upper_cap,
     )
     return max(4, best)
 
@@ -100,7 +119,7 @@ def determine_batch_size(
     bucket_counts: dict[tuple[int, int], int],
     device: torch.device,
     dtype: torch.dtype = torch.bfloat16,
-    vram_fraction: float = 0.75,
+    vram_fraction: float = 0.6,
 ) -> dict:
     """Determine the optimal batch size from data distribution and VRAM.
 
@@ -126,7 +145,16 @@ def determine_batch_size(
         model, largest_bucket, device, dtype=dtype, fraction=vram_fraction,
     )
 
-    batch_size = max(4, min(data_floor, vram_limit))
+    batch_size = max(4, vram_limit)
+
+    # Warn about very sparse buckets (would get partial batches)
+    sparse = {f"{w}x{h}": n for (w, h), n in bucket_counts.items()
+              if 0 < n < batch_size // 4}
+    if sparse:
+        logger.warning(
+            "Sparse buckets (< %d images): %s — these will emit partial batches",
+            batch_size // 4, sparse,
+        )
 
     logger.info(
         "Auto batch size: %d (data_floor=%d, vram_limit=%d)",
@@ -137,6 +165,6 @@ def determine_batch_size(
         "batch_size": batch_size,
         "data_floor": data_floor,
         "vram_limit": vram_limit,
-        "largest_bucket": largest_bucket,
-        "bucket_counts": dict(bucket_counts),
+        "largest_bucket": list(largest_bucket),
+        "bucket_counts": {f"{w}x{h}": n for (w, h), n in bucket_counts.items()},
     }

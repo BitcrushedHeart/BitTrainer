@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import dataclass, field
+from functools import partial
 from pathlib import Path
 from typing import Callable
 
@@ -17,10 +19,6 @@ from torch.utils.data import DataLoader
 from bittrainer.group_dataset import (
     GroupDataset,
     build_group_bucket_sampler,
-    get_skin_normalised_train_transform,
-    get_skin_normalised_val_transform,
-    get_train_transform,
-    get_val_transform,
 )
 from bittrainer.group_validation import compute_multiclass_metrics, compute_multilabel_metrics, compute_ordinal_metrics
 from bittrainer.model import (
@@ -35,6 +33,21 @@ from bittrainer.model import (
 logger = logging.getLogger(__name__)
 
 _NUM_STAGES = 4
+_NONE_CLASS_NAME = "__none__"
+
+
+def _resolve_none_index(class_names: list[str]) -> int:
+    """Return the position of the ``__none__`` class, or -1 if absent.
+
+    ``__none__`` is a valid output class the model learns to predict, but it
+    must be excluded from any code path that assumes class indices are
+    positions on an ordinal scale (Gaussian soft-target smoothing, ordinal
+    validation metrics, etc.).
+    """
+    try:
+        return class_names.index(_NONE_CLASS_NAME)
+    except ValueError:
+        return -1
 
 
 @dataclass
@@ -56,6 +69,11 @@ class GroupTrainConfig:
     checkpoint_dir: str | None = None
     skin_normalise: bool = False
     face_model_path: str = ""
+    cache_dir: str | None = None
+    use_cache: bool = True
+    sourceless: bool = False
+    group_name: str = ""
+    modeltype: str = "convnext_v2"
     progress_callback: Callable[[dict], None] | None = None
 
 
@@ -80,14 +98,32 @@ def _collate_multilabel_batch(batch):
 # ---------------------------------------------------------------------------
 
 
-def _build_gaussian_kernel(num_classes: int, sigma: float = 1.0) -> torch.Tensor:
+def _build_gaussian_kernel(
+    num_classes: int,
+    sigma: float = 1.0,
+    *,
+    none_index: int = -1,
+) -> torch.Tensor:
     """Build a Gaussian smoothing kernel for ordinal classes.
 
     kernel[i, j] = exp(-(i-j)^2 / (2*sigma^2)), then normalised per row.
+
+    When ``none_index >= 0`` the corresponding class (``__none__``) is treated
+    as a separate semantic category, not a position on the ordinal scale.
+    Its row and column are zeroed and the diagonal entry is set to 1, so no
+    probability bleeds between ``__none__`` and its numeric neighbours during
+    soft-target smoothing — without this, the model learns that ``__none__``
+    is adjacent to the lowest ordinal class (e.g. ``__none__`` ↔ "Augmented
+    Breasts" or ``__none__`` ↔ "0-year-old"), which corrupts predictions on
+    visually-empty inputs.
     """
     indices = torch.arange(num_classes, dtype=torch.float32)
     diffs = indices.unsqueeze(0) - indices.unsqueeze(1)
     kernel = torch.exp(-diffs ** 2 / (2 * sigma ** 2))
+    if 0 <= none_index < num_classes:
+        kernel[none_index, :] = 0.0
+        kernel[:, none_index] = 0.0
+        kernel[none_index, none_index] = 1.0
     kernel = kernel / kernel.sum(dim=1, keepdim=True)
     return kernel
 
@@ -99,12 +135,13 @@ def _build_soft_targets(
     ordinal: bool = False,
     label_smoothing: float = 0.0,
     soft_aliases: dict | None = None,
+    none_index: int = -1,
     device: torch.device = torch.device("cpu"),
 ) -> torch.Tensor:
     """Convert integer labels to soft target vectors.
 
     1. Start with one-hot
-    2. Apply ordinal Gaussian smoothing (if ordinal)
+    2. Apply ordinal Gaussian smoothing (if ordinal), excluding ``none_index``
     3. Apply uniform label smoothing (if not ordinal but smoothing > 0)
     4. Apply soft aliases
     """
@@ -113,7 +150,7 @@ def _build_soft_targets(
     targets.scatter_(1, labels.unsqueeze(1), 1.0)
 
     if ordinal and num_classes > 2:
-        kernel = _build_gaussian_kernel(num_classes).to(device)
+        kernel = _build_gaussian_kernel(num_classes, none_index=none_index).to(device)
         targets = targets @ kernel
     elif label_smoothing > 0:
         targets = targets * (1.0 - label_smoothing) + label_smoothing / num_classes
@@ -153,15 +190,21 @@ def _train_one_epoch(
     dtype: torch.dtype,
     *,
     use_soft_targets: bool = False,
+    step_callback: Callable[[int, int, float], None] | None = None,
 ) -> float:
     model.train()
     total_loss = 0.0
     num_batches = 0
+    total_steps = len(dataloader)
+    _last_report = time.monotonic()
 
     bce_criterion = nn.BCEWithLogitsLoss() if config.multi_label else None
 
+    from bittrainer.gpu_augment import apply_train_augment
+
     for images, labels in dataloader:
-        images = images.to(device, dtype=dtype)
+        images = images.to(device, non_blocking=True)
+        images = apply_train_augment(images, dtype=dtype)
         labels = labels.to(device)
 
         optimizer.zero_grad()
@@ -177,6 +220,7 @@ def _train_one_epoch(
                     ordinal=config.ordinal,
                     label_smoothing=config.label_smoothing,
                     soft_aliases=config.soft_aliases or None,
+                    none_index=_resolve_none_index(config.class_names),
                     device=device,
                 )
                 log_probs = torch.log_softmax(logits.float(), dim=1)
@@ -191,6 +235,12 @@ def _train_one_epoch(
         total_loss += loss.item()
         num_batches += 1
 
+        if step_callback is not None:
+            now = time.monotonic()
+            if now - _last_report >= 2.0 or num_batches == total_steps:
+                _last_report = now
+                step_callback(num_batches, total_steps, total_loss / num_batches)
+
     return total_loss / max(num_batches, 1)
 
 
@@ -204,6 +254,7 @@ def _evaluate(
     *,
     multi_label: bool = False,
     ordinal: bool = False,
+    none_index: int = -1,
 ) -> dict:
     model.eval()
     all_preds = []
@@ -216,8 +267,11 @@ def _evaluate(
     else:
         criterion = nn.CrossEntropyLoss()
 
+    from bittrainer.gpu_augment import apply_val_transform
+
     for images, labels in dataloader:
-        images = images.to(device, dtype=dtype)
+        images = images.to(device, non_blocking=True)
+        images = apply_val_transform(images, dtype=dtype)
         labels = labels.to(device)
 
         with torch.amp.autocast(device_type=device.type, dtype=dtype, enabled=(dtype != torch.float32)):
@@ -246,7 +300,9 @@ def _evaluate(
     else:
         metrics = compute_multiclass_metrics(all_labels, all_preds, num_classes)
         if ordinal:
-            metrics.update(compute_ordinal_metrics(all_labels, all_preds, num_classes))
+            metrics.update(compute_ordinal_metrics(
+                all_labels, all_preds, num_classes, none_index=none_index,
+            ))
 
     metrics["val_loss"] = total_loss / max(num_batches, 1)
     return metrics
@@ -256,51 +312,118 @@ def run_group_training(
     config: GroupTrainConfig,
     *,
     progress_callback: Callable[[dict], None] | None = None,
+    stop_event: object | None = None,
 ) -> dict:
     """Run the full multi-class training loop."""
-    cb = progress_callback or config.progress_callback or (lambda _: None)
+    from bittrainer.smart_cache import _noop_callback, _never_stop
+    from bittrainer.trainer import _stop_event_is_set
+    cb = progress_callback or config.progress_callback or _noop_callback
     device = torch.device(config.device)
     dtype = _get_dtype(config.dtype)
     group_folder = Path(config.group_folder)
     checkpoint_dir = Path(config.checkpoint_dir) if config.checkpoint_dir else group_folder / "checkpoints"
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    group_name = config.group_name or group_folder.name
 
     use_soft = config.ordinal or bool(config.soft_aliases)
 
-    # Build datasets
-    train_transform = get_skin_normalised_train_transform() if config.skin_normalise else get_train_transform()
-    train_ds = GroupDataset(
-        group_folder, config.class_names, split="train",
-        transform=train_transform,
-        multi_label=config.multi_label,
-    )
-    val_transform = get_skin_normalised_val_transform() if config.skin_normalise else get_val_transform()
-    val_ds = GroupDataset(
-        group_folder, config.class_names, split="val",
-        transform=val_transform,
-        multi_label=config.multi_label,
-    )
+    # --- SmartCache setup ---
+    smart_cache = None
+    if config.use_cache:
+        from bittrainer.smart_cache import SmartCache, face_model_signature
+        cache_root = Path(config.cache_dir) if config.cache_dir else (group_folder / ".smart_cache")
+        smart_cache = SmartCache(
+            cache_root,
+            modeltype=config.modeltype,
+            progress_callback=cb,
+            stop_check=partial(_stop_event_is_set, stop_event),
+            face_model_sig=face_model_signature(config.face_model_path or None),
+        )
+
+    if config.sourceless:
+        if smart_cache is None:
+            raise RuntimeError("sourceless=True requires use_cache=True and a cache_dir")
+        cb({
+            "type": "training_progress", "stage": "validating",
+            "status_text": "Loading sourceless samples from cache",
+            "step": 0, "total_steps": 0,
+        })
+        train_ds = GroupDataset(
+            group_folder, config.class_names, split="train",
+            multi_label=config.multi_label,
+            cache=smart_cache, sourceless=True, group_name=group_name,
+        )
+        val_ds = GroupDataset(
+            group_folder, config.class_names, split="val",
+            multi_label=config.multi_label,
+            cache=smart_cache, sourceless=True, group_name=group_name,
+        )
+        face_bboxes: dict[str, list[int]] = {}
+    else:
+        train_ds = GroupDataset(
+            group_folder, config.class_names, split="train",
+            multi_label=config.multi_label,
+            skin_normalise=config.skin_normalise, group_name=group_name,
+        )
+        val_ds = GroupDataset(
+            group_folder, config.class_names, split="val",
+            multi_label=config.multi_label,
+            skin_normalise=config.skin_normalise, group_name=group_name,
+        )
+
+        # --- Face-aware cropping pre-computation ---
+        face_bboxes = {}
+        if config.face_model_path:
+            from bittrainer.face_crop import FaceBBoxCache, precompute_face_bboxes
+            face_cache = FaceBBoxCache(group_folder / ".resize_cache" / "face_bboxes.json")
+            all_image_paths = [s["path"] for s in train_ds.samples] + [s["path"] for s in val_ds.samples]
+
+            def _face_progress(done: int, total: int) -> None:
+                cb({
+                    "type": "training_progress", "stage": "face_detection",
+                    "status_text": f"Detecting faces ({done}/{total})",
+                    "step": done, "total_steps": total,
+                })
+
+            precompute_face_bboxes(
+                all_image_paths, face_cache, config.face_model_path,
+                device=config.device,
+                progress_fn=_face_progress,
+            )
+            for p in all_image_paths:
+                bbox = face_cache.get(p)
+                if bbox:
+                    face_bboxes[p] = bbox
+            train_ds.refresh_face_bboxes(face_bboxes)
+            val_ds.refresh_face_bboxes(face_bboxes)
+
+        # --- Warm SmartCache ---
+        if smart_cache is not None:
+            from bittrainer.cache_builders import build_image_tensor
+            from bittrainer.smart_cache import CachingStoppedException
+            all_cache_samples = train_ds.samples + val_ds.samples
+            try:
+                smart_cache.prepare(
+                    all_cache_samples, build_image_tensor,
+                    num_workers=1, stage_label="caching",
+                )
+            except CachingStoppedException:
+                logger.info("Caching interrupted by stop_event")
+                cb({"type": "training_cancelled", "stage": "caching",
+                    "status_text": "Cancelled during cache build"})
+                raise
+            # Callbacks are only needed during prepare(). Replace with picklable
+            # no-ops so the cache (now attached to datasets) survives pickling
+            # when DataLoader workers spawn on Windows — mp.Event and local
+            # closures aren't picklable.
+            smart_cache._progress_cb = _noop_callback
+            smart_cache._stop_check = _never_stop
+            train_ds.set_cache(smart_cache)
+            val_ds.set_cache(smart_cache)
 
     total_samples = len(train_ds)
     if total_samples == 0:
         raise RuntimeError("No training images found")
-
-    # --- Face-aware cropping pre-computation ---
-    face_bboxes: dict[str, list[int]] = {}
-    if config.face_model_path:
-        from bittrainer.face_crop import FaceBBoxCache, precompute_face_bboxes
-        face_cache = FaceBBoxCache(group_folder / ".resize_cache" / "face_bboxes.json")
-        all_image_paths = [s["path"] for s in train_ds.samples] + [s["path"] for s in val_ds.samples]
-        precompute_face_bboxes(
-            all_image_paths, face_cache, config.face_model_path,
-            device=config.device,
-        )
-        for p in all_image_paths:
-            bbox = face_cache.get(p)
-            if bbox:
-                face_bboxes[p] = bbox
-        train_ds._face_bboxes = face_bboxes
-        val_ds._face_bboxes = face_bboxes
 
     # --- Count samples per bucket ---
     bucket_counts: dict[tuple[int, int], int] = {}
@@ -328,13 +451,12 @@ def run_group_training(
             model_size=config.backbone_variant, pretrained=True,
             dtype=dtype, num_classes=config.num_classes,
         ).to(device)
-    freeze_backbone(model)
-
-    # --- Auto batch sizing ---
+    # --- Auto batch sizing (probe unfrozen = worst-case VRAM) ---
     from bittrainer.autobatch import determine_batch_size
     auto_result = determine_batch_size(model, bucket_counts, device, dtype=dtype)
     eff_bs = auto_result["batch_size"]
     cb({"type": "autobatch", **auto_result})
+    freeze_backbone(model)
 
     class_counts = train_ds.get_class_counts()
     total_raw = sum(class_counts.values())
@@ -357,6 +479,11 @@ def run_group_training(
     best_metrics: dict = {}
 
     for epoch in range(config.max_epochs):
+        if stop_event is not None and stop_event.is_set():
+            logger.info("Graceful stop requested after epoch %d — running final comparison", epoch)
+            cb({"type": "graceful_stop", "epoch": epoch, "max_epochs": config.max_epochs})
+            break
+
         # Unfreezing
         if epoch == 1:
             if use_gradual_unfreeze:
@@ -384,18 +511,41 @@ def run_group_training(
         train_sampler = build_group_bucket_sampler(train_ds, batch_size=eff_bs)
         train_loader = DataLoader(
             train_ds, batch_sampler=train_sampler, collate_fn=collate_fn,
-            num_workers=0, pin_memory=(device.type == "cuda"),
+            num_workers=4, pin_memory=True, persistent_workers=True, prefetch_factor=3,
         )
         val_sampler = build_group_bucket_sampler(val_ds, batch_size=eff_bs)
         val_loader = DataLoader(
             val_ds, batch_sampler=val_sampler, collate_fn=collate_fn,
-            num_workers=0, pin_memory=(device.type == "cuda"),
+            num_workers=4, pin_memory=True, persistent_workers=True, prefetch_factor=3,
         )
 
         # Train
+        epoch_start_mono = time.monotonic()
+
+        def _on_step(step: int, total_steps: int, avg_loss: float) -> None:
+            elapsed = time.monotonic() - epoch_start_mono
+            throughput = step / elapsed if elapsed > 0 else None
+            eta_seconds = (total_steps - step) / throughput if throughput and throughput > 0 else None
+            cb({
+                "type": "training_progress",
+                "stage": "training",
+                "status_text": f"Training (epoch {epoch + 1}/{config.max_epochs}, step {step}/{total_steps})",
+                "epoch": epoch + 1,
+                "max_epochs": config.max_epochs,
+                "step": step,
+                "total_steps": total_steps,
+                "eta_seconds": eta_seconds,
+                "throughput": throughput,
+                "throughput_unit": "batch/s",
+                "train_loss": round(avg_loss, 4),
+                "best_val_macro_f1": best_val_macro_f1 if best_val_macro_f1 >= 0 else None,
+                "best_epoch": best_epoch + 1 if best_val_macro_f1 >= 0 else None,
+            })
+
         train_loss = _train_one_epoch(
             model, train_loader, optimizer, config, device, dtype,
             use_soft_targets=use_soft,
+            step_callback=_on_step,
         )
         scheduler.step()
 
@@ -404,6 +554,7 @@ def run_group_training(
             model, val_loader, config.num_classes, device, dtype,
             multi_label=config.multi_label,
             ordinal=config.ordinal,
+            none_index=_resolve_none_index(config.class_names),
         )
         val_metrics["train_loss"] = train_loss
 
@@ -433,6 +584,8 @@ def run_group_training(
 
         epoch_msg = {
             "type": "epoch_complete",
+            "stage": "training",
+            "status_text": f"Epoch {epoch + 1}/{config.max_epochs} complete (val macro F1 {val_macro_f1:.3f})",
             "epoch": epoch + 1,
             "max_epochs": config.max_epochs,
             "train_loss": train_loss,
@@ -471,6 +624,7 @@ def run_group_training(
                     old_model, val_loader, config.num_classes, device, dtype,
                     multi_label=config.multi_label,
                     ordinal=config.ordinal,
+                    none_index=_resolve_none_index(config.class_names),
                 )
                 old_f1 = old_metrics["macro_f1"]
                 old_qwk = old_metrics.get("qwk", 0.0)

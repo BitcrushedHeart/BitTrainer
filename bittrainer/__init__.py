@@ -21,6 +21,7 @@ from bittrainer.dataset import (
     get_train_transform,
     get_val_transform,
 )
+from bittrainer.smart_cache import CachingStoppedException, SmartCache
 
 __all__ = [
     # model
@@ -48,4 +49,7 @@ __all__ = [
     "get_heavy_augment_transform",
     "get_train_transform",
     "get_val_transform",
+    # smart cache
+    "SmartCache",
+    "CachingStoppedException",
 ]

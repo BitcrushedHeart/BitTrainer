@@ -4,6 +4,7 @@ import json
 import logging
 import os
 from pathlib import Path
+from typing import Callable
 
 from PIL import Image
 
@@ -77,26 +78,31 @@ def precompute_face_bboxes(
     face_model_path: str,
     device: str = "cuda",
     batch_size: int = 32,
+    progress_fn: Callable[[int, int], None] | None = None,
 ) -> None:
     """Run YOLO face detection on uncached images and populate the cache.
 
     Loads the YOLO model, runs batch inference, stores the union bbox
     of all detected faces per image, then unloads the model.
+    Deduplicates paths before processing to avoid redundant work from
+    oversampled training sets.
     """
     import torch
 
-    uncached = cache.uncached_paths(image_paths)
+    unique_paths = list(dict.fromkeys(image_paths))
+    uncached = cache.uncached_paths(unique_paths)
     if not uncached:
-        logger.info("All %d images have cached face bboxes", len(image_paths))
+        logger.info("All %d unique images have cached face bboxes", len(unique_paths))
         return
 
-    logger.info("Computing face bboxes for %d/%d images", len(uncached), len(image_paths))
+    logger.info("Computing face bboxes for %d/%d unique images", len(uncached), len(unique_paths))
 
     from ultralytics import YOLO
     model = YOLO(face_model_path)
     model.to(device)
 
-    for start in range(0, len(uncached), batch_size):
+    total = len(uncached)
+    for start in range(0, total, batch_size):
         batch_paths = uncached[start:start + batch_size]
         try:
             results = model(batch_paths, verbose=False, device=device)
@@ -115,6 +121,10 @@ def precompute_face_bboxes(
             logger.warning("Face detection batch failed: %s", exc)
             for p in batch_paths:
                 cache.put(p, [])
+
+        done = min(start + batch_size, total)
+        if progress_fn and (done % (batch_size * 10) == 0 or done == total):
+            progress_fn(done, total)
 
     cache.flush()
 

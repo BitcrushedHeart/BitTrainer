@@ -16,7 +16,6 @@ from torch.utils.data import Dataset, Sampler
 from torchvision import transforms
 from torchvision.transforms import functional as TF
 
-from bittrainer.image_cache import load_or_resize
 from bittrainer.image_utils import is_supported_image
 
 logger = logging.getLogger(__name__)
@@ -58,7 +57,6 @@ def find_nearest_bucket(orig_w: int, orig_h: int) -> tuple[int, int]:
 # ---------------------------------------------------------------------------
 
 def get_train_transform() -> transforms.Compose:
-    """Standard training augmentation."""
     return transforms.Compose([
         transforms.RandomHorizontalFlip(p=0.5),
         transforms.ColorJitter(brightness=0.1, contrast=0.1, saturation=0.1, hue=0.02),
@@ -68,7 +66,6 @@ def get_train_transform() -> transforms.Compose:
 
 
 def get_val_transform() -> transforms.Compose:
-    """Validation transform — no augmentation."""
     return transforms.Compose([
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
@@ -76,7 +73,6 @@ def get_val_transform() -> transforms.Compose:
 
 
 def get_heavy_augment_transform() -> transforms.Compose:
-    """Heavier augmentation for when negatives < positives."""
     return transforms.Compose([
         transforms.RandomHorizontalFlip(p=0.5),
         transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.05),
@@ -85,10 +81,6 @@ def get_heavy_augment_transform() -> transforms.Compose:
         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
     ])
 
-
-# ---------------------------------------------------------------------------
-# Skin-normalised transform variants
-# ---------------------------------------------------------------------------
 
 def get_skin_normalised_train_transform() -> transforms.Compose:
     from bittrainer.skin_normalise import SkinNormalise
@@ -127,15 +119,11 @@ def get_skin_normalised_heavy_augment_transform() -> transforms.Compose:
 # ---------------------------------------------------------------------------
 
 class _DimensionCache:
-    """Caches image (width, height) keyed by absolute path + mtime.
-
-    Persisted as a JSON file so subsequent training runs skip all
-    PIL.Image.open() calls during dataset init.
-    """
+    """Caches image (width, height) keyed by absolute path + mtime."""
 
     def __init__(self, cache_path: Path):
         self._cache_path = cache_path
-        self._data: dict[str, tuple[float, int, int]] = {}  # path -> (mtime, w, h)
+        self._data: dict[str, tuple[float, int, int]] = {}
         self._dirty = False
         self._load()
 
@@ -149,7 +137,6 @@ class _DimensionCache:
                 self._data = {}
 
     def get(self, path: Path | str) -> tuple[int, int] | None:
-        """Return cached (w, h) if fresh, else None."""
         key = str(path)
         entry = self._data.get(key)
         if entry is None:
@@ -191,7 +178,6 @@ class _DimensionCache:
 # ---------------------------------------------------------------------------
 
 def _list_split_images(folder: Path, label: str, split: str) -> list[Path]:
-    """List image files in folder/{label}/{split}/ (legacy layout)."""
     d = folder / label / split
     if not d.is_dir():
         return []
@@ -199,7 +185,6 @@ def _list_split_images(folder: Path, label: str, split: str) -> list[Path]:
 
 
 def _list_split_images_flat(folder: Path, split: str) -> list[Path]:
-    """List image files in folder/{split}/ (new flat layout)."""
     d = folder / split
     if not d.is_dir():
         return []
@@ -209,19 +194,12 @@ def _list_split_images_flat(folder: Path, split: str) -> list[Path]:
 class ConceptDataset(Dataset):
     """Dataset for a single concept's training or validation split.
 
-    Supports two layouts:
-    - **Flat** (new): ``concept_folder/{split}/`` for positives,
-      ``negative_dirs`` for cross-concept negatives.
-    - **Legacy**: ``concept_folder/positive/{split}/`` and
-      ``concept_folder/negative/{split}/``.
+    When a :class:`bittrainer.smart_cache.SmartCache` is provided, images are
+    loaded as pre-resized CHW uint8 tensors directly from the cache. Cache
+    misses fall back to on-the-fly PIL decode via the build function.
 
-    When ``negative_dirs`` is provided, negatives are randomly resampled
-    each epoch via ``resample_negatives()`` so the model sees different
-    negatives every pass — prevents overfitting on a fixed negative set.
-
-    When ``use_tensor_cache=True``, images are pre-cached as uint8 CHW
-    raw bytes on disk.  ``__getitem__`` returns uint8 tensors (no
-    transform applied) — augmentation is handled on GPU by the caller.
+    In ``sourceless=True`` mode the sample list is reconstructed from the
+    cache index — the source concept folders do not need to exist on disk.
     """
 
     def __init__(
@@ -237,26 +215,31 @@ class ConceptDataset(Dataset):
         hard_negative_weight: int = 3,
         dim_cache: _DimensionCache | None = None,
         face_bboxes: dict[str, list[int]] | None = None,
-        use_tensor_cache: bool = False,
         skin_normalise: bool = False,
-        cache_progress_fn: Any | None = None,
+        cache: Any | None = None,           # SmartCache instance
+        sourceless: bool = False,
+        concept_name: str = "",
     ):
         self.concept_folder = Path(concept_folder)
         self.split = split
         self.transform = transform
         self._face_bboxes: dict[str, list[int]] = face_bboxes or {}
-        self._use_tensor_cache = use_tensor_cache
         self._skin_normalise = skin_normalise
         self._neg_pos_ratio = neg_pos_ratio
         self._hard_negative_weight = hard_negative_weight
-        self._has_cross_concept_negatives = bool(negative_dirs)
+        self._concept_name = concept_name or self.concept_folder.name
+        self._cache = cache
+        self._sourceless = sourceless
+
+        if sourceless:
+            self._init_sourceless()
+            return
 
         # Positives: flat layout first, fall back to legacy
         self._positive_paths = _list_split_images_flat(self.concept_folder, split)
         if not self._positive_paths:
             self._positive_paths = _list_split_images(self.concept_folder, "positive", split)
 
-        # Extra positive dirs (child concepts)
         for extra_dir in (extra_positive_dirs or []):
             extra_folder = Path(extra_dir)
             extra_paths = _list_split_images_flat(extra_folder, split)
@@ -264,9 +247,8 @@ class ConceptDataset(Dataset):
                 extra_paths = _list_split_images(extra_folder, "positive", split)
             self._positive_paths.extend(extra_paths)
 
-        # Negatives: cross-concept dirs or legacy per-concept folder
         self._all_negative_paths: list[Path] = []
-        self._negative_tensor_cache_dirs: list[Path] = []
+        self._has_cross_concept_negatives = bool(negative_dirs)
         if negative_dirs:
             for neg_dir in negative_dirs:
                 neg_folder = Path(neg_dir)
@@ -274,49 +256,36 @@ class ConceptDataset(Dataset):
                 if not paths:
                     paths = _list_split_images(neg_folder, "positive", split)
                 self._all_negative_paths.extend(paths)
-                tc_dir = neg_folder / ".tensor_cache"
-                if tc_dir.is_dir():
-                    self._negative_tensor_cache_dirs.append(tc_dir)
         else:
             self._all_negative_paths = _list_split_images(self.concept_folder, "negative", split)
 
-        # Hard negatives: user-curated explicit negatives, oversampled for emphasis
         self._hard_negative_paths: list[Path] = [
             Path(p) for p in (hard_negative_paths or []) if Path(p).is_file()
         ]
 
-        # Disk cache for resized images (survives across training runs)
         self._cache_dir = self.concept_folder / ".resize_cache"
-
-        # Shared dimension cache (avoids 30k+ PIL opens during init)
         self._dim_cache = dim_cache or _DimensionCache(self._cache_dir / "dimensions.json")
 
-        # Pre-compute bucket info for ALL known paths (once)
         self._path_info: dict[str, dict] = {}
         self._precompute_path_info(self._positive_paths, label=1)
         self._precompute_path_info(self._all_negative_paths, label=0)
         self._precompute_path_info(self._hard_negative_paths, label=0)
         self._dim_cache.flush()
 
-        # Build initial sample list (with ratio-capped negatives)
         self.samples: list[dict] = []
         self._build_samples()
 
-        # Build tensor cache if requested
-        if self._use_tensor_cache:
-            from bittrainer.tensor_cache import build_tensor_cache
-            self._tensor_cache_dir = self.concept_folder / ".tensor_cache"
-            build_tensor_cache(
-                self.samples,
-                self._tensor_cache_dir,
-                self._cache_dir,
-                self._skin_normalise,
-                self._face_bboxes,
-                progress_fn=cache_progress_fn,
-            )
+    def _init_sourceless(self) -> None:
+        if self._cache is None:
+            raise RuntimeError("sourceless=True requires a SmartCache instance")
+        entries = self._cache.iter_sourceless()
+        self.samples = [s for s in entries if s.get("split") == self.split]
+        self._positive_paths = [Path(s["path"]) for s in self.samples if s["label"] == 1]
+        self._all_negative_paths = [Path(s["path"]) for s in self.samples if s["label"] == 0]
+        self._hard_negative_paths = []
+        self._has_cross_concept_negatives = False
 
     def _precompute_path_info(self, paths: list[Path], label: int) -> None:
-        """Read dimensions for a list of paths, using the cache."""
         for p in paths:
             key = str(p)
             if key in self._path_info:
@@ -327,25 +296,22 @@ class ConceptDataset(Dataset):
                 self._dim_cache.put(p, dims[0], dims[1])
             bucket = find_nearest_bucket(dims[0], dims[1])
             self._path_info[key] = {
-                "path": key, "label": label,
+                "path": key,
+                "label": label,
                 "bucket": bucket,
+                "concept_name": self._concept_name,
+                "split": self.split,
+                "skin_normalise": self._skin_normalise,
+                "face_bbox": self._face_bboxes.get(key),
             }
 
     def _build_samples(self) -> None:
-        """Build the sample list: all positives + hard negatives + ratio-capped cross-concept negatives.
-
-        Hard negatives (user-curated) are oversampled by ``_hard_negative_weight``
-        and always included. Cross-concept negatives are randomly sampled up to
-        the ratio cap, minus hard negative slots.
-        """
         self.samples = [self._path_info[str(p)] for p in self._positive_paths]
 
-        # Hard negatives: always included, oversampled for emphasis
         hard_neg_samples = [self._path_info[str(p)] for p in self._hard_negative_paths]
         for _ in range(self._hard_negative_weight):
             self.samples.extend(hard_neg_samples)
 
-        # Cross-concept negatives: ratio-capped, minus hard negative slots
         num_pos = len(self._positive_paths)
         max_neg = int(num_pos * self._neg_pos_ratio) if self._neg_pos_ratio > 0 else len(self._all_negative_paths)
         hard_slots = len(hard_neg_samples) * self._hard_negative_weight
@@ -358,20 +324,23 @@ class ConceptDataset(Dataset):
         self.samples.extend(neg_samples)
 
     def resample_negatives(self) -> None:
-        """Re-roll which negatives are included (cross-concept mode).
-
-        Called between epochs so the model sees a different random subset
-        of negatives each pass. No-op when using legacy per-concept negatives.
-        """
-        if not self._has_cross_concept_negatives:
+        if self._sourceless or not self._has_cross_concept_negatives:
             return
         self._build_samples()
 
+    def set_cache(self, cache: Any) -> None:
+        """Attach a SmartCache after construction (used by trainer warm phase)."""
+        self._cache = cache
+
+    def refresh_face_bboxes(self, face_bboxes: dict[str, list[int]]) -> None:
+        self._face_bboxes = face_bboxes
+        for key, info in self._path_info.items():
+            info["face_bbox"] = face_bboxes.get(key)
+
     @staticmethod
     def _read_image_size(path: Path | str) -> tuple[int, int]:
-        """Get image dimensions without fully loading pixel data."""
         with Image.open(path) as img:
-            return img.size  # (width, height)
+            return img.size
 
     def __len__(self) -> int:
         return len(self.samples)
@@ -380,33 +349,28 @@ class ConceptDataset(Dataset):
         sample = self.samples[idx]
         bucket = sample["bucket"]
 
-        if self._use_tensor_cache:
-            from bittrainer.tensor_cache import load_cached_tensor, tensor_cache_key
-            key = tensor_cache_key(sample["path"], bucket, self._skin_normalise)
-            bw, bh = bucket
+        if self._cache is not None:
+            result = self._cache.get(sample["path"])
+            if result is not None:
+                tensor, _ = result
+                return tensor, sample["label"], tuple(bucket)
+            if self._sourceless:
+                raise RuntimeError(
+                    f"Sourceless training: cache miss for '{sample['path']}'. "
+                    "The cache is incomplete — rebuild it with sourceless disabled."
+                )
 
-            # Check own cache first
-            tensor = load_cached_tensor(self._tensor_cache_dir, key, 3, bh, bw)
-            if tensor is not None:
-                return tensor, sample["label"], bucket
-
-            # For cross-concept negatives, check source concepts' caches
-            if sample["label"] == 0 and self._negative_tensor_cache_dirs:
-                for ext_cache_dir in self._negative_tensor_cache_dirs:
-                    tensor = load_cached_tensor(ext_cache_dir, key, 3, bh, bw)
-                    if tensor is not None:
-                        return tensor, sample["label"], bucket
-
-        # Fallback: PIL loading path
-        face_bbox = self._face_bboxes.get(sample["path"])
-        img = load_or_resize(sample["path"], bucket, self._cache_dir, face_bbox=face_bbox)
+        # Fallback: build on-the-fly
+        from bittrainer.cache_builders import build_image_tensor
+        import numpy as np
+        arr = build_image_tensor(sample)
+        img_tensor = torch.from_numpy(np.ascontiguousarray(arr))
 
         if self.transform is not None:
-            img = self.transform(img)
-        else:
-            img = TF.to_tensor(img)
+            pil_img = Image.fromarray(arr.transpose(1, 2, 0))
+            return self.transform(pil_img), sample["label"], tuple(bucket)
 
-        return img, sample["label"], bucket
+        return img_tensor, sample["label"], tuple(bucket)
 
 
 # ---------------------------------------------------------------------------
@@ -414,17 +378,6 @@ class ConceptDataset(Dataset):
 # ---------------------------------------------------------------------------
 
 class BucketBatchSampler(Sampler):
-    """Groups samples by bucket so each batch has the same image dimensions.
-
-    ``undersized_policy`` controls what happens when a bucket has fewer
-    samples than ``batch_size``:
-
-    * ``"keep"``  – emit the undersized batch as-is (default).
-    * ``"drop"``  – discard the bucket entirely.
-    * ``"duplicate"`` – duplicate random samples from the same bucket to
-      fill the batch to ``batch_size``.
-    """
-
     def __init__(
         self,
         dataset: ConceptDataset,
@@ -438,28 +391,22 @@ class BucketBatchSampler(Sampler):
         self.undersized_policy = undersized_policy
 
     def __iter__(self):
-        # Group indices by bucket
         bucket_indices: dict[tuple[int, int], list[int]] = {}
         for i, sample in enumerate(self.dataset.samples):
             bucket = sample["bucket"]
             bucket_indices.setdefault(bucket, []).append(i)
 
-        # Shuffle within each bucket, then yield batches
         batches = []
         for bucket, indices in bucket_indices.items():
             random.shuffle(indices)
             for start in range(0, len(indices), self.batch_size):
-                batch = indices[start : start + self.batch_size]
+                batch = indices[start:start + self.batch_size]
                 if len(batch) < self.batch_size:
-                    if self.drop_last:
-                        continue
-                    if self.undersized_policy == "drop":
+                    if self.drop_last or self.undersized_policy == "drop":
                         continue
                     if self.undersized_policy == "duplicate":
-                        # Pad by duplicating random indices from the same bucket
                         shortfall = self.batch_size - len(batch)
                         batch = batch + [random.choice(batch) for _ in range(shortfall)]
-                    # "keep" falls through — emit as-is
                 batches.append(batch)
 
         random.shuffle(batches)
@@ -485,5 +432,4 @@ def build_bucket_batch_sampler(
     drop_last: bool = False,
     undersized_policy: str = "keep",
 ) -> BucketBatchSampler:
-    """Create a bucket-aware batch sampler for the dataset."""
     return BucketBatchSampler(dataset, batch_size, drop_last, undersized_policy)

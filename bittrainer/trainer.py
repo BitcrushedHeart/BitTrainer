@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import time
 from dataclasses import dataclass, field
+from functools import partial
 from pathlib import Path
 from typing import Callable
 
@@ -31,6 +32,12 @@ from bittrainer.validation import compute_metrics, find_optimal_threshold
 
 logger = logging.getLogger(__name__)
 
+
+def _stop_event_is_set(event) -> bool:
+    """Picklable stop-check. Module-level so the SmartCache holding it can
+    survive pickling when datasets ship to DataLoader workers on Windows spawn."""
+    return event is not None and event.is_set()
+
 _NUM_STAGES = 4  # ConvNeXt V2 has 4 stages
 
 
@@ -53,6 +60,11 @@ class TrainConfig:
     checkpoint_dir: str | None = None
     skin_normalise: bool = False
     face_model_path: str = ""
+    cache_dir: str | None = None
+    use_cache: bool = True
+    sourceless: bool = False
+    concept_name: str = ""
+    modeltype: str = "convnext_v2"
     progress_callback: Callable[[dict], None] | None = None
 
 
@@ -213,82 +225,131 @@ def run_training(
     stop_event: object | None = None,
 ) -> dict:
     """Run the full training loop. Returns a result dict with metrics and checkpoint path."""
-    cb = progress_callback or config.progress_callback or (lambda _: None)
+    from bittrainer.smart_cache import _noop_callback, _never_stop
+    cb = progress_callback or config.progress_callback or _noop_callback
     device = torch.device(config.device)
     dtype = _get_dtype(config.dtype)
     concept_folder = Path(config.concept_folder)
     checkpoint_dir = Path(config.checkpoint_dir) if config.checkpoint_dir else concept_folder / "checkpoints"
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
-    # Shared dimension cache — avoids reading image headers twice
-    cache_dir = concept_folder / ".resize_cache"
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    dim_cache = _DimensionCache(cache_dir / "dimensions.json")
+    concept_name = config.concept_name or concept_folder.name
 
-    # Build datasets (no transform — GPU augmentation applied in training loop)
-    train_ds = ConceptDataset(
-        concept_folder, split="train",
-        neg_pos_ratio=config.neg_pos_ratio,
-        extra_positive_dirs=config.extra_positive_dirs,
-        negative_dirs=config.negative_dirs,
-        hard_negative_paths=config.hard_negative_paths,
-        hard_negative_weight=config.hard_negative_weight,
-        dim_cache=dim_cache,
-    )
-    val_ds = ConceptDataset(
-        concept_folder, split="val",
-        extra_positive_dirs=config.extra_positive_dirs,
-        negative_dirs=config.negative_dirs,
-        hard_negative_paths=config.hard_negative_paths,
-        hard_negative_weight=1,
-        dim_cache=dim_cache,
-    )
-
-    _rebalance_val_negatives(train_ds, val_ds)
-
-    num_positives = len(train_ds._positive_paths)
-
-    # --- Face-aware cropping pre-computation ---
-    face_bboxes: dict[str, list[int]] = {}
-    if config.face_model_path:
-        from bittrainer.face_crop import FaceBBoxCache, precompute_face_bboxes
-        face_cache = FaceBBoxCache(cache_dir / "face_bboxes.json")
-        all_image_paths = [s["path"] for s in train_ds.samples] + [s["path"] for s in val_ds.samples]
-
-        def _face_progress(done: int, total: int) -> None:
-            cb({"type": "face_detection", "processed": done, "total": total})
-
-        precompute_face_bboxes(
-            all_image_paths, face_cache, config.face_model_path,
-            device=config.device,
-            progress_fn=_face_progress,
+    # --- SmartCache setup ---
+    smart_cache = None
+    if config.use_cache:
+        from bittrainer.smart_cache import SmartCache, face_model_signature
+        cache_root = Path(config.cache_dir) if config.cache_dir else (concept_folder / ".smart_cache")
+        smart_cache = SmartCache(
+            cache_root,
+            modeltype=config.modeltype,
+            progress_callback=cb,
+            stop_check=partial(_stop_event_is_set, stop_event),
+            face_model_sig=face_model_signature(config.face_model_path or None),
         )
-        for p in all_image_paths:
-            bbox = face_cache.get(p)
-            if bbox:
-                face_bboxes[p] = bbox
-        train_ds._face_bboxes = face_bboxes
-        val_ds._face_bboxes = face_bboxes
 
-    # --- Build tensor cache (after face bboxes so face-aware crops are cached) ---
-    from bittrainer.tensor_cache import build_tensor_cache
+    # --- Sourceless path: reconstruct samples from cache, skip dataset indexing ---
+    if config.sourceless:
+        if smart_cache is None:
+            raise RuntimeError("sourceless=True requires use_cache=True and a cache_dir")
+        cb({
+            "type": "training_progress", "stage": "validating",
+            "status_text": "Loading sourceless samples from cache",
+            "step": 0, "total_steps": 0,
+        })
+        train_ds = ConceptDataset(
+            concept_folder, split="train", cache=smart_cache,
+            sourceless=True, concept_name=concept_name,
+        )
+        val_ds = ConceptDataset(
+            concept_folder, split="val", cache=smart_cache,
+            sourceless=True, concept_name=concept_name,
+        )
+        num_positives = len(train_ds._positive_paths)
+        face_bboxes: dict[str, list[int]] = {}
+    else:
+        cache_dir = concept_folder / ".resize_cache"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        dim_cache = _DimensionCache(cache_dir / "dimensions.json")
 
-    def _cache_progress(done: int, total: int) -> None:
-        cb({"type": "tensor_cache", "cached": done, "total": total})
+        train_ds = ConceptDataset(
+            concept_folder, split="train",
+            neg_pos_ratio=config.neg_pos_ratio,
+            extra_positive_dirs=config.extra_positive_dirs,
+            negative_dirs=config.negative_dirs,
+            hard_negative_paths=config.hard_negative_paths,
+            hard_negative_weight=config.hard_negative_weight,
+            dim_cache=dim_cache,
+            skin_normalise=config.skin_normalise,
+            concept_name=concept_name,
+        )
+        val_ds = ConceptDataset(
+            concept_folder, split="val",
+            extra_positive_dirs=config.extra_positive_dirs,
+            negative_dirs=config.negative_dirs,
+            hard_negative_paths=config.hard_negative_paths,
+            hard_negative_weight=1,
+            dim_cache=dim_cache,
+            skin_normalise=config.skin_normalise,
+            concept_name=concept_name,
+        )
 
-    tensor_cache_dir = concept_folder / ".tensor_cache"
-    all_cache_samples = train_ds.samples + val_ds.samples
-    build_tensor_cache(
-        all_cache_samples, tensor_cache_dir, cache_dir,
-        config.skin_normalise, face_bboxes,
-        progress_fn=_cache_progress,
-    )
-    train_ds._use_tensor_cache = True
-    train_ds._skin_normalise = config.skin_normalise
-    train_ds._tensor_cache_dir = tensor_cache_dir
-    val_ds._use_tensor_cache = True
-    val_ds._skin_normalise = config.skin_normalise
-    val_ds._tensor_cache_dir = tensor_cache_dir
+        _rebalance_val_negatives(train_ds, val_ds)
+
+        num_positives = len(train_ds._positive_paths)
+
+        # --- Face-aware cropping pre-computation ---
+        face_bboxes = {}
+        if config.face_model_path:
+            from bittrainer.face_crop import FaceBBoxCache, precompute_face_bboxes
+            face_cache = FaceBBoxCache(cache_dir / "face_bboxes.json")
+            all_image_paths = [s["path"] for s in train_ds.samples] + [s["path"] for s in val_ds.samples]
+
+            total_faces = len(all_image_paths)
+
+            def _face_progress(done: int, total: int) -> None:
+                cb({
+                    "type": "training_progress", "stage": "face_detection",
+                    "status_text": f"Detecting faces ({done}/{total})",
+                    "step": done, "total_steps": total,
+                })
+
+            precompute_face_bboxes(
+                all_image_paths, face_cache, config.face_model_path,
+                device=config.device,
+                progress_fn=_face_progress,
+            )
+            for p in all_image_paths:
+                bbox = face_cache.get(p)
+                if bbox:
+                    face_bboxes[p] = bbox
+            train_ds.refresh_face_bboxes(face_bboxes)
+            val_ds.refresh_face_bboxes(face_bboxes)
+
+        # --- Warm SmartCache (validate + build missing) ---
+        if smart_cache is not None:
+            from bittrainer.cache_builders import build_image_tensor
+            from bittrainer.smart_cache import CachingStoppedException
+            all_cache_samples = train_ds.samples + val_ds.samples
+            try:
+                smart_cache.prepare(
+                    all_cache_samples, build_image_tensor,
+                    num_workers=1,  # PIL+LANCZOS is GIL-free enough, avoid oversubscription with GPU work
+                    stage_label="caching",
+                )
+            except CachingStoppedException:
+                logger.info("Caching interrupted by stop_event")
+                cb({"type": "training_cancelled", "stage": "caching",
+                    "status_text": "Cancelled during cache build"})
+                raise
+            # Callbacks are only needed during prepare(). Replace with picklable
+            # no-ops so the cache (now attached to datasets) survives pickling
+            # when DataLoader workers spawn on Windows — mp.Event and local
+            # closures aren't picklable.
+            smart_cache._progress_cb = _noop_callback
+            smart_cache._stop_check = _never_stop
+            train_ds.set_cache(smart_cache)
+            val_ds.set_cache(smart_cache)
 
     # --- Count samples per bucket ---
     bucket_counts: dict[tuple[int, int], int] = {}
@@ -342,22 +403,31 @@ def run_training(
     best_checkpoint_path = None
     best_metrics: dict = {}
 
-    # DataLoaders with num_workers=0 — tensor cache makes CPU workers unnecessary.
-    # Images load as uint8 from disk cache; normalize + augment on GPU.
+    # Async disk reads + pinned H2D transfers overlap with GPU compute.
+    # Workers respawn when train loader rebuilds between epochs (for negative
+    # resampling) — accept the ~3s Windows spawn cost for within-epoch async.
     val_sampler = build_bucket_batch_sampler(val_ds, batch_size=eff_bs)
     val_loader = DataLoader(
         val_ds, batch_sampler=val_sampler, collate_fn=_collate_bucket_batch,
-        num_workers=0, pin_memory=False,
+        num_workers=4, pin_memory=True, persistent_workers=True, prefetch_factor=3,
     )
 
     def _rebuild_train_loader() -> DataLoader:
         sampler = build_bucket_batch_sampler(train_ds, batch_size=eff_bs)
         return DataLoader(
             train_ds, batch_sampler=sampler, collate_fn=_collate_bucket_batch,
-            num_workers=0, pin_memory=False,
+            num_workers=4, pin_memory=True, persistent_workers=True, prefetch_factor=3,
         )
 
     train_loader = _rebuild_train_loader()
+
+    _train_start_mono = time.monotonic()
+
+    cb({
+        "type": "training_progress", "stage": "training",
+        "status_text": f"Training (epoch 0/{config.max_epochs})",
+        "epoch": 0, "max_epochs": config.max_epochs,
+    })
 
     for epoch in range(config.max_epochs):
         if stop_event is not None and stop_event.is_set():
@@ -393,13 +463,23 @@ def run_training(
                 unfreeze_stage(model, stage_idx)
 
         # Train
+        epoch_start_mono = time.monotonic()
+
         def _on_step(step: int, total_steps: int, avg_loss: float) -> None:
+            elapsed = time.monotonic() - epoch_start_mono
+            throughput = step / elapsed if elapsed > 0 else None
+            eta_seconds = (total_steps - step) / throughput if throughput and throughput > 0 else None
             cb({
-                "type": "step",
+                "type": "training_progress",
+                "stage": "training",
+                "status_text": f"Training (epoch {epoch + 1}/{config.max_epochs}, step {step}/{total_steps})",
                 "epoch": epoch + 1,
                 "max_epochs": config.max_epochs,
                 "step": step,
                 "total_steps": total_steps,
+                "eta_seconds": eta_seconds,
+                "throughput": throughput,
+                "throughput_unit": "batch/s",
                 "train_loss": round(avg_loss, 4),
                 "best_val_f1": best_val_f1 if best_val_f1 >= 0 else None,
                 "best_epoch": best_epoch + 1 if best_val_f1 >= 0 else None,
@@ -438,6 +518,8 @@ def run_training(
         # Progress callback
         cb({
             "type": "epoch_complete",
+            "stage": "training",
+            "status_text": f"Epoch {epoch + 1}/{config.max_epochs} complete (val F1 {val_f1:.3f})",
             "epoch": epoch + 1,
             "max_epochs": config.max_epochs,
             "train_loss": train_loss,

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
@@ -57,10 +58,14 @@ def _train_one_epoch(
     device: torch.device,
     dtype: torch.dtype,
     label_smoothing: float,
+    *,
+    step_callback: Callable[[int, int, float], None] | None = None,
 ) -> float:
     model.train()
     total_loss = 0.0
     num_batches = 0
+    total_steps = len(dataloader)
+    _last_report = time.monotonic()
     criterion = nn.CrossEntropyLoss(label_smoothing=label_smoothing)
 
     optimizer.zero_grad()
@@ -79,6 +84,12 @@ def _train_one_epoch(
 
         total_loss += loss.item()
         num_batches += 1
+
+        if step_callback is not None:
+            now = time.monotonic()
+            if now - _last_report >= 2.0 or num_batches == total_steps:
+                _last_report = now
+                step_callback(num_batches, total_steps, total_loss / num_batches)
 
     return total_loss / max(num_batches, 1)
 
@@ -215,19 +226,34 @@ def run_dual_branch_training(
 
     train_loader = DataLoader(
         train_ds, batch_size=eff_bs, shuffle=True,
-        collate_fn=_collate_dual, num_workers=0,
+        collate_fn=_collate_dual, num_workers=4,
         pin_memory=(device.type == "cuda"),
+        persistent_workers=True, prefetch_factor=3,
     )
     val_loader = DataLoader(
         val_ds, batch_size=eff_bs, shuffle=False,
-        collate_fn=_collate_dual, num_workers=0,
+        collate_fn=_collate_dual, num_workers=4,
         pin_memory=(device.type == "cuda"),
+        persistent_workers=True, prefetch_factor=3,
     )
 
     for epoch in range(config.max_epochs):
+        def _on_step(step: int, total_steps: int, avg_loss: float) -> None:
+            cb({
+                "type": "step",
+                "epoch": epoch + 1,
+                "max_epochs": config.max_epochs,
+                "step": step,
+                "total_steps": total_steps,
+                "train_loss": round(avg_loss, 4),
+                "best_val_macro_f1": best_val_macro_f1 if best_val_macro_f1 >= 0 else None,
+                "best_epoch": best_epoch + 1 if best_val_macro_f1 >= 0 else None,
+            })
+
         train_loss = _train_one_epoch(
             model, train_loader, optimizer, config.num_classes,
             device, dtype, config.label_smoothing,
+            step_callback=_on_step,
         )
         scheduler.step()
 
