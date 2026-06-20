@@ -22,7 +22,12 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# Fixed aspect ratio buckets (9 named ratios, ~0.512 MP, 32px-aligned)
+# Fixed aspect ratio buckets (9 named ratios, 512px base ≈ 0.26 MP, 32px-aligned)
+#
+# Every bucket holds ~512×512 px of area (256k–262k) and every dimension is a
+# multiple of 32 so ConvNeXt's stride-32 stem produces clean feature maps.
+# Editing these dims changes the SmartCache resolution key — stale tensors from
+# a prior table are rebuilt on access (see GroupDataset.__getitem__ shape guard).
 # ---------------------------------------------------------------------------
 
 ASPECT_RATIO_BUCKETS: list[tuple[int, int]] = [
@@ -348,13 +353,24 @@ class ConceptDataset(Dataset):
     def __getitem__(self, idx: int) -> tuple[torch.Tensor, int, tuple[int, int]]:
         sample = self.samples[idx]
         bucket = sample["bucket"]
+        bw, bh = int(bucket[0]), int(bucket[1])
 
         if self._cache is not None:
             result = self._cache.get(sample["path"])
             if result is not None:
                 tensor, _ = result
-                return tensor, sample["label"], tuple(bucket)
-            if self._sourceless:
+                if tuple(tensor.shape[-2:]) == (bh, bw):
+                    return tensor, sample["label"], tuple(bucket)
+                # Cached tensor was built under a different aspect-ratio bucket
+                # table; its size no longer matches this sample's bucket and
+                # would explode the bucket collate. Rebuild from source.
+                if self._sourceless:
+                    raise RuntimeError(
+                        f"Sourceless training: cached tensor for '{sample['path']}' "
+                        f"is {tuple(tensor.shape[-2:])}, expected {(bh, bw)}. The "
+                        f"cache predates the current bucket table — rebuild it."
+                    )
+            elif self._sourceless:
                 raise RuntimeError(
                     f"Sourceless training: cache miss for '{sample['path']}'. "
                     "The cache is incomplete — rebuild it with sourceless disabled."

@@ -11,6 +11,65 @@ import torch
 _IMAGENET_MEAN = torch.tensor([0.485, 0.456, 0.406])
 _IMAGENET_STD = torch.tensor([0.229, 0.224, 0.225])
 
+_randaugment_cache: dict[tuple[int, int], object] = {}
+
+
+def _get_randaugment(num_ops: int, magnitude: int):
+    key = (num_ops, magnitude)
+    if key not in _randaugment_cache:
+        from torchvision.transforms import v2
+        _randaugment_cache[key] = v2.RandAugment(num_ops=num_ops, magnitude=magnitude)
+    return _randaugment_cache[key]
+
+
+def gpu_randaugment(batch: torch.Tensor, num_ops: int, magnitude: int) -> torch.Tensor:
+    """Apply RandAugment to a uint8 CHW batch.
+
+    torchvision.v2.RandAugment processes per-sample even when given a batch
+    dimension, but kernel ops stay on-device. Returns uint8 batch with the
+    same shape and dtype.
+    """
+    ra = _get_randaugment(num_ops, magnitude)
+    # v2.RandAugment expects [..., C, H, W] uint8; iterate the batch to ensure
+    # each sample receives an independent draw of ops + magnitude.
+    out = torch.empty_like(batch)
+    for i in range(batch.shape[0]):
+        out[i] = ra(batch[i])
+    return out
+
+
+def gpu_random_erasing(
+    batch: torch.Tensor,
+    p: float = 0.25,
+    scale: tuple[float, float] = (0.02, 0.20),
+    ratio: tuple[float, float] = (0.3, 3.3),
+) -> torch.Tensor:
+    """Per-image RandomErasing on a normalised float batch.
+
+    Selects a rectangular patch per image (with probability ``p``), and zeroes
+    it on the normalised tensor — equivalent to filling with the dataset mean
+    after un-normalisation. Operates in-place for memory efficiency.
+    """
+    B, C, H, W = batch.shape
+    device = batch.device
+    area = H * W
+
+    keep = torch.rand(B, device=device) >= p
+    for i in range(B):
+        if keep[i]:
+            continue
+        for _ in range(10):
+            target_area = float(torch.empty(1).uniform_(*scale).item()) * area
+            aspect = float(torch.empty(1).uniform_(*ratio).item())
+            h = int(round((target_area * aspect) ** 0.5))
+            w = int(round((target_area / aspect) ** 0.5))
+            if 0 < h < H and 0 < w < W:
+                top = int(torch.randint(0, H - h + 1, (1,)).item())
+                left = int(torch.randint(0, W - w + 1, (1,)).item())
+                batch[i, :, top:top + h, left:left + w] = 0.0
+                break
+    return batch
+
 
 def gpu_normalize(
     batch: torch.Tensor,
@@ -61,18 +120,42 @@ def gpu_color_jitter(
 def apply_train_augment(
     batch: torch.Tensor,
     dtype: torch.dtype = torch.float32,
+    *,
+    randaugment_n: int = 0,
+    randaugment_m: int = 0,
+    random_erasing_p: float = 0.0,
+    memory_format: torch.memory_format | None = None,
 ) -> torch.Tensor:
-    """Normalize uint8 batch and apply training augmentation on GPU."""
+    """Normalize uint8 batch and apply training augmentation on GPU.
+
+    When ``randaugment_m > 0`` RandAugment runs on uint8 before normalisation.
+    When ``random_erasing_p > 0`` RandomErasing runs on the normalised float
+    tensor after the existing colour jitter. ``memory_format`` converts the
+    final tensor (e.g. channels_last) so the model forward never permutes.
+    """
+    if randaugment_m > 0 and randaugment_n > 0:
+        batch = gpu_randaugment(batch, randaugment_n, randaugment_m)
     out = gpu_normalize(batch)
     out = gpu_random_flip(out)
     out = gpu_color_jitter(out, brightness=0.1, contrast=0.1, saturation=0.1)
-    return out.to(dtype=dtype) if dtype != torch.float32 else out
+    if random_erasing_p > 0:
+        out = gpu_random_erasing(out, p=random_erasing_p)
+    if dtype != torch.float32:
+        out = out.to(dtype=dtype)
+    if memory_format is not None:
+        out = out.contiguous(memory_format=memory_format)
+    return out
 
 
 def apply_val_transform(
     batch: torch.Tensor,
     dtype: torch.dtype = torch.float32,
+    memory_format: torch.memory_format | None = None,
 ) -> torch.Tensor:
     """Normalize uint8 batch for validation (no augmentation)."""
     out = gpu_normalize(batch)
-    return out.to(dtype=dtype) if dtype != torch.float32 else out
+    if dtype != torch.float32:
+        out = out.to(dtype=dtype)
+    if memory_format is not None:
+        out = out.contiguous(memory_format=memory_format)
+    return out

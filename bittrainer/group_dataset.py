@@ -25,6 +25,9 @@ from bittrainer.dataset import (
 from bittrainer.image_utils import is_supported_image
 
 
+_NONE_CLASS_NAME = "__none__"
+
+
 def _list_class_images(group_folder: Path, class_name: str, split: str) -> list[Path]:
     d = group_folder / class_name / split
     if not d.is_dir():
@@ -53,6 +56,8 @@ class GroupDataset(Dataset):
         cache: Any | None = None,           # SmartCache instance
         sourceless: bool = False,
         group_name: str = "",
+        oversample_none: bool = False,
+        extra_paths: dict[str, list[str]] | None = None,
     ):
         self.group_folder = Path(group_folder)
         self.class_names = class_names
@@ -64,14 +69,34 @@ class GroupDataset(Dataset):
         self._cache = cache
         self._sourceless = sourceless
         self._group_name = group_name or self.group_folder.name
+        self._oversample_none = oversample_none
 
         if sourceless:
             self._init_sourceless()
             return
 
+        # Off-disk paths supplied by the caller (e.g. __none__ samples that
+        # the labelling pipeline didn't copy into the group folder). Spliced
+        # into the per-class path lists alongside whatever the disk scan
+        # finds; deduplicated by absolute string path.
+        extra = extra_paths or {}
         self._class_paths: list[list[Path]] = []
         for name in class_names:
-            self._class_paths.append(_list_class_images(self.group_folder, name, split))
+            disk_paths = _list_class_images(self.group_folder, name, split)
+            extras = extra.get(name, [])
+            if extras:
+                seen = {str(p) for p in disk_paths}
+                for raw in extras:
+                    p = Path(raw)
+                    if str(p) in seen:
+                        continue
+                    if not is_supported_image(p):
+                        continue
+                    if not p.is_file():
+                        continue
+                    disk_paths.append(p)
+                    seen.add(str(p))
+            self._class_paths.append(disk_paths)
 
         self._cache_dir = self.group_folder / ".resize_cache"
 
@@ -148,7 +173,57 @@ class GroupDataset(Dataset):
                     bucket = find_nearest_bucket(*size_cache[sp])
                     self.samples.append(self._make_sample(sp, class_idx, bucket))
 
+            if self._oversample_none:
+                self._apply_rare_group_oversample(clean_class_paths, size_cache, max_count)
+
         random.shuffle(self.samples)
+
+    def _apply_rare_group_oversample(
+        self,
+        clean_class_paths: list[list[Path]],
+        size_cache: dict[str, tuple[int, int]],
+        max_count: int,
+    ) -> None:
+        """Append extra ``__none__`` samples so the rare-group target dominates.
+
+        Target count for ``__none__`` is ``ceil(1.5 * sum_of_non_none_counts)``
+        where each non-empty non-``__none__`` class contributes ``max_count``
+        after the baseline equalisation. Already-added ``max_count`` __none__
+        samples stay in place; only the *extra* needed to reach the target
+        are appended here.
+        """
+        try:
+            none_idx = self.class_names.index(_NONE_CLASS_NAME)
+        except ValueError:
+            return
+        if none_idx >= len(clean_class_paths):
+            return
+        none_paths = clean_class_paths[none_idx]
+        if not none_paths:
+            return
+
+        non_none_class_count = sum(
+            1 for i, p in enumerate(clean_class_paths) if i != none_idx and p
+        )
+        if non_none_class_count == 0:
+            return
+        non_none_total = max_count * non_none_class_count
+        target = max(max_count, math.ceil(1.5 * non_none_total))
+        extra_needed = target - max_count
+        if extra_needed <= 0:
+            return
+
+        extra = list(none_paths) * (extra_needed // len(none_paths) + 1)
+        random.shuffle(extra)
+        extra = extra[:extra_needed]
+        for p in extra:
+            sp = str(p)
+            bucket = find_nearest_bucket(*size_cache[sp])
+            self.samples.append(self._make_sample(sp, none_idx, bucket))
+        logger.info(
+            "Rare-group oversample: __none__ %d → %d (non-none total %d)",
+            max_count, target, non_none_total,
+        )
 
     def _make_sample(self, path: str, label: int | torch.Tensor, bucket: tuple[int, int]) -> dict:
         return {
@@ -177,14 +252,23 @@ class GroupDataset(Dataset):
         if self.split == "train" and entries:
             random.shuffle(entries)
 
+        try:
+            none_idx = self.class_names.index(_NONE_CLASS_NAME)
+        except ValueError:
+            none_idx = -1
+
         for entry in entries:
             p = entry["path"]
             size = self._get_image_size(p)
             if size is None:
                 continue
 
+            class_indices = set(entry["class_indices"])
+            if none_idx >= 0 and none_idx in class_indices and len(class_indices) > 1:
+                class_indices.discard(none_idx)
+
             label = torch.zeros(num_classes, dtype=torch.float32)
-            for ci in entry["class_indices"]:
+            for ci in class_indices:
                 label[ci] = 1.0
 
             bucket = find_nearest_bucket(*size)
@@ -208,13 +292,25 @@ class GroupDataset(Dataset):
     def __getitem__(self, idx: int) -> tuple[torch.Tensor, int | torch.Tensor, tuple[int, int]]:
         sample = self.samples[idx]
         bucket = sample["bucket"]
+        bw, bh = int(bucket[0]), int(bucket[1])
 
         if self._cache is not None:
             result = self._cache.get(sample["path"])
             if result is not None:
                 tensor, _ = result
-                return tensor, sample["label"], tuple(bucket)
-            if self._sourceless:
+                if tuple(tensor.shape[-2:]) == (bh, bw):
+                    return tensor, sample["label"], tuple(bucket)
+                # Cached tensor was built under a different aspect-ratio bucket
+                # table (e.g. a prior training resolution). Its size no longer
+                # matches this sample's bucket, so it would explode the bucket
+                # collate. Rebuild from source rather than mixing sizes.
+                if self._sourceless:
+                    raise RuntimeError(
+                        f"Sourceless training: cached tensor for '{sample['path']}' "
+                        f"is {tuple(tensor.shape[-2:])}, expected {(bh, bw)}. The "
+                        f"cache predates the current bucket table — rebuild it."
+                    )
+            elif self._sourceless:
                 raise RuntimeError(
                     f"Sourceless training: cache miss for '{sample['path']}'."
                 )

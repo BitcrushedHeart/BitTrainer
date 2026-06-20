@@ -35,7 +35,7 @@ import shutil
 import threading
 import time
 from pathlib import Path
-from typing import Any, Callable, Iterable
+from typing import Any, Callable
 
 import numpy as np
 import torch
@@ -222,7 +222,7 @@ class SmartCache:
         # ------------------------------------------------------------------
         # Fast validation path — dir mtimes + spot check
         # ------------------------------------------------------------------
-        if self._fast_validate(by_path.keys()):
+        if self._fast_validate(by_path):
             n = len(self._cache_index["entries"])
             logger.info("SmartCache: fast validation passed (%d entries)", n)
             self._emit_progress(
@@ -341,6 +341,18 @@ class SmartCache:
             tensor = torch.from_numpy(tensor)
         metadata = {k: v for k, v in cached.items() if k != "tensor"}
         return tensor, metadata
+
+    def content_hash(self, source_path: str) -> str | None:
+        """Return the cached content hash for *source_path*, or ``None``.
+
+        Lets a downstream cache (e.g. the embedding cache) reuse SmartCache's
+        content-addressing without re-hashing the file.
+        """
+        self._ensure_index_loaded()
+        entry = self._cache_index["entries"].get(os.path.normpath(source_path))
+        if entry is None:
+            return None
+        return entry.get("hash")
 
     def iter_sourceless(self) -> list[dict]:
         """Rebuild sample dicts from cache.json for training without source files.
@@ -671,7 +683,7 @@ class SmartCache:
     def _validate_entry(self, path: str, entry: dict, resolution: str, sample: dict) -> str:
         if entry.get("modeltype") != self.modeltype:
             return "modeltype_changed"
-        if entry.get("resolution") and entry["resolution"] != resolution:
+        if entry.get("resolution") != resolution:
             return "resolution_changed"
         if entry.get("cache_version", 0) != CACHE_VERSION:
             return "version_changed"
@@ -714,7 +726,7 @@ class SmartCache:
         entry["split"] = str(sample.get("split", ""))
         entry["concept_name"] = str(sample.get("concept_name", ""))
 
-    def _fast_validate(self, requested_paths: Iterable[str]) -> bool:
+    def _fast_validate(self, by_path: dict[str, dict]) -> bool:
         last_validated = self._cache_index.get("last_validated")
         if last_validated is None:
             return False
@@ -722,10 +734,28 @@ class SmartCache:
         if not entries:
             return False
 
-        requested_set = set(requested_paths)
+        requested_set = set(by_path.keys())
         if not requested_set.issubset(entries.keys()):
             return False
 
+        # In-memory checks for ALL requested items (extremely fast)
+        for path in requested_set:
+            entry = entries[path]
+            if entry.get("modeltype") != self.modeltype:
+                return False
+            if entry.get("cache_version", 0) != CACHE_VERSION:
+                return False
+            expected_res = _bucket_to_resolution(by_path[path]["bucket"])
+            if entry.get("resolution") != expected_res:
+                return False
+            if bool(entry.get("skin_normalise", False)) != bool(by_path[path].get("skin_normalise", False)):
+                return False
+            if entry.get("face_bbox_sig", "none") != _bbox_sig(by_path[path].get("face_bbox")):
+                return False
+            if entry.get("face_model_sig", "none") != self.face_model_sig:
+                return False
+
+        # Directory mtime check
         parent_dirs = {os.path.dirname(p) for p in requested_set}
         for d in parent_dirs:
             try:
@@ -734,6 +764,7 @@ class SmartCache:
             except OSError:
                 return False
 
+        # Random sample for individual file mtime/existence (filesystem calls are slower)
         sample_keys = list(requested_set)
         if len(sample_keys) > 100:
             sample_size = min(50, max(10, len(sample_keys) // 20))
@@ -741,8 +772,6 @@ class SmartCache:
 
         for path in sample_keys:
             entry = entries[path]
-            if entry.get("modeltype") != self.modeltype:
-                return False
             try:
                 current_mtime = os.path.getmtime(path)
             except OSError:

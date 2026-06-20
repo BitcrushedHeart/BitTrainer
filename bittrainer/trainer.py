@@ -20,10 +20,11 @@ from bittrainer.dataset import (
     _DimensionCache,
     build_bucket_batch_sampler,
 )
+from bittrainer.ema import ModelEMA
 from bittrainer.model import (
+    build_llrd_param_groups,
     create_model,
     freeze_backbone,
-    get_stages,
     load_checkpoint,
     unfreeze_backbone,
     unfreeze_stage,
@@ -62,10 +63,37 @@ class TrainConfig:
     face_model_path: str = ""
     cache_dir: str | None = None
     use_cache: bool = True
+    cache_workers: int = 10
     sourceless: bool = False
     concept_name: str = ""
     modeltype: str = "convnext_v2"
     progress_callback: Callable[[dict], None] | None = None
+    # Layer-wise learning rate decay
+    llrd: bool = True
+    llrd_decay: float = 0.8
+    # Exponential moving average of weights. Off by default: at 1k-10k-image
+    # dataset sizes the configured decay never engages (effective decay is
+    # (1+n)/(warmup+n), which only nears 0.9999 after ~90k steps), and the
+    # full-model GPU copy adds VRAM pressure for negligible gain.
+    use_ema: bool = False
+    ema_decay: float = 0.9999
+    # RandAugment + RandomErasing (DeiT/ConvNeXt official fine-tune recipe)
+    randaugment_n: int = 2
+    randaugment_m: int = 9
+    random_erasing_p: float = 0.25
+
+
+def _make_optimizer(model: nn.Module, config: "TrainConfig") -> Prodigy_adv:
+    if config.llrd:
+        params = build_llrd_param_groups(model, config.llrd_decay)
+    else:
+        params = model.parameters()
+    return Prodigy_adv(
+        params, lr=1.0, d_coef=0.9,
+        weight_decay=0.01, betas=(0.9, 0.999),
+        kourkoutas_beta=True, k_warmup_steps=50,
+        cautious_wd=True,
+    )
 
 
 def _get_dtype(name: str) -> torch.dtype:
@@ -105,6 +133,11 @@ def train_one_epoch(
     dtype: torch.dtype,
     *,
     step_callback: Callable[[int, int, float], None] | None = None,
+    stop_now_event: object | None = None,
+    ema: ModelEMA | None = None,
+    randaugment_n: int = 0,
+    randaugment_m: int = 0,
+    random_erasing_p: float = 0.0,
 ) -> float:
     from bittrainer.gpu_augment import apply_train_augment
 
@@ -116,8 +149,15 @@ def train_one_epoch(
 
     optimizer.zero_grad()
     for images, labels in dataloader:
+        if stop_now_event is not None and stop_now_event.is_set():
+            break
         images = images.to(device, non_blocking=True)
-        images = apply_train_augment(images, dtype=dtype)
+        images = apply_train_augment(
+            images, dtype=dtype,
+            randaugment_n=randaugment_n,
+            randaugment_m=randaugment_m,
+            random_erasing_p=random_erasing_p,
+        )
         labels = labels.to(device)
 
         with torch.amp.autocast(device_type=device.type, dtype=dtype, enabled=(dtype != torch.float32)):
@@ -126,6 +166,8 @@ def train_one_epoch(
 
         loss.backward()
         optimizer.step()
+        if ema is not None:
+            ema.update(model)
         optimizer.zero_grad()
 
         total_loss += loss.item()
@@ -223,12 +265,21 @@ def run_training(
     *,
     progress_callback: Callable[[dict], None] | None = None,
     stop_event: object | None = None,
+    stop_now_event: object | None = None,
 ) -> dict:
-    """Run the full training loop. Returns a result dict with metrics and checkpoint path."""
+    """Run the full training loop. Returns a result dict with metrics and checkpoint path.
+
+    stop_event signals a graceful stop that takes effect at the next epoch
+    boundary. stop_now_event additionally interrupts the current epoch's
+    training loop mid-batch; validation and the final fair-comparison block
+    still run on the partial-epoch state.
+    """
+    from bittrainer.runtime import configure_cuda_backend
     from bittrainer.smart_cache import _noop_callback, _never_stop
     cb = progress_callback or config.progress_callback or _noop_callback
     device = torch.device(config.device)
     dtype = _get_dtype(config.dtype)
+    configure_cuda_backend()
     concept_folder = Path(config.concept_folder)
     checkpoint_dir = Path(config.checkpoint_dir) if config.checkpoint_dir else concept_folder / "checkpoints"
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
@@ -305,8 +356,6 @@ def run_training(
             face_cache = FaceBBoxCache(cache_dir / "face_bboxes.json")
             all_image_paths = [s["path"] for s in train_ds.samples] + [s["path"] for s in val_ds.samples]
 
-            total_faces = len(all_image_paths)
-
             def _face_progress(done: int, total: int) -> None:
                 cb({
                     "type": "training_progress", "stage": "face_detection",
@@ -334,7 +383,7 @@ def run_training(
             try:
                 smart_cache.prepare(
                     all_cache_samples, build_image_tensor,
-                    num_workers=1,  # PIL+LANCZOS is GIL-free enough, avoid oversubscription with GPU work
+                    num_workers=config.cache_workers,
                     stage_label="caching",
                 )
             except CachingStoppedException:
@@ -359,6 +408,10 @@ def run_training(
 
     # Create model — warm-start from best.pt unless from_scratch is set
     existing_best = checkpoint_dir / config.best_model_name
+    cb({
+        "type": "training_progress", "stage": "preparing",
+        "status_text": "Loading model",
+    })
     if not config.from_scratch and existing_best.exists():
         try:
             model = load_checkpoint(
@@ -375,27 +428,37 @@ def run_training(
 
     # Probe unfrozen = worst-case VRAM, then freeze for epoch 0
     from bittrainer.autobatch import determine_batch_size
-    auto_result = determine_batch_size(model, bucket_counts, device, dtype=dtype)
+
+    def _probe_progress(attempt: int, candidate: int, cap: int, status: str) -> None:
+        cb({
+            "type": "training_progress", "stage": "preparing",
+            "status_text": f"Probing batch size (try {attempt}: {candidate}/{cap} — {status})",
+        })
+
+    cb({
+        "type": "training_progress", "stage": "preparing",
+        "status_text": "Probing optimal batch size",
+    })
+    auto_result = determine_batch_size(
+        model, bucket_counts, device, dtype=dtype,
+        use_ema=config.use_ema, progress_callback=_probe_progress,
+    )
     eff_bs = auto_result["batch_size"]
     cb({"type": "autobatch", **auto_result})
     freeze_backbone(model)
 
     # Optimiser: Prodigy_adv with kourkoutas beta and cautious weight decay
-    optimizer = Prodigy_adv(
-        model.parameters(),
-        lr=1.0,
-        d_coef=0.9,
-        weight_decay=0.01,
-        betas=(0.9, 0.999),
-        kourkoutas_beta=True,
-        k_warmup_steps=50,
-        cautious_mask=True,
-    )
+    optimizer = _make_optimizer(model, config)
 
     # Scheduler: cosine annealing (stepped once per epoch)
     scheduler = CosineAnnealingLR(optimizer, T_max=config.max_epochs)
 
     criterion = nn.CrossEntropyLoss(label_smoothing=config.label_smoothing)
+
+    # EMA tracks all params from the start; freeze/unfreeze only affects which
+    # ones receive gradient updates, but the EMA still mirrors the live tensor
+    # values, which is what we want for inference-time smoothing.
+    ema = ModelEMA(model, decay=config.ema_decay) if config.use_ema else None
 
     best_val_f1 = -1.0
     best_epoch = 0
@@ -406,6 +469,10 @@ def run_training(
     # Async disk reads + pinned H2D transfers overlap with GPU compute.
     # Workers respawn when train loader rebuilds between epochs (for negative
     # resampling) — accept the ~3s Windows spawn cost for within-epoch async.
+    cb({
+        "type": "training_progress", "stage": "preparing",
+        "status_text": f"Batch size {eff_bs} — spawning data workers",
+    })
     val_sampler = build_bucket_batch_sampler(val_ds, batch_size=eff_bs)
     val_loader = DataLoader(
         val_ds, batch_sampler=val_sampler, collate_fn=_collate_bucket_batch,
@@ -430,6 +497,10 @@ def run_training(
     })
 
     for epoch in range(config.max_epochs):
+        if stop_now_event is not None and stop_now_event.is_set():
+            logger.info("Stop-now requested before epoch %d — running final comparison", epoch)
+            cb({"type": "stop_now", "epoch": epoch, "max_epochs": config.max_epochs})
+            break
         if stop_event is not None and stop_event.is_set():
             logger.info("Graceful stop requested after epoch %d — running final comparison", epoch)
             cb({"type": "graceful_stop", "epoch": epoch, "max_epochs": config.max_epochs})
@@ -449,12 +520,7 @@ def run_training(
             else:
                 unfreeze_backbone(model)
                 # Re-create optimizer with all params
-                optimizer = Prodigy_adv(
-                    model.parameters(), lr=1.0, d_coef=0.9,
-                    weight_decay=0.01, betas=(0.9, 0.999),
-                    kourkoutas_beta=True, k_warmup_steps=50,
-                    cautious_mask=True,
-                )
+                optimizer = _make_optimizer(model, config)
                 remaining_epochs = config.max_epochs - 1  # 1 epoch already done
                 scheduler = CosineAnnealingLR(optimizer, T_max=remaining_epochs)
         elif epoch > 1 and use_gradual_unfreeze:
@@ -488,11 +554,24 @@ def run_training(
         train_loss = train_one_epoch(
             model, train_loader, optimizer, criterion, device, dtype,
             step_callback=_on_step,
+            stop_now_event=stop_now_event,
+            ema=ema,
+            randaugment_n=config.randaugment_n,
+            randaugment_m=config.randaugment_m,
+            random_erasing_p=config.random_erasing_p,
         )
+        if stop_now_event is not None and stop_now_event.is_set():
+            cb({
+                "type": "stop_now",
+                "epoch": epoch + 1,
+                "max_epochs": config.max_epochs,
+                "status_text": f"Stop-now triggered mid-epoch {epoch + 1} — finishing up",
+            })
         scheduler.step()
 
-        # Validate
-        val_result = evaluate(model, val_loader, criterion, device, dtype)
+        # Validate (against EMA weights when enabled — they generalise better)
+        eval_model = ema.module if ema is not None else model
+        val_result = evaluate(eval_model, val_loader, criterion, device, dtype)
         metrics = compute_metrics(val_result["labels"], val_result["probs"])
         metrics["val_loss"] = val_result["val_loss"]
         metrics["train_loss"] = train_loss
@@ -506,11 +585,16 @@ def run_training(
             best_metrics = metrics.copy()
 
             ckpt_path = checkpoint_dir / "candidate.pt"
-            torch.save({
-                "state_dict": model.state_dict(),
+            primary_state = ema.state_dict() if ema is not None else model.state_dict()
+            ckpt_meta = {
+                "state_dict": primary_state,
                 "num_classes": 2,
                 "model_size": config.model_size,
-            }, ckpt_path)
+            }
+            if ema is not None:
+                ckpt_meta["model_state_dict"] = model.state_dict()
+                ckpt_meta["ema_decay"] = config.ema_decay
+            torch.save(ckpt_meta, ckpt_path)
             best_checkpoint_path = str(ckpt_path)
         else:
             patience_counter += 1
