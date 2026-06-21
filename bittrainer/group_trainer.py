@@ -31,7 +31,7 @@ from bittrainer.group_validation import (
     find_per_class_thresholds,
     ordinal_decode,
 )
-from bittrainer.losses import AsymmetricLoss
+from bittrainer.losses import AsymmetricLoss, FocalLoss
 from bittrainer.embedding_cache import EmbeddingCache
 from bittrainer.head_probe import (
     prepare_head_probe_tensors,
@@ -129,12 +129,40 @@ class GroupTrainConfig:
     asl_gamma_neg: float = 4.0
     asl_gamma_pos: float = 0.0
     asl_clip: float = 0.05
-    # Exponential moving average of weights. Off by default: at 1k-10k-image
-    # dataset sizes the configured decay never engages (effective decay is
-    # (1+n)/(warmup+n), which only nears 0.9999 after ~90k steps), and the
-    # full-model GPU copy adds VRAM pressure for negligible gain.
+    # --- Phase-2 regularisers: OPT-IN, default OFF. An A/B on the ordinal
+    # "Inner Labia" group (6 epochs) regressed QWK -0.19 vs the resample
+    # baseline, so these ship off and are enabled per-run/per-group (frontend
+    # plumbing TBD). The parameter values below are the recommended settings
+    # *when* enabled. ---
+    # Exponential moving average of weights. 0.999 decay (time constant ~1k
+    # steps) engages at 1k-10k-image sizes; the old 0.9999 only neared target
+    # after ~90k steps. When on, EMA weights become the primary state_dict.
     use_ema: bool = False
-    ema_decay: float = 0.9999
+    ema_decay: float = 0.999
+    # Stochastic Weight Averaging over the cosine tail (epoch >= swa_start_frac *
+    # max_epochs). ConvNeXt is LayerNorm-only, so no BatchNorm recalibration is
+    # needed. Needs >= 2 epochs in the tail to do anything.
+    use_swa: bool = False
+    swa_start_frac: float = 0.6
+    # MixUp / CutMix (batch-level). Composes with ordinal soft targets: targets
+    # are smoothed first, then interpolated. Gated off on tiny datasets.
+    use_mixup: bool = False
+    mixup_alpha: float = 0.2
+    cutmix_alpha: float = 1.0
+    mixup_prob: float = 0.5
+    mixup_min_images: int = 200
+    # Class imbalance handling. "resample" (default) replicates every class up to
+    # the largest; "reweight" samples at the natural distribution and applies
+    # effective-number class weights (Cui et al., 2019) in the loss; "auto" picks
+    # "reweight" only above class_balance_auto_ratio. resample + weights would
+    # double-correct, so the two are mutually exclusive by construction.
+    # NOTE: "reweight"/"auto" reduce gradient steps/epoch (natural < replicated),
+    # which under-trained short runs in testing — prefer for long-horizon runs.
+    class_balance_mode: str = "resample"
+    class_balance_beta: float = 0.999
+    class_balance_auto_ratio: float = 4.0
+    use_focal: bool = False
+    focal_gamma: float = 2.0
     # RandAugment + RandomErasing (DeiT/ConvNeXt official fine-tune recipe)
     randaugment_n: int = 2
     randaugment_m: int = 9
@@ -432,9 +460,29 @@ def _build_soft_targets(
     return targets
 
 
-def _soft_ce_loss(log_probs: torch.Tensor, soft_targets: torch.Tensor) -> torch.Tensor:
-    """Cross-entropy loss against soft targets."""
-    return -(soft_targets * log_probs).sum(dim=1).mean()
+def _soft_ce_loss(
+    log_probs: torch.Tensor,
+    soft_targets: torch.Tensor,
+    *,
+    class_weights: torch.Tensor | None = None,
+    focal_gamma: float = 0.0,
+) -> torch.Tensor:
+    """Cross-entropy against soft targets, with optional focal + class weights.
+
+    Single source of truth for the soft-target loss, so the full-FT loop, the
+    head probe, and the MixUp path all reduce identically. ``focal_gamma`` adds
+    ``(1 - p_t)^gamma`` modulation (p_t = expected prob under the soft target);
+    ``class_weights`` applies the per-class weight as the expected weight under
+    the soft target, normalised so the batch loss scale is invariant.
+    """
+    ce = -(soft_targets * log_probs).sum(dim=1)  # [N]
+    if focal_gamma > 0:
+        p_t = (soft_targets * log_probs.exp()).sum(dim=1).clamp(0.0, 1.0)
+        ce = (1.0 - p_t).pow(focal_gamma) * ce
+    if class_weights is not None:
+        w = (soft_targets * class_weights.unsqueeze(0)).sum(dim=1)
+        return (ce * w).sum() / w.sum().clamp(min=1e-8)
+    return ce.mean()
 
 
 def build_group_loss_fn(
@@ -443,14 +491,18 @@ def build_group_loss_fn(
     use_soft_targets: bool,
     none_index: int,
     device: torch.device,
+    class_weights: torch.Tensor | None = None,
 ) -> Callable[[torch.Tensor, torch.Tensor], torch.Tensor]:
     """Return ``loss_fn(logits, labels)`` for the group head/loss zoo.
 
     Single source of truth for the three branches (multi-label ASL/BCE,
     soft-CE with ordinal Gaussian smoothing + soft aliases, plain/label-smoothed
     CE) shared by the full-FT loop and the cached head probe â€” so neither can
-    drift from the other.
+    drift from the other. ``class_weights`` (the "reweight" balance mode) and
+    ``config.use_focal`` apply to the single-label paths only.
     """
+    focal_gamma = config.focal_gamma if config.use_focal else 0.0
+
     if config.multi_label:
         if config.use_asl:
             ml_criterion: nn.Module = AsymmetricLoss(
@@ -477,15 +529,87 @@ def build_group_loss_fn(
                 device=device,
             )
             log_probs = torch.log_softmax(logits.float(), dim=1)
-            return _soft_ce_loss(log_probs, soft)
+            return _soft_ce_loss(
+                log_probs, soft, class_weights=class_weights, focal_gamma=focal_gamma,
+            )
+
+    elif focal_gamma > 0:
+        focal = FocalLoss(gamma=focal_gamma, label_smoothing=config.label_smoothing)
+
+        def loss_fn(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+            return focal(logits, labels)
 
     else:
-        criterion = nn.CrossEntropyLoss(label_smoothing=0.0)
+        criterion = nn.CrossEntropyLoss(label_smoothing=0.0, weight=class_weights)
 
         def loss_fn(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
             return criterion(logits, labels)
 
     return loss_fn
+
+
+def _resolve_class_balance(config: GroupTrainConfig, class_counts: dict[int, int]) -> str:
+    """Resolve ``class_balance_mode`` to a concrete "resample"/"reweight".
+
+    ``auto`` picks "reweight" only when the max/min class-count ratio (over
+    classes with at least one image) exceeds ``class_balance_auto_ratio`` — mild
+    imbalance is served fine by the existing replication-equalised sampling, and
+    switching to weights there adds variance for no gain.
+    """
+    mode = (config.class_balance_mode or "resample").lower()
+    if mode != "auto":
+        return mode if mode in ("resample", "reweight") else "resample"
+    counts = [c for c in class_counts.values() if c > 0]
+    if len(counts) < 2:
+        return "resample"
+    ratio = max(counts) / max(1, min(counts))
+    return "reweight" if ratio >= config.class_balance_auto_ratio else "resample"
+
+
+def _effective_number_weights(
+    class_counts: dict[int, int],
+    num_classes: int,
+    beta: float,
+    device: torch.device,
+) -> torch.Tensor:
+    """Class weights by the effective number of samples (Cui et al., CVPR 2019).
+
+    ``w_c ∝ (1 - beta) / (1 - beta^{n_c})``, normalised so the mean weight is 1
+    (keeps the loss scale comparable to the unweighted baseline). Empty classes
+    keep weight 1.
+    """
+    weights = torch.ones(num_classes, dtype=torch.float32)
+    for i in range(num_classes):
+        n = int(class_counts.get(i, 0))
+        if n > 0:
+            eff = (1.0 - beta**n) / (1.0 - beta) if beta < 1.0 else float(n)
+            weights[i] = 1.0 / max(eff, 1e-8)
+    weights = weights * (num_classes / weights.sum().clamp(min=1e-8))
+    return weights.to(device)
+
+
+class _SWA:
+    """Running average of model weights over the cosine tail (LayerNorm backbone
+    => no BatchNorm recalibration needed). Captures a uniform average of the
+    state_dicts handed to ``update`` and materialises them into a model on
+    request."""
+
+    def __init__(self) -> None:
+        self._avg: dict[str, torch.Tensor] | None = None
+        self.n = 0
+
+    @torch.no_grad()
+    def update(self, model: nn.Module) -> None:
+        sd = {k: v.detach().float().cpu().clone() for k, v in model.state_dict().items()}
+        if self._avg is None:
+            self._avg = sd
+        else:
+            for k, v in sd.items():
+                self._avg[k].mul_(self.n / (self.n + 1)).add_(v / (self.n + 1))
+        self.n += 1
+
+    def state_dict(self) -> dict[str, torch.Tensor] | None:
+        return self._avg
 
 
 # ---------------------------------------------------------------------------
@@ -505,6 +629,8 @@ def _train_one_epoch(
     step_callback: Callable[[int, int, float], None] | None = None,
     stop_now_event: object | None = None,
     ema: ModelEMA | None = None,
+    class_weights: torch.Tensor | None = None,
+    mixup_enabled: bool = False,
 ) -> float:
     model.train()
     total_loss = 0.0
@@ -512,13 +638,16 @@ def _train_one_epoch(
     total_steps = len(dataloader)
     accum = max(1, int(config.grad_accum_steps))
     _last_report = time.monotonic()
+    none_index = _resolve_none_index(config.class_names)
 
     loss_fn = build_group_loss_fn(
         config, use_soft_targets=use_soft_targets,
-        none_index=_resolve_none_index(config.class_names), device=device,
+        none_index=none_index, device=device, class_weights=class_weights,
     )
+    focal_gamma = config.focal_gamma if config.use_focal else 0.0
 
     from bittrainer.gpu_augment import apply_train_augment
+    from bittrainer.mixing import apply_mixing
 
     memory_format = torch.channels_last if config.channels_last else None
     optimizer.zero_grad()
@@ -535,9 +664,32 @@ def _train_one_epoch(
         )
         labels = labels.to(device)
 
+        # MixUp/CutMix: smooth targets first (preserving ordinal/label smoothing),
+        # then interpolate, so mixing composes with the soft-target loss.
+        mix_soft = None
+        if mixup_enabled and torch.rand(1).item() < config.mixup_prob:
+            mix_soft = _build_soft_targets(
+                labels, config.num_classes,
+                ordinal=config.ordinal, ordinal_sigma=config.ordinal_sigma,
+                label_smoothing=config.label_smoothing,
+                soft_aliases=config.soft_aliases or None,
+                none_index=none_index, device=device,
+            )
+            images, mix_soft = apply_mixing(
+                images, mix_soft, config.num_classes,
+                mixup_alpha=config.mixup_alpha, cutmix_alpha=config.cutmix_alpha,
+                label_smoothing=0.0,
+            )
+
         with torch.amp.autocast(device_type=device.type, dtype=dtype, enabled=(dtype != torch.float32)):
             logits = model(images)
-            loss = loss_fn(logits, labels)
+            if mix_soft is not None:
+                loss = _soft_ce_loss(
+                    torch.log_softmax(logits.float(), dim=1), mix_soft,
+                    class_weights=class_weights, focal_gamma=focal_gamma,
+                )
+            else:
+                loss = loss_fn(logits, labels)
 
         scaled = loss / accum if accum > 1 else loss
         scaled.backward()
@@ -819,6 +971,73 @@ def _persist_softmax_calibration(
             torch.save(ckpt, checkpoint_path)
     except Exception:
         logger.warning("Failed to persist softmax calibration to checkpoint", exc_info=True)
+
+
+# Cap stored validation rows so the checkpoint stays small (a few hundred KB at
+# most). The suite only needs enough resolution to draw a selective-metric curve;
+# evenly subsampling large val sets preserves the curve shape.
+_STRICTNESS_MAX_VAL_ROWS = 5000
+
+
+def _persist_strictness_val_data(
+    checkpoint_path: str | None,
+    *,
+    config: GroupTrainConfig,
+    val_loader: DataLoader,
+    device: torch.device,
+    dtype: torch.dtype,
+    temperature: float,
+    class_logit_bias: list[float],
+    ml_probs: np.ndarray | None,
+    ml_labels: np.ndarray | None,
+    cached_logits: torch.Tensor | None,
+    cached_labels: torch.Tensor | None,
+) -> None:
+    """Stash *calibrated* validation probabilities + labels in the checkpoint.
+
+    Generic, gating-agnostic data: the suite reconstructs the auto-correct
+    "strictness curve" (selective metric vs confidence gate) from these without
+    re-running inference. The probabilities match what inference ships — softmax
+    over temperature/bias-calibrated logits (single-label) or sigmoid scores
+    (multi-label) — so the suite's gate confidences line up exactly.
+    """
+    if not checkpoint_path:
+        return
+    try:
+        if config.multi_label:
+            if ml_probs is None or ml_labels is None:
+                return
+            probs = np.asarray(ml_probs, dtype=np.float32)
+            labels = np.asarray(ml_labels).astype(np.int64)  # [N, C] indicator
+        else:
+            if cached_logits is not None and cached_labels is not None:
+                logits, labels_t = cached_logits, cached_labels
+            else:
+                model = load_checkpoint(
+                    checkpoint_path, device=str(device), dtype=dtype,
+                    model_size=config.backbone_variant, num_classes=config.num_classes,
+                ).to(device)
+                logits, labels_t = _collect_val_logits(model, val_loader, config, device, dtype)
+                del model
+            bias_t = torch.tensor(class_logit_bias, dtype=torch.float32)
+            calibrated = logits.float() / max(float(temperature), 1e-6) + bias_t
+            probs = torch.softmax(calibrated, dim=1).numpy().astype(np.float32)
+            labels = labels_t.numpy().astype(np.int64)  # [N]
+
+        if probs.shape[0] == 0:
+            return
+        if probs.shape[0] > _STRICTNESS_MAX_VAL_ROWS:
+            idx = np.linspace(0, probs.shape[0] - 1, _STRICTNESS_MAX_VAL_ROWS).astype(np.int64)
+            probs = probs[idx]
+            labels = labels[idx]
+
+        ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+        if isinstance(ckpt, dict):
+            ckpt["val_probs"] = torch.from_numpy(np.ascontiguousarray(probs))
+            ckpt["val_labels"] = torch.from_numpy(np.ascontiguousarray(labels))
+            torch.save(ckpt, checkpoint_path)
+    except Exception:
+        logger.warning("Failed to persist strictness val data to checkpoint", exc_info=True)
 
 
 def _finalise_ordinal_decode(
@@ -1485,6 +1704,9 @@ def _compare_promote_finalize(
     class_logit_bias = [0.0] * config.num_classes
     ordinal_cut_points: list[float] | None = None
     none_idx = _resolve_none_index(config.class_names)
+    # Reused below to persist the strictness val data without a second val pass.
+    val_logits_cache: torch.Tensor | None = None
+    val_labels_cache: torch.Tensor | None = None
     if (
         best_checkpoint_path
         and not config.multi_label
@@ -1497,6 +1719,7 @@ def _compare_promote_finalize(
                 model_size=config.backbone_variant, num_classes=config.num_classes,
             ).to(device)
             logits, labels = _collect_val_logits(calib_model, val_loader, config, device, dtype)
+            val_logits_cache, val_labels_cache = logits, labels
             del calib_model
 
             # __none__ gate: temperature + none-bias (only when a none class exists).
@@ -1557,6 +1780,24 @@ def _compare_promote_finalize(
                     torch.save(ckpt, best_checkpoint_path)
             except Exception:
                 logger.warning("Failed to persist per_class_thresholds to checkpoint", exc_info=True)
+
+    # Stash calibrated val probs + labels in the checkpoint so the suite can draw
+    # the auto-correct strictness curve later without re-running inference. Uses
+    # the logits already collected during calibration when available; for plain
+    # single-label groups (no __none__, not ordinal) it does one extra val pass.
+    _persist_strictness_val_data(
+        best_checkpoint_path,
+        config=config,
+        val_loader=val_loader,
+        device=device,
+        dtype=dtype,
+        temperature=calibration_temperature,
+        class_logit_bias=class_logit_bias,
+        ml_probs=best_metrics.get("_probs"),
+        ml_labels=best_metrics.get("_labels"),
+        cached_logits=val_logits_cache,
+        cached_labels=val_labels_cache,
+    )
 
     # Strip internal numpy arrays before constructing the result dict â€”
     # downstream consumers serialise this to JSON.
@@ -1706,6 +1947,31 @@ def run_group_training(
     class_counts = train_ds.get_class_counts()
     total_raw = sum(class_counts.values())
 
+    # --- Class imbalance strategy: resample (replicate) vs reweight (natural
+    # sampling + effective-number weights). Mutually exclusive, so no double
+    # correction. ---
+    balance_mode = _resolve_class_balance(config, class_counts)
+    class_weights: torch.Tensor | None = None
+    if not config.multi_label and balance_mode == "reweight":
+        train_ds.set_natural_sampling(True)
+        class_weights = _effective_number_weights(
+            class_counts, config.num_classes, config.class_balance_beta, device,
+        )
+        cb({
+            "type": "training_progress", "stage": "preparing",
+            "status_text": "Class balance: reweight (natural sampling + effective-number weights)",
+        })
+
+    # --- MixUp/CutMix gate: skip on tiny datasets where the full aug stack
+    # over-regularises, and for multi-label (single-label soft-target path only). ---
+    mixup_enabled = (
+        config.use_mixup and not config.multi_label and total_raw >= config.mixup_min_images
+    )
+
+    # --- SWA: average weights over the cosine tail (epoch >= swa_start_epoch). ---
+    swa = _SWA() if (config.use_swa and not config.multi_label) else None
+    swa_start_epoch = int(config.swa_start_frac * config.max_epochs)
+
     # Optimizer (LLRD param groups when config.llrd, else flat). Built once over
     # the fully-unfrozen model â€” the warm head means no epoch-1 rebuild.
     optimizer = _make_optimizer(model, config)
@@ -1802,6 +2068,8 @@ def run_group_training(
             step_callback=_on_step,
             stop_now_event=stop_now_event,
             ema=ema,
+            class_weights=class_weights,
+            mixup_enabled=mixup_enabled,
         )
         if stop_now_event is not None and stop_now_event.is_set():
             cb({
@@ -1811,6 +2079,11 @@ def run_group_training(
                 "status_text": f"Stop-now triggered mid-epoch {epoch + 1} â€” finishing up",
             })
         scheduler.step()
+
+        # Capture the post-epoch weights into the SWA running average over the
+        # cosine tail (uniform average; LayerNorm backbone needs no BN update).
+        if swa is not None and epoch >= swa_start_epoch:
+            swa.update(model)
 
         # Validate (against EMA weights when enabled â€” they generalise better)
         em.stage(
@@ -1902,6 +2175,48 @@ def run_group_training(
         if patience_counter >= config.patience:
             logger.info("Early stopping at epoch %d (patience=%d)", epoch + 1, config.patience)
             break
+
+    # --- SWA finalisation: materialise the averaged weights, evaluate them, and
+    # adopt as the candidate only when they beat the best single-epoch checkpoint
+    # on the selection score (so calibration/cut-points then fit on them). ---
+    if swa is not None and swa.n >= 2 and best_checkpoint_path:
+        try:
+            swa_sd_cpu = swa.state_dict()
+            model.load_state_dict({k: v.to(device) for k, v in swa_sd_cpu.items()})
+            swa_metrics = _evaluate(
+                model, val_loader, config.num_classes, device, dtype,
+                multi_label=config.multi_label, ordinal=config.ordinal,
+                none_index=_resolve_none_index(config.class_names),
+                channels_last=config.channels_last,
+            )
+            swa_score = _metric_score(swa_metrics, config)
+            cb({
+                "type": "training_progress", "stage": "validating",
+                "status_text": (
+                    f"SWA ({swa.n} snapshots): score {swa_score:.4f} "
+                    f"vs best {best_validation_score:.4f}"
+                ),
+            })
+            if swa_score > best_validation_score:
+                ckpt_meta = {
+                    "state_dict": swa_sd_cpu,
+                    "num_classes": config.num_classes,
+                    "model_size": config.backbone_variant,
+                    "class_names": list(config.class_names),
+                    "validation_metric": _primary_validation_metric(config),
+                }
+                if head_hidden_size is not None:
+                    ckpt_meta["head_hidden_size"] = head_hidden_size
+                ckpt_path = checkpoint_dir / "candidate.pt"
+                torch.save(ckpt_meta, ckpt_path)
+                best_checkpoint_path = str(ckpt_path)
+                best_metrics = swa_metrics.copy()
+                best_val_macro_f1 = swa_metrics["macro_f1"]
+                best_val_qwk = swa_metrics.get("qwk", 0.0)
+                best_validation_score = swa_score
+                logger.info("SWA weights adopted (score %.4f)", swa_score)
+        except Exception:
+            logger.warning("SWA evaluation failed; keeping best single-epoch checkpoint", exc_info=True)
 
     return _compare_promote_finalize(
         config,

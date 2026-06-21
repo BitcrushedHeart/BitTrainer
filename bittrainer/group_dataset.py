@@ -58,6 +58,7 @@ class GroupDataset(Dataset):
         group_name: str = "",
         oversample_none: bool = False,
         extra_paths: dict[str, list[str]] | None = None,
+        natural_sampling: bool = False,
     ):
         self.group_folder = Path(group_folder)
         self.class_names = class_names
@@ -70,6 +71,11 @@ class GroupDataset(Dataset):
         self._sourceless = sourceless
         self._group_name = group_name or self.group_folder.name
         self._oversample_none = oversample_none
+        # When True, train samples are taken at their natural class distribution
+        # (each image once) instead of replication-equalised to the largest
+        # class — used by the "reweight" class-balance mode, where imbalance is
+        # handled by class weights in the loss instead of by oversampling.
+        self._natural_sampling = natural_sampling
 
         if sourceless:
             self._init_sourceless()
@@ -160,7 +166,11 @@ class GroupDataset(Dataset):
             for class_idx, paths in enumerate(clean_class_paths):
                 if not paths:
                     continue
-                if len(paths) < max_count:
+                if self._natural_sampling:
+                    # Natural distribution: every image once, no equalisation.
+                    expanded = list(paths)
+                    random.shuffle(expanded)
+                elif len(paths) < max_count:
                     expanded = paths * (max_count // len(paths) + 1)
                     random.shuffle(expanded)
                     expanded = expanded[:max_count]
@@ -275,6 +285,15 @@ class GroupDataset(Dataset):
             self.samples.append(self._make_sample(str(p), label, bucket))
 
     def reshuffle(self) -> None:
+        if self.split == "train" and not self._sourceless:
+            self._build_samples()
+
+    def set_natural_sampling(self, flag: bool) -> None:
+        """Switch between natural-distribution and replication-equalised train
+        sampling, rebuilding the sample list. No-op for val/sourceless."""
+        if self._natural_sampling == flag:
+            return
+        self._natural_sampling = flag
         if self.split == "train" and not self._sourceless:
             self._build_samples()
 
