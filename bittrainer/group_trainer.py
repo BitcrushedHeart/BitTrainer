@@ -57,6 +57,20 @@ _NONE_F1_WEIGHT = 0.10
 _NONE_RECALL_REGRESSION_TOLERANCE = 0.02
 _REAL_MACRO_F1_REGRESSION_TOLERANCE = 0.01
 _NONE_LOGIT_BIAS_GRID = [round(i * 0.025, 3) for i in range(21)]
+
+# --- Checkpoint selection (epoch "best" criterion) -------------------------
+# QWK alone is gameable: a model that collapses toward the centre of the
+# ordinal scale keeps QWK high (adjacent errors are cheap) while exact-match
+# macro-F1 craters. Selecting argmax(QWK) then latches onto a noise-level QWK
+# spike that happens to coincide with an F1 collapse (e.g. QWK 0.89/F1 0.45
+# "beating" QWK 0.88/F1 0.70). We instead select ordinal models on a weighted
+# harmonic mean of the ordinal metric and macro-F1 (the harmonic mean, as in
+# F1 itself, punishes any single weak component far more than an arithmetic
+# mean), and require a minimum improvement so epoch-to-epoch noise cannot flip
+# the choice (one-standard-error-rule spirit: Breiman/CART, ESL 7.10;
+# min_delta: Prechelt 1998, Keras EarlyStopping).
+_SELECTION_SECONDARY_WEIGHT = 0.40  # weight on macro-F1 in the composite (0 = pure ordinal metric)
+_SELECTION_MIN_DELTA = 0.002        # min composite gain required to replace the incumbent best
 _TEMPERATURE_GRID = [0.75, 0.85, 1.0, 1.15, 1.3, 1.5]
 
 
@@ -180,12 +194,44 @@ def _guarded_score(metrics: dict, config: GroupTrainConfig) -> float:
     return float(metrics.get("macro_f1") or 0.0) + _NONE_F1_WEIGHT * none_f1
 
 
+def _ordinal_primary_score(metrics: dict, config: GroupTrainConfig) -> float:
+    """The ordinal driver metric (QWK, plus the __none__ guard term when the
+    group uses guarded_qwk) BEFORE it is composited with macro-F1."""
+    qwk = float(metrics.get("qwk") or 0.0)
+    if _primary_validation_metric(config) == "guarded_qwk" and _guarded_metric_enabled(config):
+        return qwk + _NONE_F1_WEIGHT * float(metrics.get("none_f1") or 0.0)
+    return qwk
+
+
+def _composite_selection_score(primary: float, macro_f1: float) -> float:
+    """Weighted harmonic mean of the ordinal primary metric and macro-F1.
+
+    The harmonic mean (as in F1 itself) is dominated by whichever component is
+    weakest, so a marginal QWK gain cannot buy back a large macro-F1 collapse.
+    Degenerate inputs (<= 0, where the harmonic mean is undefined) fall back to
+    the weighted arithmetic mean so the ordering stays well-defined.
+    """
+    p = max(0.0, primary)
+    s = max(0.0, macro_f1)
+    w_secondary = _SELECTION_SECONDARY_WEIGHT
+    w_primary = 1.0 - w_secondary
+    if p <= 0.0 or s <= 0.0:
+        return w_primary * p + w_secondary * s
+    return 1.0 / (w_primary / p + w_secondary / s)
+
+
 def _metric_score(metrics: dict, config: GroupTrainConfig) -> float:
-    if _guarded_metric_enabled(config) and (
-        (config.ordinal and _primary_validation_metric(config) == "guarded_qwk")
-        or not config.ordinal
-    ):
+    # Ordinal groups: select on a composite of the ordinal metric (QWK or
+    # guarded QWK) and macro-F1 so a marginal QWK gain cannot override an
+    # exact-match (macro-F1) collapse. See the _SELECTION_* constants above.
+    if config.ordinal and _primary_validation_metric(config) in ("qwk", "guarded_qwk"):
+        primary = _ordinal_primary_score(metrics, config)
+        macro_f1 = float(metrics.get("macro_f1") or 0.0)
+        return _composite_selection_score(primary, macro_f1)
+    # Non-ordinal groups: macro-F1 (with the __none__ guard term when present).
+    if _guarded_metric_enabled(config) and not config.ordinal:
         return _guarded_score(metrics, config)
+    # Ordinal-as-macro_f1 or any other fallthrough: the primary metric as-is.
     metric = _primary_validation_metric(config)
     value = metrics.get("qwk" if metric == "qwk" else "macro_f1")
     return float(value) if value is not None else 0.0
@@ -1699,7 +1745,10 @@ def run_group_training(
         val_qwk = val_metrics.get("qwk", 0.0)
 
         selected_score = _metric_score(val_metrics, config)
-        improved = selected_score > best_validation_score
+        # Require a minimum gain so epoch-to-epoch noise can't flip the
+        # selection onto a marginally-higher but less robust checkpoint. The
+        # first epoch always clears this (incumbent starts at -1.0).
+        improved = selected_score > best_validation_score + _SELECTION_MIN_DELTA
         if improved:
             best_val_macro_f1 = val_macro_f1
             best_val_qwk = val_qwk
