@@ -221,6 +221,21 @@ def evaluate(
     }
 
 
+def _tuned_val_metrics(val_result: dict) -> tuple[dict, float]:
+    """Validation metrics at the F1-optimal threshold, plus that threshold.
+
+    Inference ships ``find_optimal_threshold`` (not 0.5), so selecting and
+    promoting checkpoints on F1@0.5 picks a model that is best at a boundary we
+    never serve. Evaluating at the tuned threshold aligns checkpoint choice with
+    the decision rule actually used at inference. The single-scalar threshold is
+    fit on the same val set already used for the shipped threshold, so this adds
+    no optimism beyond what the served metric already carries.
+    """
+    threshold = find_optimal_threshold(val_result["labels"], val_result["probs"])
+    metrics = compute_metrics(val_result["labels"], val_result["probs"], threshold=threshold)
+    return metrics, threshold
+
+
 def _rebalance_val_negatives(train_ds: ConceptDataset, val_ds: ConceptDataset) -> None:
     """Ensure the val set has enough negatives for meaningful evaluation.
 
@@ -572,7 +587,8 @@ def run_training(
         # Validate (against EMA weights when enabled — they generalise better)
         eval_model = ema.module if ema is not None else model
         val_result = evaluate(eval_model, val_loader, criterion, device, dtype)
-        metrics = compute_metrics(val_result["labels"], val_result["probs"])
+        # Select on F1 at the tuned threshold (what inference ships), not @0.5.
+        metrics, _epoch_threshold = _tuned_val_metrics(val_result)
         metrics["val_loss"] = val_result["val_loss"]
         metrics["train_loss"] = train_loss
 
@@ -641,9 +657,9 @@ def run_training(
                 old_val_result = evaluate(
                     old_model, val_loader, criterion, device, dtype,
                 )
-                old_metrics = compute_metrics(
-                    old_val_result["labels"], old_val_result["probs"],
-                )
+                # Compare old vs new at the tuned threshold (consistent with the
+                # per-epoch selection metric and with what inference serves).
+                old_metrics, old_threshold = _tuned_val_metrics(old_val_result)
                 old_f1 = old_metrics.get("f1", 0.0)
                 del old_model  # free GPU memory
 
@@ -659,9 +675,7 @@ def run_training(
                     best_checkpoint_path = str(existing_best)
                     best_val_f1 = old_f1
                     best_metrics = old_metrics
-                    optimal_threshold = find_optimal_threshold(
-                        old_val_result["labels"], old_val_result["probs"],
-                    )
+                    optimal_threshold = old_threshold
                 else:
                     # New model wins — promote candidate to best.pt
                     logger.info(

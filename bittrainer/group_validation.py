@@ -107,6 +107,140 @@ def compute_ordinal_metrics(
     }
 
 
+def _real_ordinal_indices(num_classes: int, none_index: int) -> list[int]:
+    """Class indices that lie on the ordinal scale (everything but ``__none__``).
+
+    ``__none__`` is a separate semantic category, never a position on the
+    ordinal scale (see :func:`compute_ordinal_metrics`). The remaining indices
+    keep their raw values as ordinal positions, matching the distance space QWK
+    is computed over.
+    """
+    return [i for i in range(num_classes) if i != none_index]
+
+
+def ordinal_decode(
+    probs: np.ndarray,
+    *,
+    none_index: int = -1,
+    cut_points: list[float] | np.ndarray | None = None,
+) -> list[int]:
+    """Decode softmax probabilities to class labels under the QWK-optimal rule.
+
+    Under quadratic-weighted kappa the cost of predicting ``k`` for true class
+    ``j`` is ``(k - j)**2``, so the Bayes-optimal prediction is the class that
+    minimises expected quadratic cost::
+
+        argmin_k  sum_j p_j (k - j)**2  =  round(sum_j j * p_j)  =  round(E[j])
+
+    i.e. the **rounded expected ordinal index**, not ``argmax``. When the
+    posterior is even slightly diffuse (always, at real dataset sizes) the mean
+    and the mode diverge and rounding the mean scores strictly higher QWK.
+
+    ``__none__`` is off the ordinal scale: samples whose overall ``argmax`` is
+    ``none_index`` are decoded as ``__none__`` (preserving the tuned none-bias
+    gate), everything else is decoded by expected value over the real classes.
+
+    ``cut_points`` are the ``len(real) - 1`` ascending boundaries on ``E[j]``
+    (see :func:`find_ordinal_cut_points`). When ``None`` (or malformed) the
+    midpoints between consecutive real indices are used — plain round-to-nearest.
+
+    Returns predictions in the original full class-index space, so every
+    downstream consumer is unchanged.
+    """
+    arr = np.asarray(probs, dtype=np.float64)
+    if arr.ndim == 1:
+        arr = arr[None, :]
+    num_classes = arr.shape[1]
+
+    real_indices = _real_ordinal_indices(num_classes, none_index)
+    argmax_all = arr.argmax(axis=1)
+    # Fewer than two real classes => no ordinal scale to decode over.
+    if len(real_indices) < 2:
+        return argmax_all.astype(int).tolist()
+
+    real_arr = np.asarray(real_indices, dtype=np.float64)
+    real_probs = arr[:, real_indices]
+    real_sum = real_probs.sum(axis=1, keepdims=True)
+    norm = real_probs / np.clip(real_sum, 1e-12, None)
+    ev = (norm * real_arr[None, :]).sum(axis=1)  # E[j] over real classes
+
+    boundaries = None
+    if cut_points is not None:
+        cand = np.asarray(cut_points, dtype=np.float64)
+        if cand.ndim == 1 and cand.shape[0] == len(real_indices) - 1:
+            boundaries = cand
+    if boundaries is None:
+        boundaries = (real_arr[:-1] + real_arr[1:]) / 2.0
+
+    # Number of boundaries each E[j] exceeds => position within real_indices.
+    # side="right" rounds the half-integer boundary up, matching round-half-up.
+    pos = np.searchsorted(boundaries, ev, side="right")
+    pos = np.clip(pos, 0, len(real_indices) - 1)
+    decoded = real_arr[pos].astype(np.int64)
+
+    if 0 <= none_index < num_classes:
+        decoded = np.where(argmax_all == none_index, none_index, decoded)
+    return decoded.astype(int).tolist()
+
+
+def find_ordinal_cut_points(
+    probs: np.ndarray,
+    labels: np.ndarray | list[int],
+    num_classes: int,
+    *,
+    none_index: int = -1,
+    grid_steps: int = 20,
+    passes: int = 3,
+) -> list[float] | None:
+    """Fit ``E[j]`` decision boundaries that maximise validation QWK.
+
+    The ordinal analogue of :func:`find_per_class_thresholds`: instead of
+    rounding ``E[j]`` at the half-integers, search the ``len(real) - 1``
+    boundaries (an OptimizedRounder, Kaggle-style) so the decode is tuned to the
+    metric we actually ship on. Coordinate ascent over a per-boundary grid,
+    keeping boundaries monotonic; deterministic and dependency-free.
+
+    Returns the boundary list, or ``None`` when there is no ordinal scale to fit
+    (fewer than two real classes) so callers fall back to round-to-nearest.
+    """
+    real_indices = _real_ordinal_indices(num_classes, none_index)
+    if len(real_indices) < 2:
+        return None
+
+    arr = np.asarray(probs, dtype=np.float64)
+    labels = list(np.asarray(labels).astype(int).tolist())
+    real_arr = np.asarray(real_indices, dtype=np.float64)
+
+    def _qwk(boundaries: np.ndarray) -> float:
+        preds = ordinal_decode(arr, none_index=none_index, cut_points=boundaries)
+        return compute_ordinal_metrics(
+            labels, preds, num_classes, none_index=none_index,
+        )["qwk"]
+
+    boundaries = (real_arr[:-1] + real_arr[1:]) / 2.0
+    best_score = _qwk(boundaries)
+
+    for _ in range(max(1, passes)):
+        improved = False
+        for b in range(len(boundaries)):
+            lo = real_arr[b] if b == 0 else boundaries[b - 1]
+            hi = real_arr[b + 1] if b == len(boundaries) - 1 else boundaries[b + 1]
+            # Open interval so boundaries stay strictly monotonic.
+            candidates = np.linspace(lo, hi, grid_steps + 2)[1:-1]
+            for c in candidates:
+                trial = boundaries.copy()
+                trial[b] = c
+                score = _qwk(trial)
+                if score > best_score + 1e-9:
+                    best_score = score
+                    boundaries = trial
+                    improved = True
+        if not improved:
+            break
+
+    return [float(x) for x in boundaries]
+
+
 def compute_none_metrics(
     labels: list[int],
     predictions: list[int],

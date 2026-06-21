@@ -27,7 +27,9 @@ from bittrainer.group_validation import (
     compute_multilabel_metrics,
     compute_none_metrics,
     compute_ordinal_metrics,
+    find_ordinal_cut_points,
     find_per_class_thresholds,
+    ordinal_decode,
 )
 from bittrainer.losses import AsymmetricLoss
 from bittrainer.embedding_cache import EmbeddingCache
@@ -611,6 +613,11 @@ def _evaluate(
             all_probs_ml.append(probs.cpu().numpy())
             all_labels_ml.append(labels.cpu().int().numpy())
         else:
+            # Per-epoch selection decodes on argmax (the unbiased mode estimate).
+            # Raw round(E[j]) is biased inward at the scale edges for symmetric
+            # posteriors, so the EV decode is only adopted at finalisation, and
+            # only with fitted cut-points that beat argmax on val (see
+            # _finalise_ordinal_decode). This keeps selection stable.
             preds = logits.float().argmax(dim=1)
             all_preds.extend(preds.cpu().tolist())
             all_labels.extend(labels.cpu().tolist())
@@ -651,9 +658,18 @@ def _metrics_from_logits(
     labels: torch.Tensor,
     config: GroupTrainConfig,
     none_index: int,
+    cut_points: list[float] | None = None,
 ) -> dict:
     probs = torch.softmax(logits.float(), dim=1)
-    preds = probs.argmax(dim=1).cpu().tolist()
+    if config.ordinal and cut_points is not None:
+        # Shipped ordinal decode: round E[j] at the fitted cut-points. Without
+        # cut-points we stay on argmax (the unbiased mode), matching per-epoch
+        # selection — raw round-to-nearest E[j] is biased inward at the edges.
+        preds = ordinal_decode(
+            probs.cpu().numpy(), none_index=none_index, cut_points=cut_points,
+        )
+    else:
+        preds = probs.argmax(dim=1).cpu().tolist()
     label_list = labels.cpu().tolist()
     metrics = compute_multiclass_metrics(label_list, preds, config.num_classes)
     if none_index >= 0:
@@ -803,6 +819,52 @@ def _persist_softmax_calibration(
             torch.save(ckpt, checkpoint_path)
     except Exception:
         logger.warning("Failed to persist softmax calibration to checkpoint", exc_info=True)
+
+
+def _finalise_ordinal_decode(
+    logits: torch.Tensor,
+    labels: torch.Tensor,
+    config: GroupTrainConfig,
+    none_index: int,
+) -> tuple[list[float] | None, dict]:
+    """Fit E[j] cut-points on (calibrated) val logits, adopting the EV decode
+    only when it beats argmax on the selection score.
+
+    Returns ``(cut_points or None, metrics under the chosen decode)``. ``None``
+    cut-points mean inference keeps argmax (the safe default) — so the shipped
+    ordinal decode can never score below argmax on validation. ``argmax`` is the
+    unbiased mode estimate; raw ``round(E[j])`` is biased inward at the scale
+    edges, and only the fitted cut-points (OptimizedRounder) reliably correct it.
+    """
+    argmax_metrics = _metrics_from_logits(logits, labels, config, none_index, cut_points=None)
+    argmax_metrics["ordinal_decode"] = "argmax"
+    if not config.ordinal:
+        return None, argmax_metrics
+
+    probs = torch.softmax(logits.float(), dim=1).cpu().numpy()
+    label_list = labels.cpu().tolist()
+    cuts = find_ordinal_cut_points(probs, label_list, config.num_classes, none_index=none_index)
+    if not cuts:
+        return None, argmax_metrics
+
+    ev_metrics = _metrics_from_logits(logits, labels, config, none_index, cut_points=cuts)
+    if _metric_score(ev_metrics, config) > _metric_score(argmax_metrics, config) + 1e-9:
+        ev_metrics["ordinal_decode"] = "expected_value"
+        ev_metrics["ordinal_cut_points"] = cuts
+        return cuts, ev_metrics
+    return None, argmax_metrics
+
+
+def _persist_ordinal_cut_points(checkpoint_path: str | None, cut_points: list[float]) -> None:
+    if not checkpoint_path:
+        return
+    try:
+        ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+        if isinstance(ckpt, dict):
+            ckpt["ordinal_cut_points"] = [float(x) for x in cut_points]
+            torch.save(ckpt, checkpoint_path)
+    except Exception:
+        logger.warning("Failed to persist ordinal_cut_points to checkpoint", exc_info=True)
 
 
 def _prepare_datasets_and_cache(
@@ -1421,30 +1483,53 @@ def _compare_promote_finalize(
     # (or post-compare) model. Thresholds are baked into the checkpoint.
     calibration_temperature = 1.0
     class_logit_bias = [0.0] * config.num_classes
-    if best_checkpoint_path and not config.multi_label and _has_none_class(config):
+    ordinal_cut_points: list[float] | None = None
+    none_idx = _resolve_none_index(config.class_names)
+    if (
+        best_checkpoint_path
+        and not config.multi_label
+        and (_has_none_class(config) or config.ordinal)
+    ):
         try:
-            _emit("calibrating", "Calibrating absence threshold")
+            _emit("calibrating", "Calibrating decision boundaries")
             calib_model = load_checkpoint(
                 best_checkpoint_path, device=str(device), dtype=dtype,
                 model_size=config.backbone_variant, num_classes=config.num_classes,
             ).to(device)
             logits, labels = _collect_val_logits(calib_model, val_loader, config, device, dtype)
             del calib_model
-            calibration_temperature, class_logit_bias, calibrated_metrics = _tune_softmax_calibration(
-                logits, labels, config, _resolve_none_index(config.class_names),
-            )
-            best_metrics = calibrated_metrics
-            best_val_macro_f1 = calibrated_metrics.get("macro_f1", best_val_macro_f1)
-            best_val_qwk = calibrated_metrics.get("qwk", best_val_qwk)
-            _persist_softmax_calibration(
-                best_checkpoint_path,
-                config=config,
-                metrics=best_metrics,
-                temperature=calibration_temperature,
-                class_logit_bias=class_logit_bias,
-            )
+
+            # __none__ gate: temperature + none-bias (only when a none class exists).
+            if _has_none_class(config):
+                calibration_temperature, class_logit_bias, calibrated_metrics = _tune_softmax_calibration(
+                    logits, labels, config, none_idx,
+                )
+                best_metrics = calibrated_metrics
+                _persist_softmax_calibration(
+                    best_checkpoint_path,
+                    config=config,
+                    metrics=best_metrics,
+                    temperature=calibration_temperature,
+                    class_logit_bias=class_logit_bias,
+                )
+
+            # Ordinal EV cut-points, fit on the *calibrated* logits (temperature
+            # and bias shift E[j]) and adopted only when they beat argmax on the
+            # selection score. Absent cut-points => inference keeps argmax.
+            if config.ordinal:
+                bias_t = torch.tensor(class_logit_bias, dtype=torch.float32)
+                calibrated_logits = logits.float() / max(calibration_temperature, 1e-6) + bias_t
+                ordinal_cut_points, decoded_metrics = _finalise_ordinal_decode(
+                    calibrated_logits, labels, config, none_idx,
+                )
+                best_metrics = decoded_metrics
+                if ordinal_cut_points is not None:
+                    _persist_ordinal_cut_points(best_checkpoint_path, ordinal_cut_points)
+
+            best_val_macro_f1 = best_metrics.get("macro_f1", best_val_macro_f1)
+            best_val_qwk = best_metrics.get("qwk", best_val_qwk)
         except Exception:
-            logger.warning("Softmax calibration failed; keeping uncalibrated checkpoint", exc_info=True)
+            logger.warning("Calibration / decode tuning failed; keeping uncalibrated checkpoint", exc_info=True)
 
     final_thresholds: list[float] | None = None
     if (
@@ -1512,6 +1597,8 @@ def _compare_promote_finalize(
             else 0.0
         ),
         "ordinal_sigma": config.ordinal_sigma,
+        "ordinal_cut_points": ordinal_cut_points,
+        "ordinal_decode": best_metrics.get("ordinal_decode"),
         "label_smoothing": config.label_smoothing,
     }
     if final_thresholds is not None:
