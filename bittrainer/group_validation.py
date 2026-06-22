@@ -241,6 +241,41 @@ def find_ordinal_cut_points(
     return [float(x) for x in boundaries]
 
 
+def compute_multihead_metrics(
+    *,
+    band_labels: list[int],
+    band_preds: list[int],
+    num_bands: int,
+    size_volume_labels: list[int],
+    size_volume_preds: list[int],
+    num_size_ranks: int,
+    none_index: int = -1,
+) -> dict:
+    """Per-head + combined metrics for the multi-head size model.
+
+    Band and size are scored independently as ordinal scales: band over its band vocabulary,
+    size over its **volume-rank** scale (so sister-size confusion is zero ordinal error).
+    The ``multi_head`` figures are the mean of the two heads' F1 / QWK — a single summary
+    number for "how good is the model overall" that the issue asks for.
+
+    Returns ``{band: {f1, qwk}, size: {f1, qwk}, multi_head: {f1, qwk}}``.
+    """
+    band_mc = compute_multiclass_metrics(band_labels, band_preds, num_bands)
+    band_ord = compute_ordinal_metrics(band_labels, band_preds, num_bands, none_index=none_index)
+    size_mc = compute_multiclass_metrics(size_volume_labels, size_volume_preds, num_size_ranks)
+    size_ord = compute_ordinal_metrics(
+        size_volume_labels, size_volume_preds, num_size_ranks, none_index=none_index
+    )
+
+    band = {"f1": band_mc["macro_f1"], "qwk": band_ord["qwk"]}
+    size = {"f1": size_mc["macro_f1"], "qwk": size_ord["qwk"]}
+    multi_head = {
+        "f1": (band["f1"] + size["f1"]) / 2.0,
+        "qwk": (band["qwk"] + size["qwk"]) / 2.0,
+    }
+    return {"band": band, "size": size, "multi_head": multi_head}
+
+
 def compute_none_metrics(
     labels: list[int],
     predictions: list[int],
