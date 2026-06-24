@@ -212,6 +212,24 @@ class GroupTrainConfig:
     channels_last: bool = True
     # Gradient accumulation escape hatch: optimizer steps every N batches.
     grad_accum_steps: int = 1
+    # --- OFTv2-style orthogonal fine-tuning (training_mode="oft"). Defaults are
+    # the fast path for normal incremental updates; see bittrainer/oft.py. ---
+    # Backend: "cayley_neumann" (default, fast, guarded by oft_clipped_norm),
+    # "cayley" (exact solve), or "cans" (slower, lower orthogonalisation error).
+    oft_backend: str = "cayley_neumann"
+    # Clipped OFT norm — Neumann-divergence guard. Float threshold (~0.95) or
+    # None to disable (only safe for backends that don't rely on Neumann).
+    oft_clipped_norm: float | None = 0.95
+    # Number of block-diagonal orthogonal blocks per wrapped Linear (auto-reduced
+    # to the nearest divisor of each layer's output dim).
+    oft_blocks: int = 8
+    # Truncated Neumann series length (cayley_neumann / cans seed).
+    oft_neumann_terms: int = 6
+    # Newton-Schulz polar refinement iterations (cans only).
+    oft_cans_iters: int = 3
+    # Experimental DoRA-OFT (OFT rotation + learned magnitude). Not default; not
+    # surfaced in the main UI.
+    oft_dora: bool = False
 
 
 def _primary_validation_metric(config: GroupTrainConfig) -> str:
