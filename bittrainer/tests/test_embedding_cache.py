@@ -1,5 +1,5 @@
 """Tests for EmbeddingCache: build/reuse, the mandatory verify self-test, and
-per-backbone-era namespace isolation. All CPU, no SmartCache (on-the-fly build).
+stale-era pruning on backbone change. All CPU, no SmartCache (on-the-fly build).
 """
 
 from __future__ import annotations
@@ -69,7 +69,10 @@ def test_verify_raises_when_empty(tmp_path):
         cache.verify(samples, model, None, device=_DEV, dtype=_DT)
 
 
-def test_namespaces_isolated_by_backbone(tmp_path):
+def test_stale_era_pruned_on_backbone_change(tmp_path):
+    """A new backbone hash invalidates the old era; ensure() prunes the previous
+    namespace so the cache never accumulates dead vectors for a hash that will
+    never recur. (Cache point includes head.norm, so mutating it re-hashes.)"""
     samples = _samples(tmp_path)
     model = create_model(model_size="nano", pretrained=False, num_classes=3).eval()
     root = tmp_path / "embed"
@@ -82,5 +85,21 @@ def test_namespaces_isolated_by_backbone(tmp_path):
     assert h2 != h1
     EmbeddingCache(root, h2, 640).ensure(samples, model, None, device=_DEV, dtype=_DT)
 
+    # Old era removed, only the active backbone's namespace remains.
     eras = sorted(p.name for p in root.iterdir() if p.is_dir())
-    assert eras == sorted([h1, h2])
+    assert eras == [h2]
+
+
+def test_prune_leaves_unrelated_dirs(tmp_path):
+    """Pruning only touches recognisable era namespaces — an unrelated sibling
+    directory under the cache root is never deleted."""
+    samples = _samples(tmp_path)
+    model = create_model(model_size="nano", pretrained=False, num_classes=3).eval()
+    root = tmp_path / "embed"
+    root.mkdir()
+    (root / "not-an-era").mkdir()  # 16-hex regex won't match, no meta.json
+
+    EmbeddingCache(root, backbone_feature_hash(model), 640).ensure(
+        samples, model, None, device=_DEV, dtype=_DT
+    )
+    assert (root / "not-an-era").is_dir()

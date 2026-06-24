@@ -6,7 +6,10 @@ image tensors): embeddings are keyed by the backbone-feature hash (directory
 namespace) plus the image's content hash (filename). A fine-tuned backbone
 produces a different feature hash, so it gets a fresh namespace and never
 collides with the pretrained-era cache — re-running the probe after a full
-fine-tune rebuilds against the adapted features automatically.
+fine-tune rebuilds against the adapted features automatically. Establishing a
+new era also prunes the prior one (:meth:`EmbeddingCache.prune_other_eras`, run
+from :meth:`ensure`): the superseded hash will never recur, so its vectors are
+deleted rather than left to accumulate under the cache root.
 
 The cache point is ``flatten(norm(global_pool(features)))`` (pre pre_logits/fc),
 computed by :func:`bittrainer.model.pooled_features` with the backbone in
@@ -18,6 +21,8 @@ from __future__ import annotations
 import json
 import logging
 import random
+import re
+import shutil
 from collections import defaultdict
 from pathlib import Path
 from typing import Any, Callable
@@ -32,6 +37,11 @@ from bittrainer.model import pooled_features
 logger = logging.getLogger(__name__)
 
 EMBED_CACHE_VERSION = 1
+
+# Era namespace = backbone-feature hash (16-char hex digest from
+# model.backbone_feature_hash). Used to recognise our own era directories when
+# pruning so we never touch an unrelated sibling under the cache root.
+_ERA_DIR_RE = re.compile(r"^[0-9a-f]{16}$")
 
 
 class EmbeddingCacheMismatch(RuntimeError):
@@ -89,6 +99,46 @@ class EmbeddingCache:
             "preproc_sig": self.preproc_sig,
         }))
 
+    def prune_other_eras(self) -> list[str]:
+        """Delete sibling era directories for other (now-invalid) backbone hashes.
+
+        A fine-tune moves the backbone weights, producing a new feature hash and
+        thus a fresh era namespace; the previous hash will never recur, so its
+        stored pooled vectors are dead weight. Without this, every fine-tune
+        leaks one full era (a ``.npy`` per image) under the cache root forever.
+
+        Called from :meth:`ensure`, so committing to build the active era also
+        reclaims the stale ones. Only directories that are recognisably our own
+        eras — a 16-char hex name and/or an embedding-cache ``meta.json`` — are
+        removed; any unrelated sibling is left untouched. Best-effort: a removal
+        failure (e.g. a concurrent reader holding a handle on Windows) is logged
+        and skipped rather than aborting the training run.
+
+        Returns the list of removed era hashes.
+        """
+        parent = self.root.parent
+        if not parent.is_dir():
+            return []
+        removed: list[str] = []
+        for child in parent.iterdir():
+            if not child.is_dir() or child.name == self.backbone_hash:
+                continue
+            if not _ERA_DIR_RE.match(child.name) and not (child / "meta.json").is_file():
+                continue
+            try:
+                shutil.rmtree(child)
+                removed.append(child.name)
+            except OSError as exc:
+                logger.warning(
+                    "EmbeddingCache: could not prune stale era %s: %s", child.name, exc
+                )
+        if removed:
+            logger.info(
+                "EmbeddingCache: pruned %d stale backbone era(s): %s",
+                len(removed), ", ".join(removed),
+            )
+        return removed
+
     def _load_input_tensor(self, sample: dict, smart_cache: Any | None) -> torch.Tensor | None:
         if smart_cache is not None:
             res = smart_cache.get(sample["path"])
@@ -133,6 +183,10 @@ class EmbeddingCache:
         Returns ``{"built": n, "reused": n, "total": n}``.
         """
         self._write_meta()
+        # Establishing this era invalidates any other backbone-hash era under the
+        # same cache root — reclaim them now so the cache can't accumulate dead
+        # vectors for hashes that will never recur.
+        self.prune_other_eras()
         backbone.eval()
 
         by_hash: dict[str, dict] = {}
