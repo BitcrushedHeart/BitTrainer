@@ -27,6 +27,23 @@ from bittrainer.image_utils import is_supported_image
 
 _NONE_CLASS_NAME = "__none__"
 
+# Rare-group ``__none__`` oversample magnitude: the target ``__none__`` count is
+# this factor times the (equalised) non-``__none__`` total. Shared with the
+# auto-oversample sweep in group_trainer so the probe and the full fine-tune
+# agree on what "1.5x" means.
+_RARE_GROUP_OVERSAMPLE_FACTOR = 1.5
+
+
+def rare_group_none_target(max_count: int, non_none_class_count: int) -> int:
+    """Target ``__none__`` sample count for rare-group oversampling.
+
+    ``ceil(FACTOR * sum_of_non_none_counts)`` where each non-empty
+    non-``__none__`` class contributes ``max_count`` after baseline
+    equalisation, floored at ``max_count`` so it never *reduces* the count.
+    """
+    non_none_total = max_count * non_none_class_count
+    return max(max_count, math.ceil(_RARE_GROUP_OVERSAMPLE_FACTOR * non_none_total))
+
 
 def _list_class_images(group_folder: Path, class_name: str, split: str) -> list[Path]:
     d = group_folder / class_name / split
@@ -113,11 +130,51 @@ class GroupDataset(Dataset):
         if self._cache is None:
             raise RuntimeError("sourceless=True requires a SmartCache instance")
         entries = self._cache.iter_sourceless()
-        self.samples = [s for s in entries if s.get("split") == self.split]
-        counts: dict[int, int] = {}
-        for s in self.samples:
-            counts[s["label"]] = counts.get(s["label"], 0) + 1
+        # Base = the exact (equalised) list baked into the cache, kept so the
+        # auto-oversample sweep can re-derive __none__ oversampling on the pod.
+        self._sourceless_base = [s for s in entries if s.get("split") == self.split]
+        self.samples = list(self._sourceless_base)
+        if self.split == "train" and self._oversample_none:
+            self._apply_sourceless_none_oversample()
         self._class_paths = [[] for _ in self.class_names]
+
+    def _apply_sourceless_none_oversample(self) -> None:
+        """Rare-group ``__none__`` oversample for the sourceless (cloud-pod)
+        path: duplicates cached ``__none__`` sample dicts up to the same target
+        used by :meth:`_apply_rare_group_oversample`. No-op for multi-label or
+        when there is no ``__none__`` class/data."""
+        try:
+            none_idx = self.class_names.index(_NONE_CLASS_NAME)
+        except ValueError:
+            return
+        counts: dict[int, int] = {}
+        none_samples: list[dict] = []
+        for s in self._sourceless_base:
+            lbl = s.get("label")
+            if not isinstance(lbl, int):
+                return  # multi-label targets: rare-group oversample doesn't apply
+            counts[lbl] = counts.get(lbl, 0) + 1
+            if lbl == none_idx:
+                none_samples.append(s)
+        none_count = counts.get(none_idx, 0)
+        if none_count == 0:
+            return
+        max_count = max(counts.values())
+        non_none_class_count = sum(1 for k, v in counts.items() if k != none_idx and v)
+        if non_none_class_count == 0:
+            return
+        target = rare_group_none_target(max_count, non_none_class_count)
+        extra_needed = target - none_count
+        if extra_needed <= 0:
+            return
+        pool = none_samples * (extra_needed // none_count + 1)
+        random.shuffle(pool)
+        self.samples.extend(pool[:extra_needed])
+        random.shuffle(self.samples)
+        logger.info(
+            "Rare-group oversample (sourceless): __none__ %d → %d",
+            none_count, target,
+        )
 
     def set_cache(self, cache: Any) -> None:
         self._cache = cache
@@ -217,8 +274,8 @@ class GroupDataset(Dataset):
         )
         if non_none_class_count == 0:
             return
+        target = rare_group_none_target(max_count, non_none_class_count)
         non_none_total = max_count * non_none_class_count
-        target = max(max_count, math.ceil(1.5 * non_none_total))
         extra_needed = target - max_count
         if extra_needed <= 0:
             return
@@ -295,6 +352,30 @@ class GroupDataset(Dataset):
             return
         self._natural_sampling = flag
         if self.split == "train" and not self._sourceless:
+            self._build_samples()
+
+    @property
+    def oversample_none(self) -> bool:
+        return self._oversample_none
+
+    def set_oversample_none(self, flag: bool) -> None:
+        """Toggle rare-group ``__none__`` oversampling, rebuilding the sample
+        list. No-op for val/sourceless or when unchanged.
+
+        Mirrors :meth:`set_natural_sampling` so the auto-oversample sweep can
+        apply its selection to the full fine-tune dataset after the warmup
+        probe has decided off-vs-1.5x. Works for sourceless (cloud-pod) datasets
+        too, re-deriving from the cached base list."""
+        if self._oversample_none == flag:
+            return
+        self._oversample_none = flag
+        if self.split != "train":
+            return
+        if self._sourceless:
+            self.samples = list(self._sourceless_base)
+            if flag:
+                self._apply_sourceless_none_oversample()
+        else:
             self._build_samples()
 
     @staticmethod

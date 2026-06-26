@@ -31,6 +31,7 @@ from bittrainer.group_trainer import (
     _prepare_datasets_and_cache,
     _primary_validation_metric,
     _resolve_none_index,
+    _run_auto_oversample_probe,
     _run_auto_softness_probe,
 )
 from bittrainer.model import backbone_feature_hash
@@ -128,12 +129,24 @@ def run_head_only_training(
 
     cb({"type": "training_progress", "stage": "training",
         "status_text": f"Training head probe ({config.probe_head})"})
+    none_index = _resolve_none_index(config.class_names)
     probe = _run_auto_softness_probe(
         model, config, embed_cache, smart_cache,
         train_ds.samples, val_ds.samples,
-        device=device, none_index=_resolve_none_index(config.class_names),
+        device=device, none_index=none_index,
         cb=cb, stop_event=stop_event,
     )
+    # Second pre-training sweep: __none__ oversample off vs 1.5x. When it runs
+    # it leaves the head in the selected state and supersedes the softness probe
+    # as the candidate to evaluate.
+    oversample_probe = _run_auto_oversample_probe(
+        model, config, embed_cache, smart_cache,
+        train_ds.samples, val_ds.samples,
+        device=device, none_index=none_index,
+        cb=cb, stop_event=stop_event,
+    )
+    if oversample_probe:
+        probe = oversample_probe
 
     # Evaluate the trained candidate (frozen backbone + warm head) on the val
     # images, so it competes with the incumbent on identical _evaluate footing,
