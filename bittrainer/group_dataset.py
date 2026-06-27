@@ -15,7 +15,6 @@ from PIL import Image
 from torch.utils.data import Dataset, Sampler
 from torchvision.transforms import functional as TF
 
-from bittrainer.class_balance import capped_equalise_target
 from bittrainer.dataset import (
     find_nearest_bucket,
     get_skin_normalised_train_transform,
@@ -27,6 +26,30 @@ from bittrainer.image_utils import is_supported_image
 
 
 _NONE_CLASS_NAME = "__none__"
+
+# Rare-group ``__none__`` oversample magnitude: the target ``__none__`` count is
+# this factor times the (equalised) non-``__none__`` total. Shared with the
+# auto-oversample sweep in group_trainer so the probe and the full fine-tune
+# agree on what "1.5x" means.
+_RARE_GROUP_OVERSAMPLE_FACTOR = 1.5
+
+# Hardcoded global ceiling on minority-class replication during balancing: a class
+# is oversampled to at most this multiple of its natural size (still never beyond
+# the largest class). Bounds the memorisation that uncapped equalisation to the
+# largest class caused on sparse classes. Applies to the baseline equalisation only;
+# __none__ rare-group oversampling (above) is layered on top as before.
+_MAX_OVERSAMPLE_FACTOR = 4.0
+
+
+def rare_group_none_target(max_count: int, non_none_class_count: int) -> int:
+    """Target ``__none__`` sample count for rare-group oversampling.
+
+    ``ceil(FACTOR * sum_of_non_none_counts)`` where each non-empty
+    non-``__none__`` class contributes ``max_count`` after baseline
+    equalisation, floored at ``max_count`` so it never *reduces* the count.
+    """
+    non_none_total = max_count * non_none_class_count
+    return max(max_count, math.ceil(_RARE_GROUP_OVERSAMPLE_FACTOR * non_none_total))
 
 
 def _list_class_images(group_folder: Path, class_name: str, split: str) -> list[Path]:
@@ -60,7 +83,6 @@ class GroupDataset(Dataset):
         oversample_none: bool = False,
         extra_paths: dict[str, list[str]] | None = None,
         natural_sampling: bool = False,
-        oversample_max_ratio: float = 0.0,
     ):
         self.group_folder = Path(group_folder)
         self.class_names = class_names
@@ -72,15 +94,7 @@ class GroupDataset(Dataset):
         self._cache = cache
         self._sourceless = sourceless
         self._group_name = group_name or self.group_folder.name
-        # When True, oversample __none__ up to 1:1 with the combined positives if it
-        # is under-populated (negatives are outside class balancing and exempt from
-        # the oversample cap; never downsampled).
         self._oversample_none = oversample_none
-        # Ceiling on replication-based balancing: a minority class is oversampled to
-        # at most ``oversample_max_ratio`` x its natural size (0 = uncapped/legacy
-        # full equalisation). Bounds memorisation from extreme over-replication and
-        # respects the genuine (deployment-matched) class prior.
-        self._oversample_max_ratio = oversample_max_ratio
         # When True, train samples are taken at their natural class distribution
         # (each image once) instead of replication-equalised to the largest
         # class — used by the "reweight" class-balance mode, where imbalance is
@@ -123,9 +137,8 @@ class GroupDataset(Dataset):
         if self._cache is None:
             raise RuntimeError("sourceless=True requires a SmartCache instance")
         entries = self._cache.iter_sourceless()
-        # Base = the exact (positive-equalised, __none__-at-natural-count) list baked
-        # into the cache, kept so the __none__ oversample toggle can be re-derived on
-        # the pod without re-baking.
+        # Base = the exact (equalised) list baked into the cache, kept so the
+        # auto-oversample sweep can re-derive __none__ oversampling on the pod.
         self._sourceless_base = [s for s in entries if s.get("split") == self.split]
         self.samples = list(self._sourceless_base)
         if self.split == "train" and self._oversample_none:
@@ -133,28 +146,32 @@ class GroupDataset(Dataset):
         self._class_paths = [[] for _ in self.class_names]
 
     def _apply_sourceless_none_oversample(self) -> None:
-        """``__none__`` 1:1 oversample for the sourceless (cloud-pod) path:
-        duplicates cached ``__none__`` sample dicts up to the combined positive
-        count, mirroring :meth:`_apply_none_oversample`. No-op for multi-label, when
-        there is no ``__none__`` data, or when negatives already meet the target."""
+        """Rare-group ``__none__`` oversample for the sourceless (cloud-pod)
+        path: duplicates cached ``__none__`` sample dicts up to the same target
+        used by :meth:`_apply_rare_group_oversample`. No-op for multi-label or
+        when there is no ``__none__`` class/data."""
         try:
             none_idx = self.class_names.index(_NONE_CLASS_NAME)
         except ValueError:
             return
+        counts: dict[int, int] = {}
         none_samples: list[dict] = []
-        positives_total = 0
         for s in self._sourceless_base:
             lbl = s.get("label")
             if not isinstance(lbl, int):
-                return  # multi-label targets: this oversample doesn't apply
+                return  # multi-label targets: rare-group oversample doesn't apply
+            counts[lbl] = counts.get(lbl, 0) + 1
             if lbl == none_idx:
                 none_samples.append(s)
-            else:
-                positives_total += 1
-        none_count = len(none_samples)
-        if none_count == 0 or positives_total <= 0:
+        none_count = counts.get(none_idx, 0)
+        if none_count == 0:
             return
-        extra_needed = positives_total - none_count
+        max_count = max(counts.values())
+        non_none_class_count = sum(1 for k, v in counts.items() if k != none_idx and v)
+        if non_none_class_count == 0:
+            return
+        target = rare_group_none_target(max_count, non_none_class_count)
+        extra_needed = target - none_count
         if extra_needed <= 0:
             return
         pool = none_samples * (extra_needed // none_count + 1)
@@ -162,8 +179,8 @@ class GroupDataset(Dataset):
         self.samples.extend(pool[:extra_needed])
         random.shuffle(self.samples)
         logger.info(
-            "__none__ oversample (sourceless): %d → %d (1:1 vs positives)",
-            none_count, positives_total,
+            "Rare-group oversample (sourceless): __none__ %d → %d",
+            none_count, target,
         )
 
     def set_cache(self, cache: Any) -> None:
@@ -206,83 +223,70 @@ class GroupDataset(Dataset):
                 [p for p in paths if str(p) not in bad_paths]
                 for paths in self._class_paths
             ]
-            none_idx = (
-                self.class_names.index(_NONE_CLASS_NAME)
-                if _NONE_CLASS_NAME in self.class_names
-                else -1
-            )
-            # __none__ sits OUTSIDE class balancing: the positive classes equalise
-            # among themselves (so they never scale up to match a large __none__),
-            # and __none__ is added at its natural count, then optionally
-            # oversampled to 1:1 with the positives below.
-            max_count = max(
-                (len(p) for i, p in enumerate(clean_class_paths) if i != none_idx and p),
-                default=0,
-            )
+            max_count = max((len(p) for p in clean_class_paths if len(p) > 0), default=0)
             if max_count == 0:
                 return
 
-            positives_total = 0
             for class_idx, paths in enumerate(clean_class_paths):
                 if not paths:
                     continue
-                if class_idx == none_idx:
-                    # Every available negative, at its natural count (no equalisation).
-                    expanded = list(paths)
-                    random.shuffle(expanded)
-                elif self._natural_sampling:
+                if self._natural_sampling:
                     # Natural distribution: every image once, no equalisation.
                     expanded = list(paths)
                     random.shuffle(expanded)
-                    positives_total += len(expanded)
                 elif len(paths) < max_count:
-                    # Replicate up to the target, but no more than max_ratio x the
-                    # class's natural size (when a cap is set) to bound memorisation.
-                    target = capped_equalise_target(
-                        len(paths), max_count, self._oversample_max_ratio
-                    )
+                    # Cap replication at _MAX_OVERSAMPLE_FACTOR x the class's natural
+                    # size (still <= max_count) to bound memorisation of sparse classes.
+                    target = min(max_count, math.ceil(_MAX_OVERSAMPLE_FACTOR * len(paths)))
                     expanded = paths * (target // len(paths) + 1)
                     random.shuffle(expanded)
                     expanded = expanded[:target]
-                    positives_total += len(expanded)
                 else:
                     expanded = list(paths)
                     random.shuffle(expanded)
-                    positives_total += len(expanded)
 
                 for p in expanded:
                     sp = str(p)
                     bucket = find_nearest_bucket(*size_cache[sp])
                     self.samples.append(self._make_sample(sp, class_idx, bucket))
 
-            if none_idx >= 0 and self._oversample_none:
-                self._apply_none_oversample(
-                    clean_class_paths, size_cache, none_idx, positives_total
-                )
+            if self._oversample_none:
+                self._apply_rare_group_oversample(clean_class_paths, size_cache, max_count)
 
         random.shuffle(self.samples)
 
-    def _apply_none_oversample(
+    def _apply_rare_group_oversample(
         self,
         clean_class_paths: list[list[Path]],
         size_cache: dict[str, tuple[int, int]],
-        none_idx: int,
-        positives_total: int,
+        max_count: int,
     ) -> None:
-        """Oversample ``__none__`` up to 1:1 with the positives, if under-populated.
+        """Append extra ``__none__`` samples so the rare-group target dominates.
 
-        Target is ``positives_total`` — the combined positive sample count after
-        equalisation — for a 50/50 positive-vs-``__none__`` split. ``__none__`` is
-        outside class balancing and exempt from the oversample cap, and is never
-        downsampled: when negatives already meet/exceed the target this is a no-op.
+        Target count for ``__none__`` is ``ceil(1.5 * sum_of_non_none_counts)``
+        where each non-empty non-``__none__`` class contributes ``max_count``
+        after the baseline equalisation. Already-added ``max_count`` __none__
+        samples stay in place; only the *extra* needed to reach the target
+        are appended here.
         """
+        try:
+            none_idx = self.class_names.index(_NONE_CLASS_NAME)
+        except ValueError:
+            return
         if none_idx >= len(clean_class_paths):
             return
         none_paths = clean_class_paths[none_idx]
-        if not none_paths or positives_total <= 0:
+        if not none_paths:
             return
-        current = len(none_paths)  # __none__ was added at its natural count
-        extra_needed = positives_total - current
+
+        non_none_class_count = sum(
+            1 for i, p in enumerate(clean_class_paths) if i != none_idx and p
+        )
+        if non_none_class_count == 0:
+            return
+        target = rare_group_none_target(max_count, non_none_class_count)
+        non_none_total = max_count * non_none_class_count
+        extra_needed = target - max_count
         if extra_needed <= 0:
             return
 
@@ -294,8 +298,8 @@ class GroupDataset(Dataset):
             bucket = find_nearest_bucket(*size_cache[sp])
             self.samples.append(self._make_sample(sp, none_idx, bucket))
         logger.info(
-            "__none__ oversample: %d → %d (1:1 vs %d positives)",
-            current, positives_total, positives_total,
+            "Rare-group oversample: __none__ %d → %d (non-none total %d)",
+            max_count, target, non_none_total,
         )
 
     def _make_sample(self, path: str, label: int | torch.Tensor, bucket: tuple[int, int]) -> dict:
@@ -365,9 +369,13 @@ class GroupDataset(Dataset):
         return self._oversample_none
 
     def set_oversample_none(self, flag: bool) -> None:
-        """Toggle 1:1 ``__none__`` oversampling, rebuilding the sample list.
-        No-op for val or when unchanged. Works for sourceless (cloud-pod)
-        datasets too, re-deriving from the cached base list."""
+        """Toggle rare-group ``__none__`` oversampling, rebuilding the sample
+        list. No-op for val/sourceless or when unchanged.
+
+        Mirrors :meth:`set_natural_sampling` so the auto-oversample sweep can
+        apply its selection to the full fine-tune dataset after the warmup
+        probe has decided off-vs-1.5x. Works for sourceless (cloud-pod) datasets
+        too, re-deriving from the cached base list."""
         if self._oversample_none == flag:
             return
         self._oversample_none = flag

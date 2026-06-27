@@ -17,11 +17,11 @@ from adv_optm import Prodigy_adv
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader
 
-from bittrainer.class_balance import cap_weight_ratio
 from bittrainer.ema import ModelEMA
 from bittrainer.group_dataset import (
     GroupDataset,
     build_group_bucket_sampler,
+    rare_group_none_target,
 )
 from bittrainer.group_validation import (
     compute_multiclass_metrics,
@@ -56,6 +56,8 @@ logger = logging.getLogger(__name__)
 _NONE_CLASS_NAME = "__none__"
 _ORDINAL_SIGMA_CANDIDATES = [round(i / 10, 3) for i in range(11)]
 _LABEL_SMOOTHING_CANDIDATES = [0.0, 0.025, 0.05, 0.075, 0.1, 0.15, 0.2]
+# __none__ oversample sweep candidates: (label, oversample_none flag).
+_OVERSAMPLE_NONE_CANDIDATES = [("off", False), ("1.5x", True)]
 _NONE_F1_WEIGHT = 0.10
 _NONE_RECALL_REGRESSION_TOLERANCE = 0.02
 _REAL_MACRO_F1_REGRESSION_TOLERANCE = 0.01
@@ -104,9 +106,7 @@ class GroupTrainConfig:
     ordinal_sigma: float = 1.0
     validation_metric: str = "qwk"
     multi_label: bool = False
-    # Oversample __none__ up to 1:1 with the combined positives when it is
-    # under-populated (negatives are outside class balancing; never downsampled).
-    oversample_none: bool = True
+    oversample_none: bool = False
     extra_paths_train: dict[str, list[str]] = field(default_factory=dict)
     extra_paths_val: dict[str, list[str]] = field(default_factory=dict)
     soft_aliases: dict = field(default_factory=dict)
@@ -164,12 +164,6 @@ class GroupTrainConfig:
     class_balance_mode: str = "resample"
     class_balance_beta: float = 0.999
     class_balance_auto_ratio: float = 4.0
-    # Ceiling on how far class balancing may correct, applied to BOTH mechanisms:
-    # in "resample" the minority replication factor is capped at this, in "reweight"
-    # the max/min effective-number loss-weight ratio is. Bounds memorisation from
-    # extreme over-replication and respects the genuine (deployment-matched) prior —
-    # tuned for real-world / weighted F1 rather than balanced accuracy. 0 = uncapped.
-    class_balance_max_ratio: float = 4.0
     use_focal: bool = False
     focal_gamma: float = 2.0
     # RandAugment + RandomErasing (DeiT/ConvNeXt official fine-tune recipe)
@@ -200,6 +194,16 @@ class GroupTrainConfig:
     soft_label_tuning_metric: str | None = None
     soft_label_tuning_results: list[dict] = field(default_factory=list)
     soft_label_tuning_elapsed_ms: int | None = None
+    # Auto ``__none__`` oversample sweep: a second pre-training probe (after the
+    # soft-label sweep) that trains a head with no rare-group oversampling and
+    # again with 1.5x ``__none__`` oversampling, then selects the better by
+    # validation score and applies it to the full fine-tune dataset.
+    # ``oversample_none`` (above) becomes the *resolved* value the sweep writes.
+    auto_oversample_none: bool = True
+    selected_oversample_none: bool | None = None
+    oversample_tuning_metric: str | None = None
+    oversample_tuning_results: list[dict] = field(default_factory=list)
+    oversample_tuning_elapsed_ms: int | None = None
     data_quality_warnings: list[dict] = field(default_factory=list)
     # torch.compile for the full fine-tune forward/backward. Falls back to
     # eager (with a status message) when triton is unavailable.
@@ -598,25 +602,19 @@ def _effective_number_weights(
     num_classes: int,
     beta: float,
     device: torch.device,
-    max_ratio: float = 0.0,
 ) -> torch.Tensor:
     """Class weights by the effective number of samples (Cui et al., CVPR 2019).
 
-    ``w_c ∝ (1 - beta) / (1 - beta^{n_c})``, optionally clamped so the max/min weight
-    over non-empty classes is at most ``max_ratio`` (bounds over-correction; 0 =
-    uncapped), then normalised so the mean weight is 1 (keeps the loss scale
-    comparable to the unweighted baseline). Empty classes keep weight 1.
+    ``w_c ∝ (1 - beta) / (1 - beta^{n_c})``, normalised so the mean weight is 1
+    (keeps the loss scale comparable to the unweighted baseline). Empty classes
+    keep weight 1.
     """
-    raw = [1.0] * num_classes
-    counts = [0] * num_classes
+    weights = torch.ones(num_classes, dtype=torch.float32)
     for i in range(num_classes):
         n = int(class_counts.get(i, 0))
-        counts[i] = n
         if n > 0:
             eff = (1.0 - beta**n) / (1.0 - beta) if beta < 1.0 else float(n)
-            raw[i] = 1.0 / max(eff, 1e-8)
-    raw = cap_weight_ratio(raw, counts, max_ratio)
-    weights = torch.tensor(raw, dtype=torch.float32)
+            weights[i] = 1.0 / max(eff, 1e-8)
     weights = weights * (num_classes / weights.sum().clamp(min=1e-8))
     return weights.to(device)
 
@@ -1149,6 +1147,14 @@ def _prepare_datasets_and_cache(
             face_model_sig=face_model_signature(config.face_model_path or None),
         )
 
+    # When the auto __none__ oversample sweep is enabled it decides off-vs-1.5x
+    # during warmup, so build the train set un-oversampled here and let the
+    # caller rebuild it once the sweep has chosen. A manual oversample_none is
+    # only honoured up-front when the auto sweep is off.
+    initial_oversample_none = config.oversample_none and not _auto_oversample_enabled(
+        config, _resolve_none_index(config.class_names),
+    )
+
     if config.sourceless:
         if smart_cache is None:
             raise RuntimeError("sourceless=True requires use_cache=True and a cache_dir")
@@ -1161,9 +1167,8 @@ def _prepare_datasets_and_cache(
             group_folder, config.class_names, split="train",
             multi_label=config.multi_label,
             cache=smart_cache, sourceless=True, group_name=group_name,
-            oversample_none=config.oversample_none,
+            oversample_none=initial_oversample_none,
             extra_paths=config.extra_paths_train,
-            oversample_max_ratio=config.class_balance_max_ratio,
         )
         val_ds = GroupDataset(
             group_folder, config.class_names, split="val",
@@ -1176,9 +1181,8 @@ def _prepare_datasets_and_cache(
             group_folder, config.class_names, split="train",
             multi_label=config.multi_label,
             skin_normalise=config.skin_normalise, group_name=group_name,
-            oversample_none=config.oversample_none,
+            oversample_none=initial_oversample_none,
             extra_paths=config.extra_paths_train,
-            oversample_max_ratio=config.class_balance_max_ratio,
         )
         val_ds = GroupDataset(
             group_folder, config.class_names, split="val",
@@ -1527,6 +1531,197 @@ def _run_auto_softness_probe(
     return best_probe
 
 
+def _auto_oversample_enabled(config: GroupTrainConfig, none_index: int) -> bool:
+    """The auto ``__none__`` oversample sweep applies only to single-label
+    groups that actually have a ``__none__`` class to oversample."""
+    return bool(config.auto_oversample_none) and not config.multi_label and none_index >= 0
+
+
+def _build_oversampled_tensors(
+    x_train: torch.Tensor, y_train: torch.Tensor, none_index: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Append extra ``__none__`` feature rows up to the rare-group target.
+
+    Mirrors ``GroupDataset._apply_rare_group_oversample`` at the cached-feature
+    level: the ``__none__`` images are already embedded, so reaching the 1.5x
+    target only duplicates existing rows â€” no re-embed. Returns the inputs
+    unchanged when there is nothing to oversample.
+    """
+    if none_index < 0 or y_train.numel() == 0:
+        return x_train, y_train
+    counts = torch.bincount(y_train, minlength=none_index + 1)
+    none_count = int(counts[none_index].item())
+    if none_count == 0:
+        return x_train, y_train
+    max_count = int(counts.max().item())
+    non_none_class_count = int((counts > 0).sum().item()) - 1  # exclude __none__
+    if non_none_class_count <= 0:
+        return x_train, y_train
+    target = rare_group_none_target(max_count, non_none_class_count)
+    extra_needed = target - none_count
+    if extra_needed <= 0:
+        return x_train, y_train
+    none_rows = x_train[y_train == none_index]
+    reps = extra_needed // none_count + 1
+    extra_x = none_rows.repeat(reps, *([1] * (none_rows.dim() - 1)))[:extra_needed]
+    extra_y = y_train.new_full((extra_needed,), none_index)
+    return torch.cat([x_train, extra_x], dim=0), torch.cat([y_train, extra_y], dim=0)
+
+
+def _oversample_candidate_better(candidate: dict, incumbent: dict | None) -> bool:
+    if incumbent is None:
+        return True
+    cand_score = float(candidate.get("score") or 0.0)
+    inc_score = float(incumbent.get("score") or 0.0)
+    if cand_score != inc_score:
+        return cand_score > inc_score
+    cand_loss = candidate.get("val_loss")
+    inc_loss = incumbent.get("val_loss")
+    if cand_loss is not None and inc_loss is not None and float(cand_loss) != float(inc_loss):
+        return float(cand_loss) < float(inc_loss)
+    # Tie: prefer *less* oversampling (the simpler, cheaper dataset).
+    return bool(incumbent.get("oversample")) and not bool(candidate.get("oversample"))
+
+
+def _run_auto_oversample_probe(
+    model: nn.Module,
+    config: GroupTrainConfig,
+    embed_cache: EmbeddingCache,
+    smart_cache: object | None,
+    train_samples: list[dict],
+    val_samples: list[dict],
+    *,
+    device: torch.device,
+    none_index: int,
+    cb: Callable[[dict], None],
+    stop_event: object | None,
+) -> dict:
+    """Sweep ``__none__`` oversampling (off vs 1.5x) on cached features.
+
+    Runs after the soft-label sweep, building on the soft-label-selected head.
+    Trains a head probe for each candidate, selects the better by validation
+    score, and writes the choice to ``config.oversample_none`` (+ tuning
+    metadata). Returns the winning probe dict, or ``{}`` when the sweep is
+    skipped (multi-label, no ``__none__`` class, or oversampling adds nothing).
+    """
+    if not _auto_oversample_enabled(config, none_index):
+        return {}
+
+    x_train, y_train, x_val, y_val = prepare_head_probe_tensors(
+        embed_cache, smart_cache, train_samples, val_samples, config, cb=cb,
+    )
+    x_train_os, y_train_os = _build_oversampled_tensors(x_train, y_train, none_index)
+    if x_train_os.shape[0] == x_train.shape[0]:
+        # No extra __none__ rows were added: the two candidates are identical,
+        # so a sweep is meaningless. Leave config.oversample_none untouched.
+        return {}
+
+    tensors_by_flag = {False: (x_train, y_train), True: (x_train_os, y_train_os)}
+    original_head_state = copy.deepcopy(model.head.state_dict())
+    original_rng_state = _capture_rng_state(device)
+    original_oversample = config.oversample_none
+    score_metric = _score_metric_label(config)
+    total = len(_OVERSAMPLE_NONE_CANDIDATES)
+
+    best_row: dict | None = None
+    best_probe: dict | None = None
+    best_head_state: dict | None = None
+    matrix: list[dict] = []
+    sweep_start = time.monotonic()
+
+    for idx, (clabel, flag) in enumerate(_OVERSAMPLE_NONE_CANDIDATES, start=1):
+        if stop_event is not None and getattr(stop_event, "is_set", lambda: False)():
+            break
+        model.head.load_state_dict(original_head_state)
+        _restore_rng_state(original_rng_state, device)
+        xt, yt = tensors_by_flag[flag]
+        cb({
+            "type": "training_progress",
+            "stage": "oversample_tuning",
+            "status_text": f"Testing __none__ oversample {clabel} ({idx}/{total})",
+            "step": idx,
+            "total_steps": total,
+            "oversample_none": flag,
+            "oversample_tuning_metric": score_metric,
+        })
+        candidate_start = time.monotonic()
+        probe = train_head_probe_from_tensors(
+            model, xt, yt, x_val, y_val, config,
+            device=device, none_index=none_index, cb=cb,
+            stop_event=stop_event,
+            progress_stage="oversample_tuning",
+            progress_prefix=f"__none__ oversample {clabel}",
+            score_metric=score_metric,
+        )
+        score = _metric_score(probe, config)
+        row = {
+            "label": clabel,
+            "oversample": bool(flag),
+            "score": score,
+            "macro_f1": probe.get("macro_f1"),
+            "qwk": probe.get("qwk"),
+            "none_f1": probe.get("none_f1"),
+            "none_recall": probe.get("none_recall"),
+            "none_precision": probe.get("none_precision"),
+            "none_false_positive_rate": probe.get("none_false_positive_rate"),
+            "val_loss": probe.get("val_loss"),
+            "best_epoch": probe.get("best_epoch"),
+            "epochs_completed": probe.get("epochs_completed"),
+            "train_samples": int(xt.shape[0]),
+            "elapsed_ms": int(round((time.monotonic() - candidate_start) * 1000)),
+        }
+        matrix.append(row)
+        cb({
+            "type": "training_progress",
+            "stage": "oversample_tuning",
+            "status_text": (
+                f"Tested __none__ oversample {clabel}: {score_metric} {score:.3f}, "
+                f"macro F1 {(row['macro_f1'] or 0.0):.3f}"
+                + (f", none F1 {row['none_f1']:.3f}" if row.get("none_f1") is not None else "")
+            ),
+            "step": idx,
+            "total_steps": total,
+            "oversample_none": flag,
+            "val_macro_f1": row["macro_f1"],
+            "val_qwk": row.get("qwk"),
+            "val_none_f1": row.get("none_f1"),
+            "val_none_recall": row.get("none_recall"),
+            "selected_validation_score": score,
+        })
+        if _oversample_candidate_better(row, best_row):
+            best_row = row
+            best_probe = probe
+            best_head_state = copy.deepcopy(model.head.state_dict())
+
+    config.oversample_none = original_oversample
+
+    if best_row is None or best_probe is None or best_head_state is None:
+        model.head.load_state_dict(original_head_state)
+        return {}
+
+    model.head.load_state_dict(best_head_state)
+    config.oversample_none = bool(best_row["oversample"])
+    config.selected_oversample_none = bool(best_row["oversample"])
+    config.oversample_tuning_metric = score_metric
+    config.oversample_tuning_results = matrix
+    config.oversample_tuning_elapsed_ms = int(round((time.monotonic() - sweep_start) * 1000))
+    cb({
+        "type": "training_progress",
+        "stage": "oversample_tuning",
+        "status_text": f"Selected __none__ oversample {best_row['label']} by {score_metric}",
+        "step": total,
+        "total_steps": total,
+        "oversample_none": best_row["oversample"],
+        "best_val_macro_f1": best_row.get("macro_f1"),
+        "best_val_qwk": best_row.get("qwk"),
+        "best_val_none_f1": best_row.get("none_f1"),
+        "best_val_none_recall": best_row.get("none_recall"),
+        "selected_validation_score": best_row.get("score"),
+        "oversample_tuning_metric": score_metric,
+    })
+    return best_probe
+
+
 def _warmup_head_probe(
     model: nn.Module,
     config: GroupTrainConfig,
@@ -1591,6 +1786,15 @@ def _warmup_head_probe(
     )
     if _stop():
         return
+    # Second pre-training sweep: pick __none__ oversample off vs 1.5x on the
+    # soft-label-selected head. Writes config.oversample_none; the caller
+    # rebuilds train_ds to honour it before the full fine-tune.
+    _run_auto_oversample_probe(
+        model, config, embed_cache, smart_cache,
+        train_ds.samples, val_ds.samples,
+        device=device, none_index=none_index,
+        cb=cb, stop_event=stop_event,
+    )
 
 
 def _compare_promote_finalize(
@@ -1864,6 +2068,10 @@ def _compare_promote_finalize(
         "soft_label_tuning_metric": config.soft_label_tuning_metric,
         "soft_label_tuning_results": config.soft_label_tuning_results,
         "soft_label_tuning_elapsed_ms": config.soft_label_tuning_elapsed_ms,
+        "selected_oversample_none": config.selected_oversample_none,
+        "oversample_tuning_metric": config.oversample_tuning_metric,
+        "oversample_tuning_results": config.oversample_tuning_results,
+        "oversample_tuning_elapsed_ms": config.oversample_tuning_elapsed_ms,
         "data_quality_warnings": config.data_quality_warnings,
         "final_val_none_precision": best_metrics.get("none_precision"),
         "final_val_none_recall": best_metrics.get("none_recall"),
@@ -1952,6 +2160,16 @@ def run_group_training(
     )
     unfreeze_backbone(model)  # the probe froze the backbone â€” restore full grad
 
+    # The warmup oversample sweep may have flipped config.oversample_none; rebuild
+    # the train set (and bucket histogram) so the full fine-tune trains on the
+    # chosen __none__ composition. No-op when the sweep was off/undecided.
+    if config.oversample_none != train_ds.oversample_none:
+        train_ds.set_oversample_none(config.oversample_none)
+        bucket_counts = {}
+        for s in train_ds.samples:
+            b = s["bucket"]
+            bucket_counts[b] = bucket_counts.get(b, 0) + 1
+
     # --- Auto batch sizing (probe unfrozen = worst-case VRAM) ---
     # Targets config.vram_fraction of free VRAM. Prodigy_adv state (~2.2x param
     # bytes, allocated lazily on first .step()) is budgeted explicitly inside
@@ -1994,7 +2212,6 @@ def run_group_training(
         train_ds.set_natural_sampling(True)
         class_weights = _effective_number_weights(
             class_counts, config.num_classes, config.class_balance_beta, device,
-            max_ratio=config.class_balance_max_ratio,
         )
         cb({
             "type": "training_progress", "stage": "preparing",

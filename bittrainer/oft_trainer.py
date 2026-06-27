@@ -165,7 +165,6 @@ def run_oft_training(
         train_ds.set_natural_sampling(True)
         class_weights = _effective_number_weights(
             class_counts, config.num_classes, config.class_balance_beta, device,
-            max_ratio=config.class_balance_max_ratio,
         )
 
     optimizer = _make_oft_optimizer(trainable)
