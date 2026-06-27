@@ -328,7 +328,6 @@ def warm_group_cache(
     skin_normalise: bool = False,
     face_model_path: str = "",
     multi_label: bool = False,
-    oversample_none: bool = False,
     oversample_max_ratio: float = 0.0,
     modeltype: str = "convnext_v2",
     group_name: str = "",
@@ -372,11 +371,12 @@ def warm_group_cache(
         face_model_sig=face_model_signature(face_model_path or None),
     )
 
+    # Bake the base with __none__ at its natural count (oversample_none left off);
+    # the pod re-derives the 1:1 __none__ oversample toggle from the cached base.
     train_ds = GroupDataset(
         group_folder, class_names, split="train",
         multi_label=multi_label,
         skin_normalise=skin_normalise, group_name=group_name,
-        oversample_none=oversample_none,
         extra_paths=extra_paths_train or {},
         oversample_max_ratio=oversample_max_ratio,
     )

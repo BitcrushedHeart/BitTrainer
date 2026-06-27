@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from bittrainer.group_dataset import GroupDataset, rare_group_none_target
+from bittrainer.group_dataset import GroupDataset
 
 
 class _FakeCache:
@@ -29,29 +29,24 @@ def _counts(ds: GroupDataset) -> dict[int, int]:
     return c
 
 
-def test_rare_group_none_target_formula():
-    # ceil(1.5 * (max_count=2 * non_none_classes=2)) = 6.
-    assert rare_group_none_target(2, 2) == 6
-    # Never reduces below max_count.
-    assert rare_group_none_target(10, 0) == 10
-
-
 def test_sourceless_oversample_off_by_default():
     ds = GroupDataset(
         "/tmp/g", ["a", "b", "__none__"], split="train",
         cache=_FakeCache(_base_samples()), sourceless=True,
     )
+    # __none__ stays at its natural count; positives are not scaled to it.
     assert _counts(ds) == {0: 2, 1: 2, 2: 2}
 
 
-def test_sourceless_set_oversample_none_reaches_target():
+def test_sourceless_set_oversample_none_reaches_1to1():
     ds = GroupDataset(
         "/tmp/g", ["a", "b", "__none__"], split="train",
         cache=_FakeCache(_base_samples()), sourceless=True,
     )
     ds.set_oversample_none(True)
     assert ds.oversample_none is True
-    assert _counts(ds) == {0: 2, 1: 2, 2: 6}
+    # 1:1 vs combined positives (2 + 2 = 4): __none__ 2 -> 4. Positives unchanged.
+    assert _counts(ds) == {0: 2, 1: 2, 2: 4}
 
     # Toggling back restores the un-oversampled base (idempotent re-derive).
     ds.set_oversample_none(False)
@@ -63,6 +58,20 @@ def test_sourceless_oversample_at_construction():
         "/tmp/g", ["a", "b", "__none__"], split="train",
         cache=_FakeCache(_base_samples()), sourceless=True,
         oversample_none=True,
+    )
+    assert _counts(ds) == {0: 2, 1: 2, 2: 4}
+
+
+def test_sourceless_oversample_no_downsample_when_negatives_plentiful():
+    # 2 positives per class (total 4) but 6 __none__: already >= 1:1, so no-op.
+    base = []
+    for label in (0, 0, 1, 1, 2, 2, 2, 2, 2, 2):
+        base.append(
+            {"label": label, "split": "train", "path": f"p{len(base)}", "bucket": (256, 256)}
+        )
+    ds = GroupDataset(
+        "/tmp/g", ["a", "b", "__none__"], split="train",
+        cache=_FakeCache(base), sourceless=True, oversample_none=True,
     )
     assert _counts(ds) == {0: 2, 1: 2, 2: 6}
 
