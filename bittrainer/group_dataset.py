@@ -15,6 +15,7 @@ from PIL import Image
 from torch.utils.data import Dataset, Sampler
 from torchvision.transforms import functional as TF
 
+from bittrainer.class_balance import capped_equalise_target
 from bittrainer.dataset import (
     find_nearest_bucket,
     get_skin_normalised_train_transform,
@@ -76,6 +77,7 @@ class GroupDataset(Dataset):
         oversample_none: bool = False,
         extra_paths: dict[str, list[str]] | None = None,
         natural_sampling: bool = False,
+        oversample_max_ratio: float = 0.0,
     ):
         self.group_folder = Path(group_folder)
         self.class_names = class_names
@@ -88,6 +90,11 @@ class GroupDataset(Dataset):
         self._sourceless = sourceless
         self._group_name = group_name or self.group_folder.name
         self._oversample_none = oversample_none
+        # Ceiling on replication-based balancing: a minority class is oversampled to
+        # at most ``oversample_max_ratio`` x its natural size (0 = uncapped/legacy
+        # full equalisation). Bounds memorisation from extreme over-replication and
+        # respects the genuine (deployment-matched) class prior.
+        self._oversample_max_ratio = oversample_max_ratio
         # When True, train samples are taken at their natural class distribution
         # (each image once) instead of replication-equalised to the largest
         # class — used by the "reweight" class-balance mode, where imbalance is
@@ -228,9 +235,14 @@ class GroupDataset(Dataset):
                     expanded = list(paths)
                     random.shuffle(expanded)
                 elif len(paths) < max_count:
-                    expanded = paths * (max_count // len(paths) + 1)
+                    # Replicate up to the target, but no more than max_ratio x the
+                    # class's natural size (when a cap is set) to bound memorisation.
+                    target = capped_equalise_target(
+                        len(paths), max_count, self._oversample_max_ratio
+                    )
+                    expanded = paths * (target // len(paths) + 1)
                     random.shuffle(expanded)
-                    expanded = expanded[:max_count]
+                    expanded = expanded[:target]
                 else:
                     expanded = list(paths)
                     random.shuffle(expanded)

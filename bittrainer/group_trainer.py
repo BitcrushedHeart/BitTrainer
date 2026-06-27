@@ -17,6 +17,7 @@ from adv_optm import Prodigy_adv
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader
 
+from bittrainer.class_balance import cap_weight_ratio
 from bittrainer.ema import ModelEMA
 from bittrainer.group_dataset import (
     GroupDataset,
@@ -164,6 +165,12 @@ class GroupTrainConfig:
     class_balance_mode: str = "resample"
     class_balance_beta: float = 0.999
     class_balance_auto_ratio: float = 4.0
+    # Ceiling on how far class balancing may correct, applied to BOTH mechanisms:
+    # in "resample" the minority replication factor is capped at this, in "reweight"
+    # the max/min effective-number loss-weight ratio is. Bounds memorisation from
+    # extreme over-replication and respects the genuine (deployment-matched) prior —
+    # tuned for real-world / weighted F1 rather than balanced accuracy. 0 = uncapped.
+    class_balance_max_ratio: float = 4.0
     use_focal: bool = False
     focal_gamma: float = 2.0
     # RandAugment + RandomErasing (DeiT/ConvNeXt official fine-tune recipe)
@@ -602,19 +609,25 @@ def _effective_number_weights(
     num_classes: int,
     beta: float,
     device: torch.device,
+    max_ratio: float = 0.0,
 ) -> torch.Tensor:
     """Class weights by the effective number of samples (Cui et al., CVPR 2019).
 
-    ``w_c ∝ (1 - beta) / (1 - beta^{n_c})``, normalised so the mean weight is 1
-    (keeps the loss scale comparable to the unweighted baseline). Empty classes
-    keep weight 1.
+    ``w_c ∝ (1 - beta) / (1 - beta^{n_c})``, optionally clamped so the max/min weight
+    over non-empty classes is at most ``max_ratio`` (bounds over-correction; 0 =
+    uncapped), then normalised so the mean weight is 1 (keeps the loss scale
+    comparable to the unweighted baseline). Empty classes keep weight 1.
     """
-    weights = torch.ones(num_classes, dtype=torch.float32)
+    raw = [1.0] * num_classes
+    counts = [0] * num_classes
     for i in range(num_classes):
         n = int(class_counts.get(i, 0))
+        counts[i] = n
         if n > 0:
             eff = (1.0 - beta**n) / (1.0 - beta) if beta < 1.0 else float(n)
-            weights[i] = 1.0 / max(eff, 1e-8)
+            raw[i] = 1.0 / max(eff, 1e-8)
+    raw = cap_weight_ratio(raw, counts, max_ratio)
+    weights = torch.tensor(raw, dtype=torch.float32)
     weights = weights * (num_classes / weights.sum().clamp(min=1e-8))
     return weights.to(device)
 
@@ -1169,6 +1182,7 @@ def _prepare_datasets_and_cache(
             cache=smart_cache, sourceless=True, group_name=group_name,
             oversample_none=initial_oversample_none,
             extra_paths=config.extra_paths_train,
+            oversample_max_ratio=config.class_balance_max_ratio,
         )
         val_ds = GroupDataset(
             group_folder, config.class_names, split="val",
@@ -1183,6 +1197,7 @@ def _prepare_datasets_and_cache(
             skin_normalise=config.skin_normalise, group_name=group_name,
             oversample_none=initial_oversample_none,
             extra_paths=config.extra_paths_train,
+            oversample_max_ratio=config.class_balance_max_ratio,
         )
         val_ds = GroupDataset(
             group_folder, config.class_names, split="val",
@@ -2212,6 +2227,7 @@ def run_group_training(
         train_ds.set_natural_sampling(True)
         class_weights = _effective_number_weights(
             class_counts, config.num_classes, config.class_balance_beta, device,
+            max_ratio=config.class_balance_max_ratio,
         )
         cb({
             "type": "training_progress", "stage": "preparing",

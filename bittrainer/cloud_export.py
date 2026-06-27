@@ -329,6 +329,7 @@ def warm_group_cache(
     face_model_path: str = "",
     multi_label: bool = False,
     oversample_none: bool = False,
+    oversample_max_ratio: float = 0.0,
     modeltype: str = "convnext_v2",
     group_name: str = "",
     cache_workers: int = 10,
@@ -377,6 +378,7 @@ def warm_group_cache(
         skin_normalise=skin_normalise, group_name=group_name,
         oversample_none=oversample_none,
         extra_paths=extra_paths_train or {},
+        oversample_max_ratio=oversample_max_ratio,
     )
     val_ds = GroupDataset(
         group_folder, class_names, split="val",

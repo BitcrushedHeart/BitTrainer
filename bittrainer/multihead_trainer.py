@@ -67,6 +67,9 @@ class MultiHeadTrainConfig:
     channels_last: bool = True
     progress_callback: Callable[[dict], None] | None = None
     band_classes: list[str] = field(default_factory=list)
+    # Cap on minority size-class replication during balancing (see GroupTrainConfig);
+    # 0 = uncapped/legacy full equalisation.
+    class_balance_max_ratio: float = 4.0
 
 
 def _get_dtype(name: str) -> torch.dtype:
@@ -235,7 +238,10 @@ def run_multihead_training(
     if num_bands < 1 or maps.num_ranks < 1:
         raise RuntimeError("Multi-head training needs at least one parseable size class")
 
-    train_ds = GroupDataset(group_folder, size_classes, split="train", transform=get_train_transform())
+    train_ds = GroupDataset(
+        group_folder, size_classes, split="train", transform=get_train_transform(),
+        oversample_max_ratio=config.class_balance_max_ratio,
+    )
     val_ds = GroupDataset(group_folder, size_classes, split="val", transform=get_val_transform())
     total_samples = len(train_ds)
     if total_samples == 0:

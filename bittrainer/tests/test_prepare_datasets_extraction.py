@@ -64,6 +64,7 @@ def test_helper_matches_direct_construction(tmp_path):
         root, classes, split="train", multi_label=False,
         skin_normalise=False, group_name="group",
         oversample_none=False, extra_paths={},
+        oversample_max_ratio=config.class_balance_max_ratio,
     )
     ref_val = GroupDataset(
         root, classes, split="val", multi_label=False,
