@@ -211,7 +211,10 @@ class _OFTBase(nn.Module):
         else:
             self.base_bias = None
 
-        self.oft_a = nn.Parameter(torch.zeros(n_blocks, bs, bs))
+        # Born on the wrapped layer's device: wrap_backbone_with_oft runs after
+        # the model is moved to the training device, so a default-device (cpu)
+        # generator would mismatch a cuda base_weight in effective_weight().
+        self.oft_a = nn.Parameter(torch.zeros(n_blocks, bs, bs, device=weight2d.device))
         if dora:
             self.oft_m = nn.Parameter(weight2d.detach().float().norm(dim=1).clone())
         else:

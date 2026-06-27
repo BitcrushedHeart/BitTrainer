@@ -203,6 +203,31 @@ def test_merge_into_model_restores_base_modules():
     assert not any(isinstance(m, _OFTBase) for m in merged.modules())
 
 
+# --- device placement -------------------------------------------------------
+
+def test_oft_generator_follows_wrapped_layer_device():
+    """``oft_a`` must be born on the same device as the wrapped layer's weight.
+
+    Regression: ``wrap_backbone_with_oft`` runs AFTER the model is moved to the
+    training device (see ``run_oft_training``), so the base weight is on cuda
+    while a ``torch.zeros(...)`` generator with no ``device=`` was stranded on
+    cpu. ``effective_weight`` then did ``r @ w`` across devices and raised
+    "Expected all tensors to be on the same device". ``meta`` is a GPU-free
+    proxy for "a device other than cpu".
+    """
+    base = nn.Linear(16, 10).to("meta")
+    oft = OFTLinear(base, blocks=2)
+    assert oft.oft_a.device == oft.base_weight.device
+
+
+def test_wrap_backbone_keeps_generators_on_model_device():
+    """Wrapping a model that already lives on a device keeps generators with it."""
+    model = create_model(model_size="atto", pretrained=False, num_classes=4).to("meta")
+    wrap_backbone_with_oft(model, blocks=4)
+    gen_devices = {p.device for n, p in model.named_parameters() if n.endswith(".oft_a")}
+    assert gen_devices == {torch.device("meta")}
+
+
 # --- config defaults --------------------------------------------------------
 
 def test_config_defaults_are_fast_path():
