@@ -8,6 +8,7 @@ from bittrainer.model import (
     unfreeze_backbone,
     unfreeze_stage,
 )
+from bittrainer.backbone_init import BackboneInitSpec, normalize_backbone_init
 from bittrainer.trainer import TrainConfig, run_training
 from bittrainer.group_trainer import GroupTrainConfig, run_group_training
 from bittrainer.head_only_trainer import run_head_only_training
@@ -43,6 +44,8 @@ __all__ = [
     "load_checkpoint",
     "unfreeze_backbone",
     "unfreeze_stage",
+    "BackboneInitSpec",
+    "normalize_backbone_init",
     # trainer
     "TrainConfig",
     "run_training",

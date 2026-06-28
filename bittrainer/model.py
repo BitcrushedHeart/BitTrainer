@@ -6,6 +6,7 @@ import torch
 import torch.nn as nn
 import timm
 
+from bittrainer.backbone_init import apply_backbone_init, uses_timm_pretrained
 
 _MODEL_REGISTRY = {
     "atto": "convnextv2_atto.fcmae_ft_in1k",
@@ -64,6 +65,7 @@ def create_model(
     dtype: torch.dtype = torch.float32,
     num_classes: int = 2,
     head_hidden_size: int | None = None,
+    backbone_init: dict | None = None,
 ) -> nn.Module:
     """Create a ConvNeXt V2 model with *num_classes* output head.
 
@@ -75,12 +77,17 @@ def create_model(
     model_name = _MODEL_REGISTRY.get(model_size)
     if model_name is None:
         raise ValueError(f"Unknown model_size '{model_size}'. Valid: {list(_MODEL_REGISTRY.keys())}")
+    use_pretrained = uses_timm_pretrained(
+        requested_pretrained=pretrained,
+        backbone_init=backbone_init,
+    )
     model = timm.create_model(
         model_name,
-        pretrained=pretrained,
+        pretrained=use_pretrained,
         num_classes=num_classes,
         head_hidden_size=head_hidden_size,
     )
+    apply_backbone_init(model, backbone_init)
     if dtype != torch.float32:
         model = model.to(dtype=dtype)
     return model

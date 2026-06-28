@@ -2,11 +2,10 @@
 
 from __future__ import annotations
 
-import timm
 import torch
 import torch.nn as nn
 
-from bittrainer.model import _MODEL_REGISTRY
+from bittrainer.model import create_model
 
 
 class DualBranchConvNeXt(nn.Module):
@@ -16,17 +15,21 @@ class DualBranchConvNeXt(nn.Module):
         backbone_variant: str = "nano",
         num_classes: int = 2,
         drop_rate: float = 0.3,
+        pretrained: bool = True,
+        backbone_init: dict | None = None,
     ):
         super().__init__()
-        model_name = _MODEL_REGISTRY.get(backbone_variant)
-        if model_name is None:
-            raise ValueError(f"Unknown backbone_variant '{backbone_variant}'. Valid: {list(_MODEL_REGISTRY.keys())}")
-
-        self.crop_branch = timm.create_model(
-            model_name, pretrained=True, num_classes=0,
+        self.crop_branch = create_model(
+            model_size=backbone_variant,
+            pretrained=pretrained,
+            num_classes=0,
+            backbone_init=backbone_init,
         )
-        self.context_branch = timm.create_model(
-            model_name, pretrained=True, num_classes=0,
+        self.context_branch = create_model(
+            model_size=backbone_variant,
+            pretrained=pretrained,
+            num_classes=0,
+            backbone_init=backbone_init,
         )
 
         feature_dim = self.crop_branch.num_features
@@ -69,6 +72,7 @@ class DualBranchConvNeXt(nn.Module):
         model = cls(
             backbone_variant=meta["backbone_variant"],
             num_classes=meta["num_classes"],
+            pretrained=False,
         )
         model.crop_branch.load_state_dict(checkpoint["crop_branch"])
         model.context_branch.load_state_dict(checkpoint["context_branch"])

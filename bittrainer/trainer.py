@@ -67,6 +67,7 @@ class TrainConfig:
     sourceless: bool = False
     concept_name: str = ""
     modeltype: str = "convnext_v2"
+    backbone_init: dict | None = None
     progress_callback: Callable[[dict], None] | None = None
     # Layer-wise learning rate decay
     llrd: bool = True
@@ -436,9 +437,19 @@ def run_training(
             logger.info("Warm-starting from existing checkpoint: %s", existing_best)
         except Exception:
             logger.warning("Failed to load existing checkpoint, starting from pretrained", exc_info=True)
-            model = create_model(model_size=config.model_size, pretrained=True, dtype=dtype).to(device)
+            model = create_model(
+                model_size=config.model_size,
+                pretrained=True,
+                dtype=dtype,
+                backbone_init=config.backbone_init,
+            ).to(device)
     else:
-        model = create_model(model_size=config.model_size, pretrained=True, dtype=dtype).to(device)
+        model = create_model(
+            model_size=config.model_size,
+            pretrained=True,
+            dtype=dtype,
+            backbone_init=config.backbone_init,
+        ).to(device)
     use_gradual_unfreeze = num_positives < 50
 
     # Probe unfrozen = worst-case VRAM, then freeze for epoch 0

@@ -11,11 +11,10 @@ own checkpoint format like :class:`bittrainer.dual_branch_model.DualBranchConvNe
 
 from __future__ import annotations
 
-import timm
 import torch
 import torch.nn as nn
 
-from bittrainer.model import _MODEL_REGISTRY
+from bittrainer.model import create_model
 
 
 class MultiHeadConvNeXt(nn.Module):
@@ -29,15 +28,15 @@ class MultiHeadConvNeXt(nn.Module):
         size_classes: list[str] | None = None,
         drop_rate: float = 0.3,
         pretrained: bool = True,
+        backbone_init: dict | None = None,
     ):
         super().__init__()
-        model_name = _MODEL_REGISTRY.get(backbone_variant)
-        if model_name is None:
-            raise ValueError(
-                f"Unknown backbone_variant '{backbone_variant}'. Valid: {list(_MODEL_REGISTRY.keys())}"
-            )
-
-        self.backbone = timm.create_model(model_name, pretrained=pretrained, num_classes=0)
+        self.backbone = create_model(
+            model_size=backbone_variant,
+            pretrained=pretrained,
+            num_classes=0,
+            backbone_init=backbone_init,
+        )
         feature_dim = self.backbone.num_features
 
         self.shared = nn.Sequential(

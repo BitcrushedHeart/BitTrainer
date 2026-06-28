@@ -123,6 +123,7 @@ class GroupTrainConfig:
     sourceless: bool = False
     group_name: str = ""
     modeltype: str = "convnext_v2"
+    backbone_init: dict | None = None
     progress_callback: Callable[[dict], None] | None = None
     # Layer-wise learning rate decay
     llrd: bool = True
@@ -933,7 +934,6 @@ def _tune_softmax_calibration(
     base_loss = float(base_metrics.get("val_loss") or 0.0)
 
     best_temp = 1.0
-    best_temp_logits = base_logits
     best_temp_metrics = base_metrics
     best_temp_loss = base_loss
     for temp in _TEMPERATURE_GRID:
@@ -943,7 +943,6 @@ def _tune_softmax_calibration(
         cand_score = _metric_score(cand_metrics, config)
         if cand_loss < best_temp_loss and cand_score + 1e-9 >= base_score:
             best_temp = float(temp)
-            best_temp_logits = cand_logits
             best_temp_metrics = cand_metrics
             best_temp_loss = cand_loss
 
@@ -1271,6 +1270,10 @@ def _emit_model_load_stage(em, config: GroupTrainConfig, checkpoint_dir: Path) -
     if not config.from_scratch and existing_best.exists():
         em.stage(Stage.loading_model, f"Loading model ({config.backbone_variant}, warm start)")
         return
+    source = (config.backbone_init or {}).get("source")
+    if source and source != "temporary_timm_pretrained_fallback":
+        em.stage(Stage.loading_model, f"Loading backbone init ({config.backbone_variant})")
+        return
     try:
         from huggingface_hub import try_to_load_from_cache
 
@@ -1339,8 +1342,11 @@ def _create_or_warmstart_model(
         except (RuntimeError, OSError, KeyError, EOFError):
             logger.warning("Warm-start failed, falling back to pretrained", exc_info=True)
     return create_model(
-        model_size=config.backbone_variant, pretrained=True,
-        num_classes=config.num_classes, head_hidden_size=head_hidden_size,
+        model_size=config.backbone_variant,
+        pretrained=True,
+        num_classes=config.num_classes,
+        head_hidden_size=head_hidden_size,
+        backbone_init=config.backbone_init,
     ).to(device)
 
 

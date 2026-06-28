@@ -65,6 +65,7 @@ class MultiHeadTrainConfig:
     batch_size: int | None = None
     use_compile: bool = True
     channels_last: bool = True
+    backbone_init: dict | None = None
     progress_callback: Callable[[dict], None] | None = None
     band_classes: list[str] = field(default_factory=list)
 
@@ -250,6 +251,7 @@ def run_multihead_training(
             n_sizes=len(size_classes),
             band_classes=maps.band_vocab,
             size_classes=size_classes,
+            backbone_init=config.backbone_init,
         ).to(device)
 
     if not config.from_scratch and existing_best.exists():

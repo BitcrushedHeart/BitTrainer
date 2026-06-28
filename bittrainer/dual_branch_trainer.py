@@ -43,6 +43,7 @@ class DualBranchTrainConfig:
     use_compile: bool = True
     # NHWC layout — ConvNeXt stem/downsample/dwconv save permute traffic.
     channels_last: bool = True
+    backbone_init: dict | None = None
 
 
 def _get_dtype(name: str) -> torch.dtype:
@@ -191,11 +192,13 @@ def run_dual_branch_training(
             model = DualBranchConvNeXt(
                 backbone_variant=config.backbone_variant,
                 num_classes=config.num_classes,
+                backbone_init=config.backbone_init,
             ).to(device)
     else:
         model = DualBranchConvNeXt(
             backbone_variant=config.backbone_variant,
             num_classes=config.num_classes,
+            backbone_init=config.backbone_init,
         ).to(device)
     memory_format = torch.channels_last if config.channels_last else None
     if memory_format is not None:
