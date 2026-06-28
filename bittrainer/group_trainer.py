@@ -105,6 +105,13 @@ class GroupTrainConfig:
     ordinal: bool = False
     ordinal_sigma: float = 1.0
     validation_metric: str = "qwk"
+    # __none__ "guard": when True, fold the __none__-class F1 into epoch/candidate
+    # selection (macro_f1 + 0.1*none_f1, and qwk + 0.1*none_f1 for guarded_qwk
+    # ordinal groups) and veto promotion on __none__-recall regression. Default
+    # OFF — selection is plain macro_f1 (non-ordinal) / the raw qwk+macro_f1
+    # composite (ordinal). Opt in per-group when __none__ recall matters more
+    # than raw macro-F1.
+    none_guard: bool = False
     multi_label: bool = False
     oversample_none: bool = False
     extra_paths_train: dict[str, list[str]] = field(default_factory=dict)
@@ -245,7 +252,7 @@ def _has_none_class(config: GroupTrainConfig) -> bool:
 
 
 def _guarded_metric_enabled(config: GroupTrainConfig) -> bool:
-    return _has_none_class(config) and not config.multi_label
+    return config.none_guard and _has_none_class(config) and not config.multi_label
 
 
 def _guarded_score(metrics: dict, config: GroupTrainConfig) -> float:
