@@ -33,8 +33,24 @@ def test_ordinal_keep_syncs_all_summary_metrics(tmp_path, monkeypatch):
     torch.save({"state_dict": {}}, ckpt_dir / "candidate.pt")
 
     # Incumbent evaluates higher on QWK than the candidate → incumbent kept.
+    # Single-label incumbents are scored via _collect_val_logits +
+    # _incumbent_decode_metrics (the shipped-decode fair comparison); mock that
+    # seam — this test pins summary-metric syncing, not the decode itself.
     monkeypatch.setattr(gt, "load_checkpoint", lambda *a, **k: torch.nn.Identity())
-    monkeypatch.setattr(gt, "_evaluate", lambda *a, **k: dict(_INCUMBENT))
+
+    calls = {"n": 0}
+
+    def _fake_collect(*_a, **_k):
+        # First call = incumbent fair-comparison pass (succeeds); the later
+        # finalisation-calibration pass fails like the real val_loader=None
+        # would, so the kept incumbent's metrics survive to the result dict.
+        calls["n"] += 1
+        if calls["n"] > 1:
+            raise RuntimeError("No validation logits available for calibration")
+        return torch.zeros(1, 4), torch.zeros(1, dtype=torch.long)
+
+    monkeypatch.setattr(gt, "_collect_val_logits", _fake_collect)
+    monkeypatch.setattr(gt, "_incumbent_decode_metrics", lambda *a, **k: dict(_INCUMBENT))
 
     cfg = GroupTrainConfig(
         group_folder=str(tmp_path), num_classes=4, class_names=_CLASSES,

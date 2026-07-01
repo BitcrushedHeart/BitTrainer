@@ -78,6 +78,13 @@ _NONE_LOGIT_BIAS_GRID = [round(i * 0.025, 3) for i in range(21)]
 _SELECTION_SECONDARY_WEIGHT = 0.40  # weight on macro-F1 in the composite (0 = pure ordinal metric)
 _SELECTION_MIN_DELTA = 0.002        # min composite gain required to replace the incumbent best
 _TEMPERATURE_GRID = [0.75, 0.85, 1.0, 1.15, 1.3, 1.5]
+# Per-epoch ordinal cut-point fit budget. The finalisation fit keeps the full
+# find_ordinal_cut_points defaults (20 steps x 3 passes); per-epoch selection
+# only needs the boundaries roughly right for a fair inter-epoch comparison,
+# and the full-budget cost is quadratic-ish in num_classes (Age: 101
+# boundaries). Bump after GPU profiling if the reduced fit proves unstable.
+_EPOCH_CUT_GRID_STEPS = 8
+_EPOCH_CUT_PASSES = 1
 
 
 def _resolve_none_index(class_names: list[str]) -> int:
@@ -1083,6 +1090,9 @@ def _finalise_ordinal_decode(
     labels: torch.Tensor,
     config: GroupTrainConfig,
     none_index: int,
+    *,
+    grid_steps: int = 20,
+    passes: int = 3,
 ) -> tuple[list[float] | None, dict]:
     """Fit E[j] cut-points on (calibrated) val logits, adopting the EV decode
     only when it beats argmax on the selection score.
@@ -1092,6 +1102,10 @@ def _finalise_ordinal_decode(
     ordinal decode can never score below argmax on validation. ``argmax`` is the
     unbiased mode estimate; raw ``round(E[j])`` is biased inward at the scale
     edges, and only the fitted cut-points (OptimizedRounder) reliably correct it.
+
+    ``grid_steps``/``passes`` bound the coordinate-ascent budget: finalisation
+    keeps the full defaults, per-epoch selection uses the reduced
+    ``_EPOCH_CUT_*`` budget.
     """
     argmax_metrics = _metrics_from_logits(logits, labels, config, none_index, cut_points=None)
     argmax_metrics["ordinal_decode"] = "argmax"
@@ -1100,7 +1114,10 @@ def _finalise_ordinal_decode(
 
     probs = torch.softmax(logits.float(), dim=1).cpu().numpy()
     label_list = labels.cpu().tolist()
-    cuts = find_ordinal_cut_points(probs, label_list, config.num_classes, none_index=none_index)
+    cuts = find_ordinal_cut_points(
+        probs, label_list, config.num_classes, none_index=none_index,
+        grid_steps=grid_steps, passes=passes,
+    )
     if not cuts:
         return None, argmax_metrics
 
@@ -1110,6 +1127,79 @@ def _finalise_ordinal_decode(
         ev_metrics["ordinal_cut_points"] = cuts
         return cuts, ev_metrics
     return None, argmax_metrics
+
+
+def _shipped_decode_metrics(
+    logits: torch.Tensor,
+    labels: torch.Tensor,
+    config: GroupTrainConfig,
+    none_index: int,
+    *,
+    cut_grid_steps: int = _EPOCH_CUT_GRID_STEPS,
+    cut_passes: int = _EPOCH_CUT_PASSES,
+) -> dict:
+    """Score val logits under the decode the model actually ships with.
+
+    Mirrors finalisation: temperature + ``__none__`` logit bias (when a none
+    class exists) then the ordinal EV cut-point decode (adopted only when it
+    beats argmax), so per-epoch selection and the shipped model agree on what
+    "best" means. Plain single-label groups (no none, not ordinal) reduce to
+    argmax — identical to the previous behaviour.
+    """
+    if _has_none_class(config):
+        temperature, bias_vec, metrics = _tune_softmax_calibration(
+            logits, labels, config, none_index,
+        )
+        none_bias = (
+            float(bias_vec[none_index]) if 0 <= none_index < len(bias_vec) else 0.0
+        )
+        calibrated = _apply_calibration(
+            logits, temperature=temperature, none_bias=none_bias, none_index=none_index,
+        )
+    else:
+        calibrated = logits.float()
+        metrics = _metrics_from_logits(calibrated, labels, config, none_index)
+    if config.ordinal:
+        _, metrics = _finalise_ordinal_decode(
+            calibrated, labels, config, none_index,
+            grid_steps=cut_grid_steps, passes=cut_passes,
+        )
+    metrics["selection_decode"] = "shipped"
+    return metrics
+
+
+def _incumbent_decode_metrics(
+    logits: torch.Tensor,
+    labels: torch.Tensor,
+    config: GroupTrainConfig,
+    none_index: int,
+    ckpt: object,
+) -> dict:
+    """Score the incumbent under its OWN persisted calibration.
+
+    The fair comparison must judge the incumbent by what it ships with —
+    re-fitting calibration on it would credit it with tuning it never had,
+    and scoring it on raw argmax would penalise a well-calibrated incumbent.
+    Checkpoints from before calibration persistence (or non-dict payloads)
+    have no keys and fall back to plain argmax.
+    """
+    temperature = 1.0
+    none_bias = 0.0
+    cuts: list[float] | None = None
+    if isinstance(ckpt, dict):
+        temperature = float(ckpt.get("temperature") or 1.0)
+        bias_list = ckpt.get("class_logit_bias")
+        if bias_list is not None and 0 <= none_index < len(bias_list):
+            none_bias = float(bias_list[none_index])
+        raw_cuts = ckpt.get("ordinal_cut_points")
+        if config.ordinal and raw_cuts:
+            cuts = [float(x) for x in raw_cuts]
+    calibrated = _apply_calibration(
+        logits, temperature=temperature, none_bias=none_bias, none_index=none_index,
+    )
+    metrics = _metrics_from_logits(calibrated, labels, config, none_index, cut_points=cuts)
+    metrics["selection_decode"] = "shipped"
+    return metrics
 
 
 def _persist_ordinal_cut_points(checkpoint_path: str | None, cut_points: list[float]) -> None:
@@ -1837,6 +1927,10 @@ def _compare_promote_finalize(
     best_val_macro_f1 = candidate_macro_f1
     best_val_qwk = candidate_qwk
     best_checkpoint_path = candidate_path
+    # Which decode produced the selection metrics ("shipped" from the FT epoch
+    # loop; None for legacy/head-only paths). Captured before finalisation
+    # overwrites best_metrics with the calibrated dicts.
+    selection_decode = best_metrics.get("selection_decode")
 
     if best_checkpoint_path:
         _emit("comparing", "Comparing against current model")
@@ -1881,12 +1975,24 @@ def _compare_promote_finalize(
                         str(existing_best), device=str(device), dtype=dtype,
                         model_size=old_size, num_classes=config.num_classes,
                     ).to(device)
-                    old_metrics = _evaluate(
-                        old_model, val_loader, config.num_classes, device, dtype,
-                        multi_label=config.multi_label,
-                        ordinal=config.ordinal,
-                        none_index=_resolve_none_index(config.class_names),
-                    )
+                    if config.multi_label:
+                        old_metrics = _evaluate(
+                            old_model, val_loader, config.num_classes, device, dtype,
+                            multi_label=True,
+                            ordinal=config.ordinal,
+                            none_index=_resolve_none_index(config.class_names),
+                        )
+                    else:
+                        # Fair comparison: the incumbent is judged under its own
+                        # persisted calibration/decode (argmax for pre-calibration
+                        # checkpoints), matching the shipped-decode candidate score.
+                        inc_logits, inc_labels = _collect_val_logits(
+                            old_model, val_loader, config, device, dtype,
+                        )
+                        old_metrics = _incumbent_decode_metrics(
+                            inc_logits, inc_labels, config,
+                            _resolve_none_index(config.class_names), old_data,
+                        )
                     del old_model
                     incumbent_score = _metric_score(old_metrics, config)
                     eval_ok = True
@@ -2107,6 +2213,7 @@ def _compare_promote_finalize(
         "ordinal_sigma": config.ordinal_sigma,
         "ordinal_cut_points": ordinal_cut_points,
         "ordinal_decode": best_metrics.get("ordinal_decode"),
+        "selection_decode": selection_decode,
         "label_smoothing": config.label_smoothing,
     }
     if final_thresholds is not None:
@@ -2369,13 +2476,25 @@ def run_group_training(
             epoch=epoch + 1, max_epochs=config.max_epochs,
         )
         eval_model = ema.module if ema is not None else fwd_model
-        val_metrics = _evaluate(
-            eval_model, val_loader, config.num_classes, device, dtype,
-            multi_label=config.multi_label,
-            ordinal=config.ordinal,
-            none_index=_resolve_none_index(config.class_names),
-            channels_last=config.channels_last,
-        )
+        if config.multi_label:
+            val_metrics = _evaluate(
+                eval_model, val_loader, config.num_classes, device, dtype,
+                multi_label=True,
+                ordinal=config.ordinal,
+                none_index=_resolve_none_index(config.class_names),
+                channels_last=config.channels_last,
+            )
+        else:
+            # Score the epoch under the decode the model ships with
+            # (temperature + __none__ bias + ordinal cut-points) so selection
+            # and the shipped model agree on what "best" means.
+            epoch_logits, epoch_labels = _collect_val_logits(
+                eval_model, val_loader, config, device, dtype,
+            )
+            val_metrics = _shipped_decode_metrics(
+                epoch_logits, epoch_labels, config,
+                _resolve_none_index(config.class_names),
+            )
         val_metrics["train_loss"] = train_loss
 
         val_macro_f1 = val_metrics["macro_f1"]
@@ -2462,11 +2581,11 @@ def run_group_training(
         try:
             swa_sd_cpu = swa.state_dict()
             model.load_state_dict({k: v.to(device) for k, v in swa_sd_cpu.items()})
-            swa_metrics = _evaluate(
-                model, val_loader, config.num_classes, device, dtype,
-                multi_label=config.multi_label, ordinal=config.ordinal,
-                none_index=_resolve_none_index(config.class_names),
-                channels_last=config.channels_last,
+            # SWA competes against per-epoch bests, so it must be scored under
+            # the same shipped decode (SWA is single-label-only by the gate).
+            swa_logits, swa_labels = _collect_val_logits(model, val_loader, config, device, dtype)
+            swa_metrics = _shipped_decode_metrics(
+                swa_logits, swa_labels, config, _resolve_none_index(config.class_names),
             )
             swa_score = _metric_score(swa_metrics, config)
             cb({
