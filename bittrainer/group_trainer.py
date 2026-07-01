@@ -30,6 +30,7 @@ from bittrainer.group_validation import (
     compute_ordinal_metrics,
     find_ordinal_cut_points,
     find_per_class_thresholds,
+    macro_f1_variants,
     ordinal_decode,
 )
 from bittrainer.losses import AsymmetricLoss, FocalLoss
@@ -820,6 +821,7 @@ def _evaluate(
             metrics.update(compute_ordinal_metrics(
                 all_labels, all_preds, num_classes, none_index=none_index,
             ))
+        _augment_metric_variants(metrics, num_classes, none_index)
 
     metrics["val_loss"] = total_loss / max(num_batches, 1)
     return metrics
@@ -852,18 +854,34 @@ def _metrics_from_logits(
         metrics.update(compute_ordinal_metrics(
             label_list, preds, config.num_classes, none_index=none_index,
         ))
+    _augment_metric_variants(metrics, config.num_classes, none_index)
     metrics["val_loss"] = float(nn.CrossEntropyLoss()(logits.float(), labels.long()).item())
+    return metrics
+
+
+def _augment_metric_variants(metrics: dict, num_classes: int, none_index: int) -> dict:
+    """Attach the report-only macro-F1 variants (supported / __none__-excluded).
+
+    Selection stays on the raw metrics; the variants exist so consumers can see
+    the honest number for groups whose class list outruns their val support.
+    """
+    metrics.update(macro_f1_variants(
+        metrics.get("per_class_f1") or {},
+        metrics.get("per_class_support") or {},
+        num_classes,
+        none_index=none_index,
+    ))
     return metrics
 
 
 def _real_macro_f1(metrics: dict, config: GroupTrainConfig, none_index: int) -> float:
     per_class = metrics.get("per_class_f1") or {}
-    vals = [
-        float(per_class.get(str(i), 0.0))
-        for i in range(config.num_classes)
-        if i != none_index
-    ]
-    return float(np.mean(vals)) if vals else float(metrics.get("macro_f1") or 0.0)
+    if config.num_classes <= (1 if 0 <= none_index < config.num_classes else 0):
+        return float(metrics.get("macro_f1") or 0.0)
+    variants = macro_f1_variants(
+        per_class, {}, config.num_classes, none_index=none_index,
+    )
+    return variants["macro_f1_excl_none"]
 
 
 @torch.no_grad()
@@ -2035,6 +2053,13 @@ def _compare_promote_finalize(
     best_metrics.pop("_probs", None)
     best_metrics.pop("_labels", None)
 
+    # Val-side per-class counts: the support context that separates "class F1
+    # is 0" from "class had no validation samples to score".
+    try:
+        val_class_counts = dict(val_loader.dataset.get_class_counts())
+    except Exception:
+        val_class_counts = {}
+
     result = {
         "epochs_completed": epochs_completed,
         "best_epoch": best_epoch_display,
@@ -2042,14 +2067,21 @@ def _compare_promote_finalize(
         "validation_metric": _primary_validation_metric(config),
         "selected_validation_score": _metric_score(best_metrics, config),
         "final_val_macro_f1": best_metrics.get("macro_f1"),
+        "final_val_macro_f1_supported": best_metrics.get("macro_f1_supported"),
+        "final_val_macro_f1_excl_none": best_metrics.get("macro_f1_excl_none"),
+        "final_val_macro_f1_supported_excl_none": best_metrics.get(
+            "macro_f1_supported_excl_none"
+        ),
         "final_val_macro_precision": best_metrics.get("macro_precision"),
         "final_val_macro_recall": best_metrics.get("macro_recall"),
         "final_val_loss": best_metrics.get("val_loss"),
         "per_class_f1": best_metrics.get("per_class_f1", {}),
         "per_class_precision": best_metrics.get("per_class_precision", {}),
         "per_class_recall": best_metrics.get("per_class_recall", {}),
+        "per_class_support": best_metrics.get("per_class_support", {}),
         "checkpoint_path": best_checkpoint_path,
         "class_counts": class_counts,
+        "val_class_counts": val_class_counts,
         "total_images": total_raw,
         "promotion_reason": promotion_reason.value if promotion_reason else None,
         "selected_softness_kind": config.selected_softness_kind,
@@ -2395,11 +2427,13 @@ def run_group_training(
             "train_loss": train_loss,
             "val_loss": val_metrics["val_loss"],
             "val_macro_f1": val_macro_f1,
+            "val_macro_f1_supported": val_metrics.get("macro_f1_supported"),
             "val_macro_precision": val_metrics.get("macro_precision", 0.0),
             "val_macro_recall": val_metrics.get("macro_recall", 0.0),
             "per_class_f1": val_metrics.get("per_class_f1", {}),
             "per_class_precision": val_metrics.get("per_class_precision", {}),
             "per_class_recall": val_metrics.get("per_class_recall", {}),
+            "per_class_support": val_metrics.get("per_class_support", {}),
             "val_none_precision": val_metrics.get("none_precision"),
             "val_none_recall": val_metrics.get("none_recall"),
             "val_none_f1": val_metrics.get("none_f1"),

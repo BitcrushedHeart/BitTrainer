@@ -30,6 +30,7 @@ def compute_multiclass_metrics(
             "per_class_f1": {},
             "per_class_precision": {},
             "per_class_recall": {},
+            "per_class_support": {},
             "confusion_matrix": [],
             "balanced_accuracy": 0.0,
         }
@@ -51,6 +52,9 @@ def compute_multiclass_metrics(
     per_class_recall = {str(i): float(per_rec[i]) for i in range(num_classes)}
 
     cm = confusion_matrix(y_true, y_pred, labels=class_labels)
+    # True-label counts per class (CM row sums) — the denominator context the
+    # per-class F1 numbers are meaningless without.
+    per_class_support = {str(i): int(cm[i].sum()) for i in range(num_classes)}
 
     # Balanced accuracy = mean of per-class recall
     balanced_acc = float(np.mean(per_rec))
@@ -62,8 +66,49 @@ def compute_multiclass_metrics(
         "per_class_f1": per_class_f1,
         "per_class_precision": per_class_precision,
         "per_class_recall": per_class_recall,
+        "per_class_support": per_class_support,
         "confusion_matrix": cm.tolist(),
         "balanced_accuracy": balanced_acc,
+    }
+
+
+def macro_f1_variants(
+    per_class_f1: dict,
+    per_class_support: dict,
+    num_classes: int,
+    none_index: int = -1,
+) -> dict:
+    """Report-only macro-F1 variants over filtered class subsets.
+
+    The raw macro-F1 averages every defined class, so classes with zero
+    validation support each contribute a permanent 0 and cap the metric below
+    1.0 regardless of model quality. These variants make the honest number
+    visible without changing selection:
+
+    - ``macro_f1_supported``: mean over classes with val support > 0.
+    - ``macro_f1_excl_none``: mean over real (non-``__none__``) classes.
+    - ``macro_f1_supported_excl_none``: both filters combined.
+
+    A filter that removes every class falls back to the unfiltered mean so the
+    value stays defined (mirrors ``_real_macro_f1``'s fallback).
+    """
+
+    def _mean_over(indices: list[int]) -> float:
+        if not indices:
+            indices = list(range(num_classes))
+        vals = [float(per_class_f1.get(str(i), 0.0)) for i in indices]
+        return float(np.mean(vals)) if vals else 0.0
+
+    supported = [
+        i for i in range(num_classes) if int(per_class_support.get(str(i), 0) or 0) > 0
+    ]
+    real = [i for i in range(num_classes) if i != none_index]
+    supported_real = [i for i in supported if i != none_index]
+
+    return {
+        "macro_f1_supported": _mean_over(supported),
+        "macro_f1_excl_none": _mean_over(real),
+        "macro_f1_supported_excl_none": _mean_over(supported_real),
     }
 
 
@@ -387,6 +432,7 @@ def compute_multilabel_metrics(
             "per_class_f1": {},
             "per_class_precision": {},
             "per_class_recall": {},
+            "per_class_support": {},
             "hamming_loss": 0.0,
             "exact_match_ratio": 0.0,
             "thresholds": (thresholds.tolist() if thresholds is not None else [0.5] * num_classes),
@@ -413,6 +459,10 @@ def compute_multilabel_metrics(
     per_class_f1 = {str(i): float(per_f1[i]) for i in range(num_classes)}
     per_class_precision = {str(i): float(per_prec[i]) for i in range(num_classes)}
     per_class_recall = {str(i): float(per_rec[i]) for i in range(num_classes)}
+    per_class_support = {
+        str(i): int(labels[:, i].sum()) if i < labels.shape[1] else 0
+        for i in range(num_classes)
+    }
 
     # Hamming loss: fraction of wrong individual labels
     hamming = float(np.mean(labels != predictions))
@@ -427,6 +477,7 @@ def compute_multilabel_metrics(
         "per_class_f1": per_class_f1,
         "per_class_precision": per_class_precision,
         "per_class_recall": per_class_recall,
+        "per_class_support": per_class_support,
         "hamming_loss": hamming,
         "exact_match_ratio": exact_match,
         "thresholds": (thresholds.tolist() if thresholds is not None else [0.5] * num_classes),
