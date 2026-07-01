@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -9,6 +10,57 @@ from typing import Callable
 from PIL import Image
 
 logger = logging.getLogger(__name__)
+
+
+def select_bbox(
+    detections: list[tuple[str, float, tuple[float, float, float, float]]],
+    *,
+    target_classes: list[str] | None = None,
+    selection: str = "union",
+) -> list[int]:
+    """Pick the crop bbox from a set of (class_name, confidence, xyxy) detections.
+
+    ``target_classes`` filters by detector class name (case-insensitive;
+    ``None``/empty keeps everything — the face-crop behaviour). ``selection``
+    is ``"union"`` (min/max envelope of all matches, the face-crop behaviour)
+    or ``"highest_conf"`` (the single best matching box — the right default
+    for a body-part region where a union with a false positive would drag the
+    crop off-target). No match returns ``[]`` (cached negative).
+    """
+    wanted: set[str] | None = None
+    if target_classes:
+        wanted = {c.strip().lower() for c in target_classes if c and c.strip()}
+    matches = [
+        d for d in detections
+        if wanted is None or d[0].strip().lower() in wanted
+    ]
+    if not matches:
+        return []
+    if selection == "highest_conf":
+        _, _, box = max(matches, key=lambda d: d[1])
+        return [int(box[0]), int(box[1]), int(box[2]), int(box[3])]
+    x1 = min(d[2][0] for d in matches)
+    y1 = min(d[2][1] for d in matches)
+    x2 = max(d[2][2] for d in matches)
+    y2 = max(d[2][3] for d in matches)
+    return [int(x1), int(y1), int(x2), int(y2)]
+
+
+def region_bbox_cache_name(
+    model_path: str,
+    target_classes: list[str] | None,
+    selection: str,
+) -> str:
+    """Cache filename for a region-bbox pre-pass, distinct per model/classes/selection.
+
+    The face path keeps its historical ``face_bboxes.json``; region caches are
+    side-by-side so switching detector, class filter, or selection mode never
+    reads another configuration's boxes.
+    """
+    stem = Path(model_path).stem or "model"
+    classes_csv = ",".join(sorted(c.strip().lower() for c in (target_classes or []) if c))
+    classes_key = hashlib.sha1(classes_csv.encode("utf-8")).hexdigest()[:8] if classes_csv else "all"
+    return f"region_bboxes_{stem}_{classes_key}_{selection}.json"
 
 
 class FaceBBoxCache:
@@ -72,33 +124,36 @@ class FaceBBoxCache:
         return [p for p in all_paths if self.get(p) is None]
 
 
-def precompute_face_bboxes(
+def precompute_region_bboxes(
     image_paths: list[str],
     cache: FaceBBoxCache,
-    face_model_path: str,
+    model_path: str,
+    *,
+    target_classes: list[str] | None = None,
+    selection: str = "union",
     device: str = "cuda",
     batch_size: int = 32,
     progress_fn: Callable[[int, int], None] | None = None,
 ) -> None:
-    """Run YOLO face detection on uncached images and populate the cache.
+    """Run YOLO detection on uncached images and populate the bbox cache.
 
-    Loads the YOLO model, runs batch inference, stores the union bbox
-    of all detected faces per image, then unloads the model.
-    Deduplicates paths before processing to avoid redundant work from
-    oversampled training sets.
+    Loads the YOLO model, runs batch inference, stores the ``select_bbox``
+    result per image (union or highest-confidence, optionally filtered to
+    ``target_classes``), then unloads the model. Deduplicates paths before
+    processing to avoid redundant work from oversampled training sets.
     """
     import torch
 
     unique_paths = list(dict.fromkeys(image_paths))
     uncached = cache.uncached_paths(unique_paths)
     if not uncached:
-        logger.info("All %d unique images have cached face bboxes", len(unique_paths))
+        logger.info("All %d unique images have cached region bboxes", len(unique_paths))
         return
 
-    logger.info("Computing face bboxes for %d/%d unique images", len(uncached), len(unique_paths))
+    logger.info("Computing region bboxes for %d/%d unique images", len(uncached), len(unique_paths))
 
     from ultralytics import YOLO
-    model = YOLO(face_model_path)
+    model = YOLO(model_path)
     model.to(device)
 
     total = len(uncached)
@@ -108,17 +163,24 @@ def precompute_face_bboxes(
             results = model(batch_paths, verbose=False, device=device)
             for path, result in zip(batch_paths, results):
                 boxes = result.boxes
+                detections: list[tuple[str, float, tuple[float, float, float, float]]] = []
                 if boxes is not None and len(boxes) > 0:
+                    names = result.names or {}
                     xyxy = boxes.xyxy.cpu().numpy()
-                    x1 = int(xyxy[:, 0].min())
-                    y1 = int(xyxy[:, 1].min())
-                    x2 = int(xyxy[:, 2].max())
-                    y2 = int(xyxy[:, 3].max())
-                    cache.put(path, [x1, y1, x2, y2])
-                else:
-                    cache.put(path, [])
+                    confs = boxes.conf.cpu().numpy() if boxes.conf is not None else None
+                    clses = boxes.cls.cpu().numpy() if boxes.cls is not None else None
+                    for i in range(len(xyxy)):
+                        cls_name = (
+                            str(names.get(int(clses[i]), int(clses[i])))
+                            if clses is not None else ""
+                        )
+                        conf = float(confs[i]) if confs is not None else 0.0
+                        detections.append((cls_name, conf, tuple(xyxy[i][:4])))
+                cache.put(path, select_bbox(
+                    detections, target_classes=target_classes, selection=selection,
+                ))
         except (RuntimeError, OSError) as exc:
-            logger.warning("Face detection batch failed: %s", exc)
+            logger.warning("Region detection batch failed: %s", exc)
             for p in batch_paths:
                 cache.put(p, [])
 
@@ -130,7 +192,23 @@ def precompute_face_bboxes(
 
     del model
     torch.cuda.empty_cache()
-    logger.info("Face bbox pre-computation complete, model unloaded")
+    logger.info("Region bbox pre-computation complete, model unloaded")
+
+
+def precompute_face_bboxes(
+    image_paths: list[str],
+    cache: FaceBBoxCache,
+    face_model_path: str,
+    device: str = "cuda",
+    batch_size: int = 32,
+    progress_fn: Callable[[int, int], None] | None = None,
+) -> None:
+    """Face pre-pass: union bbox of all detections (historical behaviour)."""
+    precompute_region_bboxes(
+        image_paths, cache, face_model_path,
+        target_classes=None, selection="union",
+        device=device, batch_size=batch_size, progress_fn=progress_fn,
+    )
 
 
 def face_aware_crop(

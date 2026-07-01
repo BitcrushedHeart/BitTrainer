@@ -191,6 +191,28 @@ class GroupDataset(Dataset):
         for s in self.samples:
             s["face_bbox"] = face_bboxes.get(s["path"])
 
+    def drop_paths_without_bbox(self, bboxes: dict[str, list[int]]) -> int:
+        """Remove images with no detected crop region and rebuild samples.
+
+        Region-crop training with ``region_fallback="drop"``: a train image
+        where the detector found nothing would otherwise fall back to a
+        centre crop of mostly-irrelevant pixels. Filtering happens at the
+        per-class path-list level so the exclusion survives ``reshuffle()``'s
+        sample rebuild. Returns the number of images dropped.
+        """
+        if self._sourceless:
+            return 0
+        dropped = 0
+        kept_lists: list[list[Path]] = []
+        for paths in self._class_paths:
+            kept = [p for p in paths if bboxes.get(str(p))]
+            dropped += len(paths) - len(kept)
+            kept_lists.append(kept)
+        if dropped:
+            self._class_paths = kept_lists
+            self._build_samples()
+        return dropped
+
     def _build_samples(self) -> None:
         self.samples = []
 

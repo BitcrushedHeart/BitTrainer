@@ -132,6 +132,18 @@ class GroupTrainConfig:
     checkpoint_dir: str | None = None
     skin_normalise: bool = False
     face_model_path: str = ""
+    # Region-crop training: a YOLO detector localises the group's concept and
+    # the crop centres on it (fine-grained groups lose their discriminative
+    # region to the ~512px bucket resolution otherwise). Takes precedence over
+    # face_model_path. region_classes filters detector classes (empty = all);
+    # region_selection is "highest_conf" or "union"; region_fallback is
+    # "full_frame" (centre crop for undetected images, the face behaviour) or
+    # "drop" (remove undetected TRAIN images — val always keeps full coverage
+    # so metrics stay comparable).
+    region_model_path: str = ""
+    region_classes: list[str] = field(default_factory=list)
+    region_selection: str = "highest_conf"
+    region_fallback: str = "full_frame"
     cache_dir: str | None = None
     use_cache: bool = True
     cache_workers: int = 10
@@ -1234,14 +1246,20 @@ def _prepare_datasets_and_cache(
     # --- SmartCache setup ---
     smart_cache = None
     if config.use_cache:
-        from bittrainer.smart_cache import SmartCache, face_model_signature
+        from bittrainer.smart_cache import SmartCache, region_signature
         cache_root = Path(config.cache_dir) if config.cache_dir else (group_folder / ".smart_cache")
+        # region_signature reduces to the historical face_model_signature for
+        # face-style args, so existing face-crop caches stay valid.
         smart_cache = SmartCache(
             cache_root,
             modeltype=config.modeltype,
             progress_callback=cb,
             stop_check=partial(_stop_event_is_set, stop_event),
-            face_model_sig=face_model_signature(config.face_model_path or None),
+            face_model_sig=region_signature(
+                (config.region_model_path or config.face_model_path) or None,
+                config.region_classes if config.region_model_path else None,
+                config.region_selection if config.region_model_path else "union",
+            ),
         )
 
     # When the auto __none__ oversample sweep is enabled it decides off-vs-1.5x
@@ -1288,31 +1306,61 @@ def _prepare_datasets_and_cache(
             extra_paths=config.extra_paths_val,
         )
 
-        # --- Face-aware cropping pre-computation ---
+        # --- Face/region-aware cropping pre-computation ---
         face_bboxes: dict[str, list[int]] = {}
-        if config.face_model_path:
-            from bittrainer.face_crop import FaceBBoxCache, precompute_face_bboxes
-            face_cache = FaceBBoxCache(group_folder / ".resize_cache" / "face_bboxes.json")
+        crop_model = config.region_model_path or config.face_model_path
+        if crop_model:
+            from bittrainer.face_crop import (
+                FaceBBoxCache,
+                precompute_region_bboxes,
+                region_bbox_cache_name,
+            )
+            if config.region_model_path:
+                cache_name = region_bbox_cache_name(
+                    config.region_model_path, config.region_classes, config.region_selection,
+                )
+                target_classes = config.region_classes or None
+                selection = config.region_selection
+                stage, verb = "region_detection", "Detecting crop regions"
+            else:
+                cache_name = "face_bboxes.json"
+                target_classes = None
+                selection = "union"
+                stage, verb = "face_detection", "Detecting faces"
+            bbox_cache = FaceBBoxCache(group_folder / ".resize_cache" / cache_name)
             all_image_paths = [s["path"] for s in train_ds.samples] + [s["path"] for s in val_ds.samples]
 
-            def _face_progress(done: int, total: int) -> None:
+            def _crop_progress(done: int, total: int) -> None:
                 cb({
-                    "type": "training_progress", "stage": "face_detection",
-                    "status_text": f"Detecting faces ({done}/{total})",
+                    "type": "training_progress", "stage": stage,
+                    "status_text": f"{verb} ({done}/{total})",
                     "step": done, "total_steps": total,
                 })
 
-            precompute_face_bboxes(
-                all_image_paths, face_cache, config.face_model_path,
+            precompute_region_bboxes(
+                all_image_paths, bbox_cache, crop_model,
+                target_classes=target_classes, selection=selection,
                 device=config.device,
-                progress_fn=_face_progress,
+                progress_fn=_crop_progress,
             )
             for p in all_image_paths:
-                bbox = face_cache.get(p)
+                bbox = bbox_cache.get(p)
                 if bbox:
                     face_bboxes[p] = bbox
             train_ds.refresh_face_bboxes(face_bboxes)
             val_ds.refresh_face_bboxes(face_bboxes)
+
+            # Undetected-region policy: "drop" removes train images the
+            # detector found nothing in (a centre crop of a region-less image
+            # is mostly label noise for a fine-grained group). Val keeps full
+            # coverage so metrics stay comparable across fallback modes.
+            if config.region_model_path and config.region_fallback == "drop":
+                dropped = train_ds.drop_paths_without_bbox(face_bboxes)
+                if dropped:
+                    cb({
+                        "type": "training_progress", "stage": stage,
+                        "status_text": f"Dropped {dropped} train images with no detected region",
+                    })
 
         # --- Warm SmartCache ---
         if smart_cache is not None:

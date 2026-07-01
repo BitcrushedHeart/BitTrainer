@@ -106,6 +106,25 @@ def face_model_signature(face_model_path: str | None) -> str:
     return f"{os.path.basename(face_model_path)}:{mtime}"
 
 
+def region_signature(
+    model_path: str | None,
+    target_classes: list[str] | None = None,
+    selection: str = "union",
+) -> str:
+    """Crop-identity signature: model binary + class filter + selection mode.
+
+    Byte-identical to :func:`face_model_signature` for face-style arguments
+    (no class filter, union selection) so existing face-crop groups keep their
+    baked tensor caches; any region-specific filter or selection extends the
+    signature and invalidates naturally.
+    """
+    base = face_model_signature(model_path)
+    if not model_path or (not target_classes and selection == "union"):
+        return base
+    classes_csv = ",".join(sorted(c.strip().lower() for c in (target_classes or []) if c))
+    return f"{base}:{classes_csv}:{selection}"
+
+
 class CachingStoppedException(Exception):
     """Raised when stop_check returns True during a cache build."""
 
