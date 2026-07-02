@@ -121,6 +121,14 @@ class GroupTrainConfig:
     # than raw macro-F1.
     none_guard: bool = False
     multi_label: bool = False
+    # Spatial-grid groups (e.g. Subject Location): per-class grid cell masks in
+    # class-index order (``__none__`` = empty list). When set, the trainer
+    # (a) swaps the classifier fc for the cell-structured SpatialCellFC head,
+    # (b) flips labels together with images instead of the label-blind hflip,
+    # and (c) restricts RandAugment to photometric ops. None = ordinary group.
+    cell_masks: list[list[int]] | None = None
+    grid_rows: int = 3
+    grid_cols: int = 3
     oversample_none: bool = False
     extra_paths_train: dict[str, list[str]] = field(default_factory=dict)
     extra_paths_val: dict[str, list[str]] = field(default_factory=dict)
@@ -239,6 +247,18 @@ class GroupTrainConfig:
     channels_last: bool = True
     # Gradient accumulation escape hatch: optimizer steps every N batches.
     grad_accum_steps: int = 1
+
+
+def _spatial_ckpt_meta(config: GroupTrainConfig) -> dict:
+    """Checkpoint metadata for spatial groups — load_checkpoint reconstructs
+    the SpatialCellFC head from these keys. Empty for ordinary groups."""
+    if not config.cell_masks:
+        return {}
+    return {
+        "cell_masks": [list(m) for m in config.cell_masks],
+        "grid_rows": int(config.grid_rows),
+        "grid_cols": int(config.grid_cols),
+    }
 
 
 def _primary_validation_metric(config: GroupTrainConfig) -> str:
@@ -689,20 +709,39 @@ def _train_one_epoch(
     from bittrainer.gpu_augment import apply_train_augment
     from bittrainer.mixing import apply_mixing
 
+    # Spatial groups: horizontal flip must remap the label to the mirrored
+    # composition (or skip samples with no mirror class) — the label-blind
+    # flip inside apply_train_augment would teach left/right classes to
+    # collapse into each other.
+    spatial_flip_map: torch.Tensor | None = None
+    if config.cell_masks:
+        from bittrainer.spatial import build_hflip_class_map
+
+        spatial_flip_map = torch.tensor(
+            build_hflip_class_map(config.cell_masks, config.grid_rows, config.grid_cols),
+            dtype=torch.long, device=device,
+        )
+
     memory_format = torch.channels_last if config.channels_last else None
     optimizer.zero_grad()
     for images, labels in dataloader:
         if stop_now_event is not None and stop_now_event.is_set():
             break
         images = images.to(device, non_blocking=True)
+        labels = labels.to(device)
+        if spatial_flip_map is not None:
+            from bittrainer.spatial import spatial_hflip_batch
+
+            images, labels = spatial_hflip_batch(images, labels, spatial_flip_map)
         images = apply_train_augment(
             images, dtype=dtype,
             randaugment_n=config.randaugment_n,
             randaugment_m=config.randaugment_m,
             random_erasing_p=config.random_erasing_p,
             memory_format=memory_format,
+            hflip=spatial_flip_map is None,
+            photometric_only=spatial_flip_map is not None,
         )
-        labels = labels.to(device)
 
         # MixUp/CutMix: smooth targets first (preserving ordinal/label smoothing),
         # then interpolate, so mixing composes with the soft-target loss.
@@ -1456,6 +1495,19 @@ def _create_or_warmstart_model(
     applies through autocast only.
     """
     del dtype  # training dtype applies via autocast; master weights are fp32
+
+    def _finalise_head(model: nn.Module) -> nn.Module:
+        # Spatial groups swap the classifier fc for the cell-structured head.
+        # Done before warm-start matching so a spatial incumbent's cell_fc
+        # carries over while a pre-spatial (linear) head simply starts clean.
+        if config.cell_masks:
+            from bittrainer.spatial import install_spatial_head
+
+            install_spatial_head(
+                model, config.cell_masks, config.grid_rows * config.grid_cols,
+            )
+        return model
+
     existing_best = checkpoint_dir / config.best_model_name
     if not config.from_scratch and existing_best.exists():
         try:
@@ -1466,10 +1518,10 @@ def _create_or_warmstart_model(
             else:
                 state = data
                 size = config.backbone_variant
-            model = create_model(
+            model = _finalise_head(create_model(
                 model_size=size, pretrained=False,
                 num_classes=config.num_classes, head_hidden_size=head_hidden_size,
-            ).to(device)
+            )).to(device)
             target = model.state_dict()
             matched = {
                 k: v.to(target[k].dtype) for k, v in state.items()
@@ -1483,10 +1535,10 @@ def _create_or_warmstart_model(
             return model
         except (RuntimeError, OSError, KeyError, EOFError):
             logger.warning("Warm-start failed, falling back to pretrained", exc_info=True)
-    return create_model(
+    return _finalise_head(create_model(
         model_size=config.backbone_variant, pretrained=True,
         num_classes=config.num_classes, head_hidden_size=head_hidden_size,
-    ).to(device)
+    )).to(device)
 
 
 def _auto_softness_kind(config: GroupTrainConfig) -> str | None:
@@ -2572,6 +2624,7 @@ def run_group_training(
                 "model_size": config.backbone_variant,
                 "class_names": list(config.class_names),
                 "validation_metric": _primary_validation_metric(config),
+                **_spatial_ckpt_meta(config),
             }
             if head_hidden_size is not None:
                 ckpt_meta["head_hidden_size"] = head_hidden_size
@@ -2650,6 +2703,7 @@ def run_group_training(
                     "model_size": config.backbone_variant,
                     "class_names": list(config.class_names),
                     "validation_metric": _primary_validation_metric(config),
+                    **_spatial_ckpt_meta(config),
                 }
                 if head_hidden_size is not None:
                     ckpt_meta["head_hidden_size"] = head_hidden_size

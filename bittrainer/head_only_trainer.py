@@ -33,6 +33,7 @@ from bittrainer.group_trainer import (
     _resolve_none_index,
     _run_auto_oversample_probe,
     _run_auto_softness_probe,
+    _spatial_ckpt_meta,
 )
 from bittrainer.model import backbone_feature_hash
 
@@ -175,6 +176,7 @@ def run_head_only_training(
         "model_size": config.backbone_variant,
         "class_names": list(config.class_names),
         "validation_metric": _primary_validation_metric(config),
+        **_spatial_ckpt_meta(config),
     }
     if head_hidden is not None:
         ckpt_meta["head_hidden_size"] = head_hidden

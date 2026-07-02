@@ -246,10 +246,15 @@ def load_checkpoint(
         state_dict = data["state_dict"]
         ckpt_size = data.get("model_size", model_size)
         ckpt_classes = data.get("num_classes", num_classes)
+        cell_masks = data.get("cell_masks")
+        grid_rows = int(data.get("grid_rows") or 3)
+        grid_cols = int(data.get("grid_cols") or 3)
     else:
         state_dict = data
         ckpt_size = model_size
         ckpt_classes = num_classes
+        cell_masks = None
+        grid_rows = grid_cols = 3
 
     # Infer architecture from weights when metadata is missing or wrong
     inferred_size = _infer_model_size(state_dict)
@@ -265,6 +270,17 @@ def load_checkpoint(
         model_size=ckpt_size, pretrained=False, dtype=dtype,
         num_classes=ckpt_classes, head_hidden_size=head_hidden_size,
     )
+    if cell_masks is not None:
+        # Spatial checkpoint: swap in the cell-structured head before loading —
+        # the state_dict carries head.fc.cell_fc.* instead of head.fc.*. The
+        # module keeps emitting num_classes scores, so callers are unaffected.
+        from bittrainer.spatial import install_spatial_head
+
+        install_spatial_head(
+            model,
+            [list(m) for m in cell_masks],
+            grid_rows * grid_cols,
+        )
     model.load_state_dict(state_dict)
     model = model.to(device)
     return model
