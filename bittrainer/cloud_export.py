@@ -129,6 +129,15 @@ def _scoped_index_bytes(entries: dict[str, dict]) -> bytes:
     return json.dumps(index, sort_keys=True, separators=(",", ":")).encode("utf-8")
 
 
+def _label_for_storage(label):
+    """JSON-storable label (mirrors smart_cache._label_to_storage without the
+    torch import — this module stays stdlib-only for pod-side staging tests)."""
+    tolist = getattr(label, "tolist", None)
+    if callable(tolist):
+        return tolist()
+    return label
+
+
 def build_scoped_export(
     *,
     global_cache_dir: str | os.PathLike,
@@ -153,10 +162,10 @@ def build_scoped_export(
     cache_out = export_dir / "cache"
     cache_out.mkdir(parents=True, exist_ok=True)
 
-    # Authoritative path -> split (dedup by normpath, which is how cache.json keys).
-    auth: dict[str, str] = {}
+    # Authoritative path -> sample (dedup by normpath, which is how cache.json keys).
+    auth: dict[str, SampleRef] = {}
     for s in samples:
-        auth[os.path.normpath(s.path)] = s.split
+        auth[os.path.normpath(s.path)] = s
     auth_paths = set(auth)
     if not auth_paths:
         raise ScopedExportError("no samples to export")
@@ -181,7 +190,9 @@ def build_scoped_export(
         if entry is None:
             not_cached.append(path)
             continue
-        scoped_entries[path] = entry
+        # Copy: the scoped entry gets this group's label/split stamped below
+        # and must never mutate the shared global index.
+        scoped_entries[path] = dict(entry)
     if not_cached:
         raise ScopedExportError(
             f"{len(not_cached)} sample(s) not in the global cache — cache first "
@@ -197,11 +208,19 @@ def build_scoped_export(
             raise ScopedExportError(
                 f"cache_version mismatch for {path}: {entry.get('cache_version')} != {_CACHE_VERSION}"
             )
-        cached_split = entry.get("split")
-        if cached_split != auth[path]:
-            raise ScopedExportError(
-                f"split mismatch for {path}: cache {cached_split!r} != expected {auth[path]!r}"
-            )
+        # The global cache is SHARED across groups but stores a single
+        # label/split per path — whichever group warmed it last stamped its
+        # view (an off-disk __none__ image is legitimately "train" for one
+        # group and "val" for another). The current group's dataset is the
+        # authority, and the pod's sourceless loader reads label/split from
+        # THIS scoped index — so stamp rather than fail, which also guarantees
+        # another group's label can never ship.
+        ref = auth[path]
+        entry["split"] = ref.split
+        if ref.label is not None:
+            entry["label"] = _label_for_storage(ref.label)
+        if ref.concept_name:
+            entry["concept_name"] = ref.concept_name
 
     pt_files = sorted({_pt_filename(e["cache_file"]) for e in scoped_entries.values()})
 
