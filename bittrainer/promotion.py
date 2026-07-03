@@ -6,6 +6,13 @@ IO) so it is unit-testable and importable on a training pod alongside the
 cloud orchestrator.
 
 Resolution order:
+  0. Auto-Promote requested      -> promote candidate unconditionally, without
+                                    loading or scoring the incumbent at all. The
+                                    caller has asserted the freshly trained model
+                                    should ship regardless of the incumbent (e.g.
+                                    the incumbent is known-leaky on the current
+                                    validation split after a re-split). Skips the
+                                    class-setup and eval checks below.
   1. No incumbent                -> promote candidate (nothing to beat).
   2. Class-setup mismatch        -> promote candidate; the models are
                                     incomparable and the incumbent is stale
@@ -32,6 +39,7 @@ from enum import Enum
 
 
 class PromotionReason(str, Enum):
+    auto_promote = "auto_promote"
     no_incumbent = "no_incumbent"
     class_mismatch = "class_mismatch"
     higher_score = "higher_score"
@@ -63,8 +71,14 @@ def decide_promotion(
     eval_ok: bool,
     incumbent_num_classes: int | None = None,
     candidate_num_classes: int | None = None,
+    auto_promote: bool = False,
 ) -> tuple[bool, PromotionReason]:
     """Decide whether to promote the candidate over the incumbent.
+
+    ``auto_promote`` short-circuits the whole gate: the candidate wins
+    unconditionally, before (and instead of) any class-setup or head-to-head
+    check. The caller is expected to skip loading/scoring the incumbent entirely
+    when it passes this, so the other arguments are ignored.
 
     ``incumbent_class_names`` is ``None`` for legacy checkpoints that predate
     class-name metadata; a name mismatch cannot be proven, so detection falls
@@ -76,6 +90,9 @@ def decide_promotion(
     promotes the candidate: a model that cannot be scored is not a model the
     candidate must beat.
     """
+    if auto_promote:
+        return True, PromotionReason.auto_promote
+
     if not incumbent_exists:
         return True, PromotionReason.no_incumbent
 

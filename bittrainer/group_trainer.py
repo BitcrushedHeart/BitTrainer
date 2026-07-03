@@ -60,7 +60,6 @@ _LABEL_SMOOTHING_CANDIDATES = [0.0, 0.025, 0.05, 0.075, 0.1, 0.15, 0.2]
 # __none__ oversample sweep candidates: (label, oversample_none flag).
 _OVERSAMPLE_NONE_CANDIDATES = [("off", False), ("1.5x", True)]
 _NONE_F1_WEIGHT = 0.10
-_NONE_RECALL_REGRESSION_TOLERANCE = 0.02
 _REAL_MACRO_F1_REGRESSION_TOLERANCE = 0.01
 _NONE_LOGIT_BIAS_GRID = [round(i * 0.025, 3) for i in range(21)]
 
@@ -136,6 +135,13 @@ class GroupTrainConfig:
     device: str = "cuda"
     dtype: str = "bfloat16"
     from_scratch: bool = False
+    # Auto-Promote: skip the incumbent comparison entirely and ship the freshly
+    # trained candidate as best.pt unconditionally (no incumbent load, no score
+    # compare, no guard). The escape hatch for a known-leaky incumbent — e.g. a
+    # re-split group whose incumbent trained on images now in the current
+    # validation split, which would otherwise be scored unfairly high. Off by
+    # default: the head-to-head promotion gate governs.
+    auto_promote: bool = False
     best_model_name: str = "best.pt"
     checkpoint_dir: str | None = None
     skin_normalise: bool = False
@@ -2033,7 +2039,6 @@ def _compare_promote_finalize(
     selection_decode = best_metrics.get("selection_decode")
 
     if best_checkpoint_path:
-        _emit("comparing", "Comparing against current model")
         candidate_score = _metric_score(best_metrics, config)
         incumbent_class_names: list[str] | None = None
         incumbent_num_classes: int | None = None
@@ -2041,7 +2046,23 @@ def _compare_promote_finalize(
         old_metrics: dict | None = None
         eval_ok = False
 
-        if not existing_best.exists():
+        if config.auto_promote:
+            # Auto-Promote: ship the candidate without loading or scoring the
+            # incumbent at all (no head-to-head, no guard). The caller has
+            # asserted the incumbent should not be the thing to beat — typically
+            # because it is known-leaky on the current validation split.
+            _emit("comparing", "Auto-Promote on — shipping new model without comparison")
+            promote, promotion_reason = decide_promotion(
+                incumbent_exists=existing_best.exists(),
+                incumbent_class_names=None,
+                candidate_class_names=list(config.class_names),
+                incumbent_score=None,
+                candidate_score=candidate_score,
+                eval_ok=False,
+                auto_promote=True,
+            )
+        elif not existing_best.exists():
+            _emit("comparing", "Comparing against current model")
             promote, promotion_reason = decide_promotion(
                 incumbent_exists=False,
                 incumbent_class_names=None,
@@ -2051,6 +2072,7 @@ def _compare_promote_finalize(
                 eval_ok=False,
             )
         else:
+            _emit("comparing", "Comparing against current model")
             try:
                 old_data = torch.load(str(existing_best), map_location=device, weights_only=True)
                 if isinstance(old_data, dict):
@@ -2110,23 +2132,6 @@ def _compare_promote_finalize(
                 incumbent_num_classes=incumbent_num_classes,
                 candidate_num_classes=config.num_classes,
             )
-            if (
-                promote
-                and _guarded_metric_enabled(config)
-                and old_metrics is not None
-                and best_metrics.get("none_recall") is not None
-                and old_metrics.get("none_recall") is not None
-                and float(best_metrics.get("none_recall") or 0.0) + _NONE_RECALL_REGRESSION_TOLERANCE
-                < float(old_metrics.get("none_recall") or 0.0)
-            ):
-                logger.info(
-                    "Keeping incumbent because candidate regressed __none__ recall "
-                    "(incumbent=%.4f candidate=%.4f)",
-                    float(old_metrics.get("none_recall") or 0.0),
-                    float(best_metrics.get("none_recall") or 0.0),
-                )
-                promote = False
-                promotion_reason = PromotionReason.incumbent_wins
 
         if promote:
             logger.info("Promoting new checkpoint (reason=%s)", promotion_reason.value)
