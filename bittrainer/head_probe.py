@@ -170,8 +170,11 @@ def train_head_probe_from_tensors(
     from bittrainer.group_trainer import build_group_loss_fn
 
     _cb = cb or (lambda _msg: None)
-    use_soft = config.ordinal or bool(config.soft_aliases) or (
-        not config.multi_label and config.label_smoothing > 0
+    use_soft = (
+        config.ordinal
+        or bool(config.soft_aliases)
+        or bool(config.class_similarity_centroids)
+        or (not config.multi_label and config.label_smoothing > 0)
     )
 
     for p in model.parameters():
@@ -306,8 +309,11 @@ def train_head_probe(
     from bittrainer.group_trainer import build_group_loss_fn
 
     _cb = cb or (lambda _msg: None)
-    use_soft = config.ordinal or bool(config.soft_aliases) or (
-        not config.multi_label and config.label_smoothing > 0
+    use_soft = (
+        config.ordinal
+        or bool(config.soft_aliases)
+        or bool(config.class_similarity_centroids)
+        or (not config.multi_label and config.label_smoothing > 0)
     )
 
     # Loading tens of thousands of small .npy vectors takes minutes on NTFS —

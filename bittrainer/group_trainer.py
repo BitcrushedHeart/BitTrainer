@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import logging
+import math
 import time
 from dataclasses import dataclass, field
 from functools import partial
@@ -154,6 +155,15 @@ class GroupTrainConfig:
     skin_tone_views_manifest: str = ""
     skin_tone_calibration: dict | None = None
     skin_tone_dual_view_prob: float = 0.5
+    # ΔE-perceptual soft labels (Skin Tone V2 spec §8.1): Oklab [L, a, b]
+    # centroid per class NAME. When >=2 classes carry centroids, soft targets
+    # use a Gaussian kernel over PERCEPTUAL centroid distance (Euclidean in
+    # Oklab) instead of ordinal rank or uniform label smoothing — probability
+    # bleeds into genuinely-near classes (undertone-aware) and none into
+    # display-adjacent-but-perceptually-distant ones. perceptual_sigma is in
+    # Oklab ΔE units (~0.02 = one JND).
+    class_similarity_centroids: dict = field(default_factory=dict)
+    perceptual_sigma: float = 0.035
     face_model_path: str = ""
     # Region-crop training: a YOLO detector localises the group's concept and
     # the crop centres on it (fine-grained groups lose their discriminative
@@ -473,6 +483,39 @@ def _build_gaussian_kernel(
     return kernel
 
 
+def _build_perceptual_kernel(
+    class_names: list[str],
+    centroids_by_name: dict,
+    sigma: float,
+    *,
+    none_index: int = -1,
+) -> torch.Tensor | None:
+    """Gaussian kernel over perceptual (Oklab ΔE) centroid distance.
+
+    kernel[i, j] = exp(-ΔE(c_i, c_j)^2 / (2*sigma^2)), row-normalised.
+    ``__none__`` and any class without a centroid stay hard (identity row and
+    zeroed column) — no probability bleeds to or from them. Returns None when
+    fewer than two classes carry centroids (feature off).
+    """
+    n = len(class_names)
+    pts: list[list[float] | None] = []
+    for name in class_names:
+        c = centroids_by_name.get(name)
+        pts.append([float(v) for v in c] if c is not None and len(c) == 3 else None)
+    if sum(1 for p in pts if p is not None) < 2 or sigma <= 0:
+        return None
+    kernel = torch.eye(n, dtype=torch.float32)
+    for i in range(n):
+        if pts[i] is None or i == none_index:
+            continue
+        for j in range(n):
+            if j == i or pts[j] is None or j == none_index:
+                continue
+            de2 = sum((a - b) ** 2 for a, b in zip(pts[i], pts[j]))
+            kernel[i, j] = math.exp(-de2 / (2.0 * sigma * sigma))
+    return kernel / kernel.sum(dim=1, keepdim=True)
+
+
 def _build_soft_targets(
     labels: torch.Tensor,
     num_classes: int,
@@ -483,21 +526,27 @@ def _build_soft_targets(
     soft_aliases: dict | None = None,
     none_index: int = -1,
     device: torch.device = torch.device("cpu"),
+    perceptual_kernel: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Convert integer labels to soft target vectors.
 
     1. Start with one-hot
-    2. Apply ordinal Gaussian smoothing (if ordinal and sigma > 0),
+    2. Apply the perceptual (ΔE-centroid) kernel when supplied — it REPLACES
+       ordinal smoothing and label smoothing (Skin Tone V2: softness follows
+       colour-space distance, never ordinal rank)
+    3. Else ordinal Gaussian smoothing (if ordinal and sigma > 0),
        excluding ``none_index``
-    3. Apply global label smoothing for non-ordinal softmax groups, excluding
+    4. Else global label smoothing for non-ordinal softmax groups, excluding
        ``none_index`` from both directions
-    4. Apply soft aliases
+    5. Apply soft aliases
     """
     batch_size = labels.shape[0]
     targets = torch.zeros(batch_size, num_classes, device=device)
     targets.scatter_(1, labels.unsqueeze(1), 1.0)
 
-    if ordinal and num_classes > 2 and ordinal_sigma > 0:
+    if perceptual_kernel is not None:
+        targets = targets @ perceptual_kernel.to(device)
+    elif ordinal and num_classes > 2 and ordinal_sigma > 0:
         kernel = _build_gaussian_kernel(num_classes, sigma=ordinal_sigma, none_index=none_index).to(device)
         targets = targets @ kernel
     elif not ordinal and label_smoothing > 0:
@@ -592,6 +641,12 @@ def build_group_loss_fn(
             return ml_criterion(logits.float(), labels.float())
 
     elif use_soft_targets:
+        perceptual_kernel = _build_perceptual_kernel(
+            list(config.class_names),
+            config.class_similarity_centroids or {},
+            config.perceptual_sigma,
+            none_index=none_index,
+        )
 
         def loss_fn(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
             soft = _build_soft_targets(
@@ -602,6 +657,7 @@ def build_group_loss_fn(
                 soft_aliases=config.soft_aliases or None,
                 none_index=none_index,
                 device=device,
+                perceptual_kernel=perceptual_kernel,
             )
             log_probs = torch.log_softmax(logits.float(), dim=1)
             return _soft_ce_loss(
@@ -768,6 +824,12 @@ def _train_one_epoch(
                 label_smoothing=config.label_smoothing,
                 soft_aliases=config.soft_aliases or None,
                 none_index=none_index, device=device,
+                perceptual_kernel=_build_perceptual_kernel(
+                    list(config.class_names),
+                    config.class_similarity_centroids or {},
+                    config.perceptual_sigma,
+                    none_index=none_index,
+                ),
             )
             images, mix_soft = apply_mixing(
                 images, mix_soft, config.num_classes,
@@ -2391,8 +2453,11 @@ def run_group_training(
     checkpoint_dir = Path(config.checkpoint_dir) if config.checkpoint_dir else group_folder / "checkpoints"
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
-    use_soft = config.ordinal or bool(config.soft_aliases) or (
-        not config.multi_label and config.label_smoothing > 0
+    use_soft = (
+        config.ordinal
+        or bool(config.soft_aliases)
+        or bool(config.class_similarity_centroids)
+        or (not config.multi_label and config.label_smoothing > 0)
     )
 
     em.stage(Stage.scanning, "Scanning dataset")
