@@ -2636,8 +2636,17 @@ def run_group_training(
             if getattr(val_ds, "skin_tone_views", None) is not None:
                 val_ds.skin_tone_force_view = True
                 try:
+                    # A FRESH in-process loader is load-bearing: val_loader's
+                    # persistent workers hold a dataset copy pickled before
+                    # the flag flip and would silently re-score the ORIGINAL
+                    # view. num_workers=0 runs __getitem__ in this process,
+                    # so the flag is guaranteed visible.
+                    view_loader = DataLoader(
+                        val_ds, batch_sampler=val_sampler, collate_fn=collate_fn,
+                        num_workers=0, pin_memory=True,
+                    )
                     view_logits, view_labels = _collect_val_logits(
-                        eval_model, val_loader, config, device, dtype,
+                        eval_model, view_loader, config, device, dtype,
                     )
                 finally:
                     val_ds.skin_tone_force_view = False
