@@ -100,6 +100,13 @@ class GroupDataset(Dataset):
         # class — used by the "reweight" class-balance mode, where imbalance is
         # handled by class weights in the loss instead of by oversampling.
         self._natural_sampling = natural_sampling
+        # Skin Tone V2 dual-view (skin_tone_views.py): a per-image colour
+        # normalisation applied as a stochastic train augmentation, or forced
+        # for the validation "normalized" pass. Attached post-init by
+        # _prepare_datasets_and_cache; None = feature off.
+        self.skin_tone_views = None
+        self.skin_tone_view_prob = 0.0
+        self.skin_tone_force_view = False
 
         if sourceless:
             self._init_sourceless()
@@ -431,6 +438,7 @@ class GroupDataset(Dataset):
             if result is not None:
                 tensor, _ = result
                 if tuple(tensor.shape[-2:]) == (bh, bw):
+                    tensor = self._maybe_skin_tone_view(tensor, sample)
                     return tensor, sample["label"], tuple(bucket)
                 # Cached tensor was built under a different aspect-ratio bucket
                 # table (e.g. a prior training resolution). Its size no longer
@@ -456,7 +464,23 @@ class GroupDataset(Dataset):
             pil_img = Image.fromarray(arr.transpose(1, 2, 0))
             return self.transform(pil_img), sample["label"], tuple(bucket)
 
+        img_tensor = self._maybe_skin_tone_view(img_tensor, sample)
         return img_tensor, sample["label"], tuple(bucket)
+
+    def _maybe_skin_tone_view(self, tensor: torch.Tensor, sample: dict) -> torch.Tensor:
+        """Skin Tone V2 dual-view hook — identity unless a view bank is
+        attached (see skin_tone_views.maybe_apply_view)."""
+        if self.skin_tone_views is None:
+            return tensor
+        from bittrainer.skin_tone_views import maybe_apply_view
+
+        return maybe_apply_view(
+            tensor,
+            str(sample.get("source_path") or sample["path"]),
+            self.skin_tone_views,
+            probability=self.skin_tone_view_prob,
+            force=self.skin_tone_force_view,
+        )
 
     def get_class_counts(self) -> dict[int, int]:
         if self._sourceless:

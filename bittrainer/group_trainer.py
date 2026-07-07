@@ -145,6 +145,15 @@ class GroupTrainConfig:
     best_model_name: str = "best.pt"
     checkpoint_dir: str | None = None
     skin_normalise: bool = False
+    # Skin Tone V2 dual-view (Bitcrush Engine ISSUE-0217, spec §8): path to
+    # the engine-written per-image normalisation manifest
+    # (skin_tone_normalisation.json), the frozen calibration snapshot
+    # (informational, rides along for provenance), and the probability of
+    # swapping a TRAIN sample for its colour-normalised view. Validation
+    # always scores both views separately when the manifest is present.
+    skin_tone_views_manifest: str = ""
+    skin_tone_calibration: dict | None = None
+    skin_tone_dual_view_prob: float = 0.5
     face_model_path: str = ""
     # Region-crop training: a YOLO detector localises the group's concept and
     # the crop centres on it (fine-grained groups lose their discriminative
@@ -1431,6 +1440,22 @@ def _prepare_datasets_and_cache(
             train_ds.set_cache(smart_cache)
             val_ds.set_cache(smart_cache)
 
+    # --- Skin Tone V2 dual-view bank (ISSUE-0217) ---
+    if config.skin_tone_views_manifest:
+        from bittrainer.skin_tone_views import load_view_bank
+
+        view_bank = load_view_bank(config.skin_tone_views_manifest)
+        if view_bank is not None:
+            train_ds.skin_tone_views = view_bank
+            train_ds.skin_tone_view_prob = float(config.skin_tone_dual_view_prob)
+            # Val default stays on the ORIGINAL view (prob 0); the epoch loop
+            # flips skin_tone_force_view for the "normalized" scoring pass.
+            val_ds.skin_tone_views = view_bank
+            cb({
+                "type": "training_progress", "stage": "preparing",
+                "status_text": f"Skin Tone dual-view: {len(view_bank)} image transforms loaded",
+            })
+
     total_samples = len(train_ds)
     if total_samples == 0:
         raise RuntimeError("No training images found")
@@ -2285,6 +2310,10 @@ def _compare_promote_finalize(
         ),
         "final_val_macro_precision": best_metrics.get("macro_precision"),
         "final_val_macro_recall": best_metrics.get("macro_recall"),
+        # Skin Tone V2 dual-view tracks (None for non-dual-view runs).
+        "final_val_macro_f1_original": best_metrics.get("macro_f1_original"),
+        "final_val_macro_f1_normalized": best_metrics.get("macro_f1_normalized"),
+        "final_val_macro_f1_dual": best_metrics.get("macro_f1_dual"),
         "final_val_loss": best_metrics.get("val_loss"),
         "per_class_f1": best_metrics.get("per_class_f1", {}),
         "per_class_precision": best_metrics.get("per_class_precision", {}),
@@ -2600,6 +2629,33 @@ def run_group_training(
                 epoch_logits, epoch_labels, config,
                 _resolve_none_index(config.class_names),
             )
+            # Skin Tone V2 dual-view (ISSUE-0217, spec §8): score the
+            # colour-normalised view and the averaged-logit combination as
+            # separate tracks. Selection stays on the ORIGINAL view — raw
+            # inference is the deployment default (spec §9).
+            if getattr(val_ds, "skin_tone_views", None) is not None:
+                val_ds.skin_tone_force_view = True
+                try:
+                    view_logits, view_labels = _collect_val_logits(
+                        eval_model, val_loader, config, device, dtype,
+                    )
+                finally:
+                    val_ds.skin_tone_force_view = False
+                view_metrics = _shipped_decode_metrics(
+                    view_logits, view_labels, config,
+                    _resolve_none_index(config.class_names),
+                )
+                val_metrics["macro_f1_original"] = val_metrics["macro_f1"]
+                val_metrics["macro_f1_normalized"] = view_metrics["macro_f1"]
+                # Averaged logits are only meaningful if both passes saw the
+                # samples in the same order (val sampler is deterministic;
+                # guard anyway).
+                if torch.equal(epoch_labels, view_labels):
+                    dual_metrics = _shipped_decode_metrics(
+                        (epoch_logits + view_logits) / 2.0, epoch_labels, config,
+                        _resolve_none_index(config.class_names),
+                    )
+                    val_metrics["macro_f1_dual"] = dual_metrics["macro_f1"]
         val_metrics["train_loss"] = train_loss
 
         val_macro_f1 = val_metrics["macro_f1"]
