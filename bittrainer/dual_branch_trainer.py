@@ -12,6 +12,7 @@ from adv_optm import Prodigy_adv
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader
 
+from bittrainer.backbone_init import apply_backbone_init, wants_timm_pretrained
 from bittrainer.dual_branch_model import DualBranchConvNeXt
 from bittrainer.dual_crop_dataset import DualCropDataset
 from bittrainer.group_dataset import get_train_transform, get_val_transform
@@ -34,6 +35,9 @@ class DualBranchTrainConfig:
     device: str = "cuda"
     dtype: str = "bfloat16"
     from_scratch: bool = False
+    # Bitcrush Engine backbone spec (see bittrainer.backbone_init) — governs
+    # where fresh-model backbone weights come from. None = timm pretrained.
+    backbone_init: dict | None = None
     best_model_name: str = "best.pt"
     checkpoint_dir: str | None = None
     progress_callback: Callable[[dict], None] | None = None
@@ -47,6 +51,17 @@ class DualBranchTrainConfig:
 
 def _get_dtype(name: str) -> torch.dtype:
     return {"bfloat16": torch.bfloat16, "float16": torch.float16, "float32": torch.float32}[name]
+
+
+def _fresh_dual_branch_model(config: "DualBranchTrainConfig") -> DualBranchConvNeXt:
+    model = DualBranchConvNeXt(
+        backbone_variant=config.backbone_variant,
+        num_classes=config.num_classes,
+        pretrained=wants_timm_pretrained(config.backbone_init),
+    )
+    apply_backbone_init(model.crop_branch, config.backbone_init)
+    apply_backbone_init(model.context_branch, config.backbone_init)
+    return model
 
 
 def _collate_dual(batch: list) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -188,15 +203,9 @@ def run_dual_branch_training(
             logger.info("Warm-starting from existing dual-branch checkpoint: %s", existing_best)
         except (RuntimeError, KeyError, FileNotFoundError):
             logger.warning("Failed to load existing checkpoint, starting from pretrained", exc_info=True)
-            model = DualBranchConvNeXt(
-                backbone_variant=config.backbone_variant,
-                num_classes=config.num_classes,
-            ).to(device)
+            model = _fresh_dual_branch_model(config).to(device)
     else:
-        model = DualBranchConvNeXt(
-            backbone_variant=config.backbone_variant,
-            num_classes=config.num_classes,
-        ).to(device)
+        model = _fresh_dual_branch_model(config).to(device)
     memory_format = torch.channels_last if config.channels_last else None
     if memory_format is not None:
         model = model.to(memory_format=memory_format)

@@ -24,6 +24,7 @@ from adv_optm import Prodigy_adv
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader
 
+from bittrainer.backbone_init import apply_backbone_init, wants_timm_pretrained
 from bittrainer.dataset import get_train_transform, get_val_transform
 from bittrainer.group_dataset import GroupDataset
 from bittrainer.group_validation import compute_multihead_metrics
@@ -60,6 +61,9 @@ class MultiHeadTrainConfig:
     device: str = "cuda"
     dtype: str = "bfloat16"
     from_scratch: bool = False
+    # Bitcrush Engine backbone spec (see bittrainer.backbone_init) — governs
+    # where fresh-model backbone weights come from. None = timm pretrained.
+    backbone_init: dict | None = None
     best_model_name: str = "best.pt"
     checkpoint_dir: str | None = None
     batch_size: int | None = None
@@ -244,13 +248,16 @@ def run_multihead_training(
     existing_best = checkpoint_dir / config.best_model_name
 
     def _fresh_model() -> MultiHeadConvNeXt:
-        return MultiHeadConvNeXt(
+        model = MultiHeadConvNeXt(
             backbone_variant=config.backbone_variant,
             n_bands=num_bands,
             n_sizes=len(size_classes),
             band_classes=maps.band_vocab,
             size_classes=size_classes,
-        ).to(device)
+            pretrained=wants_timm_pretrained(config.backbone_init),
+        )
+        apply_backbone_init(model.backbone, config.backbone_init)
+        return model.to(device)
 
     if not config.from_scratch and existing_best.exists():
         try:

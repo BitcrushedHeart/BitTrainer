@@ -16,6 +16,7 @@ class DualBranchConvNeXt(nn.Module):
         backbone_variant: str = "nano",
         num_classes: int = 2,
         drop_rate: float = 0.3,
+        pretrained: bool = True,
     ):
         super().__init__()
         model_name = _MODEL_REGISTRY.get(backbone_variant)
@@ -23,10 +24,10 @@ class DualBranchConvNeXt(nn.Module):
             raise ValueError(f"Unknown backbone_variant '{backbone_variant}'. Valid: {list(_MODEL_REGISTRY.keys())}")
 
         self.crop_branch = timm.create_model(
-            model_name, pretrained=True, num_classes=0,
+            model_name, pretrained=pretrained, num_classes=0,
         )
         self.context_branch = timm.create_model(
-            model_name, pretrained=True, num_classes=0,
+            model_name, pretrained=pretrained, num_classes=0,
         )
 
         feature_dim = self.crop_branch.num_features
@@ -69,6 +70,7 @@ class DualBranchConvNeXt(nn.Module):
         model = cls(
             backbone_variant=meta["backbone_variant"],
             num_classes=meta["num_classes"],
+            pretrained=False,
         )
         model.crop_branch.load_state_dict(checkpoint["crop_branch"])
         model.context_branch.load_state_dict(checkpoint["context_branch"])

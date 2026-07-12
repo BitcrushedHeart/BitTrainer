@@ -41,6 +41,7 @@ from bittrainer.head_probe import (
     train_head_probe,
     train_head_probe_from_tensors,
 )
+from bittrainer.backbone_init import apply_backbone_init, wants_timm_pretrained
 from bittrainer.model import (
     backbone_feature_hash,
     build_llrd_param_groups,
@@ -136,6 +137,9 @@ class GroupTrainConfig:
     device: str = "cuda"
     dtype: str = "bfloat16"
     from_scratch: bool = False
+    # Bitcrush Engine backbone spec (see bittrainer.backbone_init) — governs
+    # where fresh-model backbone weights come from. None = timm pretrained.
+    backbone_init: dict | None = None
     # Auto-Promote: skip the incumbent comparison entirely and ship the freshly
     # trained candidate as best.pt unconditionally (no incumbent load, no score
     # compare, no guard). The escape hatch for a known-leaky incumbent — e.g. a
@@ -1548,6 +1552,9 @@ def _emit_model_load_stage(em, config: GroupTrainConfig, checkpoint_dir: Path) -
     if not config.from_scratch and existing_best.exists():
         em.stage(Stage.loading_model, f"Loading model ({config.backbone_variant}, warm start)")
         return
+    if not wants_timm_pretrained(config.backbone_init):
+        em.stage(Stage.loading_model, f"Loading model ({config.backbone_variant}, local backbone)")
+        return
     try:
         from huggingface_hub import try_to_load_from_cache
 
@@ -1628,10 +1635,13 @@ def _create_or_warmstart_model(
             return model
         except (RuntimeError, OSError, KeyError, EOFError):
             logger.warning("Warm-start failed, falling back to pretrained", exc_info=True)
-    return _finalise_head(create_model(
-        model_size=config.backbone_variant, pretrained=True,
+    model = _finalise_head(create_model(
+        model_size=config.backbone_variant,
+        pretrained=wants_timm_pretrained(config.backbone_init),
         num_classes=config.num_classes, head_hidden_size=head_hidden_size,
-    )).to(device)
+    ))
+    apply_backbone_init(model, config.backbone_init)
+    return model.to(device)
 
 
 def _auto_softness_kind(config: GroupTrainConfig) -> str | None:

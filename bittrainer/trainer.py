@@ -20,6 +20,7 @@ from bittrainer.dataset import (
     _DimensionCache,
     build_bucket_batch_sampler,
 )
+from bittrainer.backbone_init import apply_backbone_init, wants_timm_pretrained
 from bittrainer.ema import ModelEMA
 from bittrainer.model import (
     build_llrd_param_groups,
@@ -52,6 +53,9 @@ class TrainConfig:
     device: str = "cuda"
     dtype: str = "bfloat16"
     from_scratch: bool = False
+    # Bitcrush Engine backbone spec (see bittrainer.backbone_init) — governs
+    # where fresh-model backbone weights come from. None = timm pretrained.
+    backbone_init: dict | None = None
     extra_positive_dirs: list[str] = field(default_factory=list)
     negative_dirs: list[str] = field(default_factory=list)
     hard_negative_paths: list[str] = field(default_factory=list)
@@ -81,6 +85,16 @@ class TrainConfig:
     randaugment_n: int = 2
     randaugment_m: int = 9
     random_erasing_p: float = 0.25
+
+
+def _fresh_binary_model(config: "TrainConfig", *, dtype: torch.dtype) -> nn.Module:
+    model = create_model(
+        model_size=config.model_size,
+        pretrained=wants_timm_pretrained(config.backbone_init),
+        dtype=dtype,
+    )
+    apply_backbone_init(model, config.backbone_init)
+    return model
 
 
 def _make_optimizer(model: nn.Module, config: "TrainConfig") -> Prodigy_adv:
@@ -436,9 +450,9 @@ def run_training(
             logger.info("Warm-starting from existing checkpoint: %s", existing_best)
         except Exception:
             logger.warning("Failed to load existing checkpoint, starting from pretrained", exc_info=True)
-            model = create_model(model_size=config.model_size, pretrained=True, dtype=dtype).to(device)
+            model = _fresh_binary_model(config, dtype=dtype).to(device)
     else:
-        model = create_model(model_size=config.model_size, pretrained=True, dtype=dtype).to(device)
+        model = _fresh_binary_model(config, dtype=dtype).to(device)
     use_gradual_unfreeze = num_positives < 50
 
     # Probe unfrozen = worst-case VRAM, then freeze for epoch 0
