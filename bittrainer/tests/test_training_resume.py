@@ -22,14 +22,7 @@ _CLASSES = ["a", "b", "c"]
 
 def _make_group(root, *, per_class=6, seed=0):
     """Write a tiny deterministic group folder: root/<class>/<split>/img.png."""
-    rng = np.random.default_rng(seed)
-    for split, n in (("train", per_class), ("val", max(2, per_class // 2))):
-        for ci, cname in enumerate(_CLASSES):
-            d = root / cname / split
-            d.mkdir(parents=True, exist_ok=True)
-            for j in range(n):
-                arr = rng.integers(0, 256, size=(64, 64, 3), dtype=np.uint8)
-                Image.fromarray(arr).save(d / f"{cname}_{j}.png")
+    _make_labelled_group(root, _CLASSES, per_class=per_class, seed=seed)
 
 
 def _cfg(group_folder, checkpoint_dir, **kw) -> GroupTrainConfig:
@@ -96,6 +89,18 @@ def _pause_after_first_periodic():
     return pause, _cb
 
 
+def _pause_at_epoch(n: int):
+    """Returns (pause_event, callback) that pauses at the top of epoch index
+    ``n`` — i.e. right after epoch ``n``'s ``epoch_complete``."""
+    pause = _FlagEvent()
+
+    def _cb(msg):
+        if msg.get("type") == "epoch_complete" and msg.get("epoch") == n:
+            pause.set()
+
+    return pause, _cb
+
+
 def test_backward_compat_no_backup_when_disabled(tmp_path):
     """Regression guard: called without backup_dir/resume_from/pause_event, the
     trainer writes ZERO backup files and returns the normal result shape."""
@@ -130,11 +135,7 @@ def test_group_resume_epoch_boundary_equivalence(tmp_path):
     control = run_group_training(_cfg(tmp_path / "grp", tmp_path / "ck_ctrl", max_epochs=3))
 
     # Interrupted: pause at the epoch-1 boundary, then resume for the rest.
-    pause = _FlagEvent()
-
-    def _cb(msg):
-        if msg.get("type") == "epoch_complete" and msg.get("epoch") == 1:
-            pause.set()  # pause at the top of epoch index 1
+    pause, _cb = _pause_at_epoch(1)
 
     _seed(0)
     first = run_group_training(
@@ -336,11 +337,7 @@ def test_soup_pool_survives_pause_and_resume(tmp_path):
     the finalisation still consumes them (soup_cands cleaned up only at the end)."""
     _make_group(tmp_path / "grp", per_class=6, seed=11)
 
-    pause = _FlagEvent()
-
-    def _cb(msg):
-        if msg.get("type") == "epoch_complete" and msg.get("epoch") == 2:
-            pause.set()  # pause at the top of epoch index 2
+    pause, _cb = _pause_at_epoch(2)
 
     _seed(0)
     first = run_group_training(
@@ -446,11 +443,8 @@ def test_binary_pause_resume_across_unfreeze_boundary(tmp_path):
 
     _make_concept(tmp_path / "c", n_pos=55, n_neg=55, n_val=10)  # >=50 -> non-gradual
 
-    pause = _FlagEvent()
-
-    def _cb(msg):
-        if msg.get("type") == "epoch_complete" and msg.get("epoch") == 1:
-            pause.set()  # pause at the top of epoch index 1 (the unfreeze boundary)
+    # Pause at the top of epoch index 1 (the unfreeze boundary).
+    pause, _cb = _pause_at_epoch(1)
 
     _seed(0)
     first = run_training(
@@ -507,11 +501,7 @@ def test_multihead_pause_and_resume_completes(tmp_path):
             backbone_init={"source": "random_init", "checkpoint_path": None}, **kw,
         )
 
-    pause = _FlagEvent()
-
-    def _cb(msg):
-        if msg.get("type") == "epoch_complete" and msg.get("epoch") == 1:
-            pause.set()
+    pause, _cb = _pause_at_epoch(1)
 
     _seed(0)
     first = run_multihead_training(
@@ -547,11 +537,7 @@ def test_dual_branch_pause_and_resume_completes(tmp_path):
             dataloader_workers=0, backbone_init={"source": "random_init", "checkpoint_path": None}, **kw,
         )
 
-    pause = _FlagEvent()
-
-    def _cb(msg):
-        if msg.get("type") == "epoch_complete" and msg.get("epoch") == 1:
-            pause.set()
+    pause, _cb = _pause_at_epoch(1)
 
     _seed(0)
     first = run_dual_branch_training(

@@ -17,9 +17,9 @@ from adv_optm import Prodigy_adv
 
 from bittrainer.training_state import (
     BACKUP_FORMAT_VERSION,
+    BackupCoordinator,
     TrainingStateManager,
     _FixedBatchSampler,
-    backup_on_exception,
     capture_rng_states,
     capture_optimizer_aux_state,
     fingerprint_matches,
@@ -365,7 +365,6 @@ def test_sanitize_for_backup_converts_numpy():
 def test_backup_on_exception_saves_and_reraises(tmp_path):
     """Regression guard: an exception inside the wrapped block writes a
     reason='exception' backup and the ORIGINAL exception still propagates."""
-    mgr = TrainingStateManager(tmp_path / "b")
 
     class Boom(RuntimeError):
         pass
@@ -374,15 +373,16 @@ def test_backup_on_exception_saves_and_reraises(tmp_path):
         return {"global_step": 11, "epoch": 2, "note": "snapshot"}
 
     events = []
+    coord = BackupCoordinator(backup_dir=tmp_path / "b", cb=events.append)
     try:
-        with backup_on_exception(_collect, mgr, cb=events.append):
+        with coord.backup_on_exception(_collect):
             raise Boom("kaboom")
     except Boom:
         pass
     else:  # pragma: no cover
         raise AssertionError("original exception was swallowed")
 
-    loaded = mgr.load_latest()
+    loaded = coord.manager.load_latest()
     assert loaded["reason"] == "exception"
     assert loaded["global_step"] == 11
     assert events and events[0]["type"] == "backup_complete"
@@ -398,9 +398,12 @@ def test_backup_failure_does_not_mask_original_exception(tmp_path):
     def _collect():
         return {"global_step": 1}
 
+    coord = BackupCoordinator(backup_dir=tmp_path / "b")
+    coord.manager = BadManager()
+
     with_pytest_raises = False
     try:
-        with backup_on_exception(_collect, BadManager()):
+        with coord.backup_on_exception(_collect):
             raise ValueError("real error")
     except ValueError as e:
         with_pytest_raises = str(e) == "real error"

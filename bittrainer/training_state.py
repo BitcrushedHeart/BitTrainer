@@ -15,15 +15,18 @@ lean on the primitives here so the per-trainer diff stays thin:
   ``random`` module is what the group/bucket samplers shuffle with, so omitting
   it (as the old ``group_trainer._capture_rng_state`` did) makes an otherwise
   "exact" resume diverge.
-* :func:`backup_on_exception` — a context manager that snapshots training state
-  when the wrapped block raises, then re-raises. A failure to back up never
-  masks the original exception.
 * :class:`_FixedBatchSampler` — a ``batch_sampler`` that yields a
   pre-materialised list of index batches, so a run can reproduce an exact batch
   order (and a resume can skip already-consumed batches by slicing the list).
 * :class:`BackupCoordinator` — bundles the manager, the ``pause_event`` and the
   periodic cadence for one run; ``None`` ``backup_dir`` makes the whole thing
-  inert (today's legacy behaviour, no files written, no resume attempted).
+  inert (today's legacy behaviour, no files written, no resume attempted). Its
+  :meth:`~BackupCoordinator.backup_on_exception` context manager snapshots the
+  training state when the wrapped block raises, then re-raises — a failure to
+  back up never masks the original exception.
+* :func:`init_backup` / :func:`paused_result` / :func:`collect_epoch_state` /
+  :func:`restore_optimizer_state` / :func:`loader_kwargs` — the shared
+  scaffolding each trainer wires around its epoch loop.
 
 **Bit-exactness contract.** With ``dataloader_workers=0`` a mid-epoch resume in
 ``run_group_training`` reproduces the uninterrupted run bit-for-bit: the epoch's
@@ -113,22 +116,16 @@ def prime_optimizer_after_resume(optimizer: torch.optim.Optimizer) -> None:
     """Make the first post-resume optimizer step match an uninterrupted one.
 
     ``Prodigy_adv`` keeps its LR-adaptation accumulators (``d_numerator`` /
-    ``d_denom``) as **instance attributes**, not in ``state_dict``. On a fresh
-    optimizer that has just ``load_state_dict``-ed, those attributes don't exist,
-    so the next ``step`` seeds ``d_numerator`` straight from ``group['d_numerator']``
-    — WITHOUT the ``beta3`` decay a continuous step applies via its reset branch
-    (which only runs once ``d_denom`` exists). The result is a ~1e-4 relative
-    drift on the first resumed step, compounding thereafter. Creating a zero
-    ``d_denom`` on the right device (then re-running the reset) re-seeds the
-    accumulators exactly as a continuous step's tail would. No-op for optimizers
-    without the Prodigy accumulator scheme.
-
+    ``d_denom``) as **instance attributes**, not in ``state_dict``.
     ``Prodigy_adv.init_step`` runs at the *tail* of every ``step`` and sets
     ``self.d_numerator = group['d_numerator'] * beta3`` for the following step —
-    but only when ``d_denom`` already exists. A freshly-loaded optimizer has
-    neither attribute, so we create ``d_denom`` and invoke ``init_step`` to
-    reproduce that tail exactly, leaving the next step bit-identical to an
-    uninterrupted one.
+    but only when ``d_denom`` already exists. A freshly-``load_state_dict``-ed
+    optimizer has neither attribute, so its next ``step`` would seed
+    ``d_numerator`` WITHOUT the ``beta3`` decay: a ~1e-4 relative drift that
+    compounds. Creating a zero ``d_denom`` on the right device and invoking
+    ``init_step`` reproduces that tail exactly, leaving the next step
+    bit-identical to an uninterrupted one. No-op for optimizers without the
+    Prodigy accumulator scheme.
     """
     if not any("d_numerator" in g for g in optimizer.param_groups):
         return
@@ -388,17 +385,12 @@ class TrainingStateManager:
         return None
 
     def delete_all(self) -> None:
-        """Remove all backup files and the backup dir (best effort)."""
+        """Remove all backup files (incl. stray tmps) and the backup dir (best effort)."""
         if not self.backup_dir.exists():
             return
-        for path in self.backup_dir.glob("backup_*.pt"):
+        for path in self.backup_dir.glob("backup_*.pt*"):  # matches .pt and .pt.tmp
             try:
                 path.unlink()
-            except OSError:
-                pass
-        for tmp in self.backup_dir.glob("backup_*.pt.tmp"):
-            try:
-                tmp.unlink()
             except OSError:
                 pass
         try:
@@ -408,7 +400,7 @@ class TrainingStateManager:
 
 
 # ---------------------------------------------------------------------------
-# Exception backup context manager
+# BackupCoordinator — per-run backup/pause orchestration shared by all trainers
 # ---------------------------------------------------------------------------
 
 
@@ -417,52 +409,6 @@ def _looks_like_oom(exc: BaseException) -> bool:
         return True
     text = str(exc).lower()
     return "out of memory" in text or "cuda oom" in text
-
-
-@contextmanager
-def backup_on_exception(
-    collect_state: Callable[[], dict],
-    manager: "TrainingStateManager | None",
-    cb: Callable[[dict], None] | None = None,
-):
-    """Snapshot training state if the wrapped block raises, then re-raise.
-
-    On any ``Exception``: best-effort ``torch.cuda.empty_cache()`` when the
-    error looks OOM-ish (frees VRAM so the backup's checkpoint IO can run),
-    then ``manager.save(collect_state(), reason="exception")`` inside its own
-    ``try/except`` — a backup failure must NEVER mask the original exception —
-    and an optional ``backup_complete`` callback. The original exception always
-    propagates.
-    """
-    try:
-        yield
-    except Exception as exc:
-        if _looks_like_oom(exc):
-            try:
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-            except Exception:
-                logger.warning("empty_cache() during exception backup failed", exc_info=True)
-        if manager is not None:
-            try:
-                state = collect_state()
-                path = manager.save(state, reason="exception")
-                if cb is not None:
-                    cb({
-                        "type": "backup_complete",
-                        "backup_path": str(path),
-                        "global_step": state.get("global_step"),
-                        "epoch": state.get("epoch"),
-                        "reason": "exception",
-                    })
-            except Exception:
-                logger.warning("Failed to back up training state on exception", exc_info=True)
-        raise
-
-
-# ---------------------------------------------------------------------------
-# BackupCoordinator — per-run backup/pause orchestration shared by all trainers
-# ---------------------------------------------------------------------------
 
 
 class BackupCoordinator:
@@ -510,6 +456,39 @@ class BackupCoordinator:
                 "reason": reason,
             })
         return path
+
+    def delete_backups(self) -> None:
+        """Drop all backups (successful completion — they are obsolete)."""
+        if self.manager is not None:
+            self.manager.delete_all()
+
+    @contextmanager
+    def backup_on_exception(self, collect_state: Callable[[], dict]):
+        """Snapshot training state if the wrapped block raises, then re-raise.
+
+        On any ``Exception``: best-effort ``torch.cuda.empty_cache()`` when the
+        error looks OOM-ish (frees VRAM so the backup's checkpoint IO can run),
+        then ``save(collect_state(), reason="exception")`` — which emits the
+        ``backup_complete`` callback — inside its own ``try/except``: a backup
+        failure must NEVER mask the original exception, which always propagates.
+        """
+        try:
+            yield
+        except Exception as exc:
+            if _looks_like_oom(exc):
+                try:
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                except Exception:
+                    logger.warning("empty_cache() during exception backup failed", exc_info=True)
+            if self.enabled:
+                try:
+                    self.save(collect_state(), reason="exception")
+                except Exception:
+                    logger.warning(
+                        "Failed to back up training state on exception", exc_info=True
+                    )
+            raise
 
     def on_boundary(self, collect_state: Callable[[], dict], global_step: int) -> str | None:
         """Called at every gradient-accumulation boundary.
@@ -573,3 +552,102 @@ class BackupCoordinator:
                 "reason": reason,
                 "status_text": "Backup incompatible with current run — starting fresh",
             })
+
+
+# ---------------------------------------------------------------------------
+# Shared per-trainer scaffolding (all four run_* entry points use these)
+# ---------------------------------------------------------------------------
+
+
+def init_backup(
+    config, pause_event: object | None, cb: Callable[[dict], None], **fingerprint_kwargs
+) -> tuple[BackupCoordinator, dict, dict | None]:
+    """Build the run's coordinator + fingerprint and load its resume state.
+
+    ``config`` only needs ``backup_dir`` / ``backup_every_steps`` /
+    ``resume_from`` (all four trainer configs carry them). A resume is only
+    attempted when ``resume_from`` is explicitly set — a bare ``backup_dir``
+    never auto-resumes.
+    """
+    coordinator = BackupCoordinator(
+        backup_dir=config.backup_dir, pause_event=pause_event,
+        backup_every_steps=config.backup_every_steps, cb=cb,
+    )
+    fingerprint = make_fingerprint(**fingerprint_kwargs)
+    resume_state = (
+        coordinator.load_resume(fingerprint, resume_from=config.resume_from)
+        if config.resume_from else None
+    )
+    return coordinator, fingerprint, resume_state
+
+
+def paused_result(
+    cb: Callable[[dict], None], epoch: int, global_step: int, backup_path, **extra
+) -> dict:
+    """Emit ``training_paused`` and build the trainer's paused return value."""
+    bp = str(backup_path) if backup_path else None
+    cb({
+        "type": "training_paused", **extra,
+        "epoch": epoch, "global_step": global_step, "backup_path": bp,
+    })
+    return {"paused": True, "backup_path": bp, "epoch": epoch, "global_step": global_step}
+
+
+def collect_epoch_state(
+    *,
+    fingerprint: dict,
+    trainer: str,
+    epoch: int,
+    global_step: int,
+    eff_bs: int,
+    scheduler_t_max: int,
+    model,
+    optimizer,
+    scheduler,
+    best: dict,
+    batch_in_epoch: int = 0,
+    **extra,
+) -> dict:
+    """The shared core of every trainer's backup envelope.
+
+    Default shape is epoch-restart (``batch_in_epoch=0``); trainer-specific
+    fields (ema/swa/dcw/rng/schedule/...) ride in via ``extra``. ``best`` is
+    copied and its ``best_metrics`` numpy-sanitised here so callers pass the
+    live dict straight through.
+    """
+    best = dict(best)
+    best["best_metrics"] = sanitize_for_backup(best.get("best_metrics") or {})
+    return {
+        "fingerprint": fingerprint,
+        "trainer": trainer,
+        "epoch": epoch,
+        "batch_in_epoch": batch_in_epoch,
+        "global_step": global_step,
+        "eff_bs": eff_bs,
+        "scheduler_t_max": scheduler_t_max,
+        "model": {k: v.detach().cpu() for k, v in model.state_dict().items()},
+        "optimizer": optimizer.state_dict(),
+        "optimizer_aux": capture_optimizer_aux_state(optimizer),
+        "scheduler": scheduler.state_dict(),
+        "best": best,
+        **extra,
+    }
+
+
+def restore_optimizer_state(resume_state: dict, optimizer, scheduler, device) -> None:
+    """Restore optimizer + scheduler from a backup, including the Prodigy
+    priming and Kourkoutas aux accumulators that keep the resume bit-exact."""
+    optimizer.load_state_dict(resume_state["optimizer"])
+    prime_optimizer_after_resume(optimizer)
+    restore_optimizer_aux_state(optimizer, resume_state.get("optimizer_aux"), device)
+    scheduler.load_state_dict(resume_state["scheduler"])
+
+
+def loader_kwargs(num_workers: int, *, pin_memory: bool = True, prefetch_factor: int = 4) -> dict:
+    """DataLoader kwargs honouring ``config.dataloader_workers`` (0 disables the
+    worker-only persistent/prefetch options; the trainers previously hardcoded 4/6)."""
+    n = max(0, int(num_workers))
+    kwargs: dict = {"num_workers": n, "pin_memory": pin_memory}
+    if n > 0:
+        kwargs.update(persistent_workers=True, prefetch_factor=prefetch_factor)
+    return kwargs

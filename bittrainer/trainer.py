@@ -331,13 +331,11 @@ def run_training(
     from bittrainer.runtime import configure_cuda_backend
     from bittrainer.smart_cache import _noop_callback, _never_stop
     from bittrainer.training_state import (
-        BackupCoordinator,
-        backup_on_exception,
-        capture_optimizer_aux_state,
-        make_fingerprint,
-        prime_optimizer_after_resume,
-        restore_optimizer_aux_state,
-        sanitize_for_backup,
+        collect_epoch_state,
+        init_backup,
+        loader_kwargs,
+        paused_result,
+        restore_optimizer_state,
     )
     cb = progress_callback or config.progress_callback or _noop_callback
     device = torch.device(config.device)
@@ -347,24 +345,13 @@ def run_training(
     checkpoint_dir = Path(config.checkpoint_dir) if config.checkpoint_dir else concept_folder / "checkpoints"
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
-    coordinator = BackupCoordinator(
-        backup_dir=config.backup_dir, pause_event=pause_event,
-        backup_every_steps=config.backup_every_steps, cb=cb,
-    )
-    fingerprint = make_fingerprint(
+    coordinator, fingerprint, resume_state = init_backup(
+        config, pause_event, cb,
         class_names=["negative", "positive"], num_classes=2,
         max_epochs=config.max_epochs, multi_label=False, ordinal=False,
         best_model_name=config.best_model_name, model_size=config.model_size,
     )
-    resume_state = (
-        coordinator.load_resume(fingerprint, resume_from=config.resume_from)
-        if config.resume_from else None
-    )
-
-    def _paused_result(cur_epoch: int, gstep: int, backup_path) -> dict:
-        bp = str(backup_path) if backup_path else None
-        cb({"type": "training_paused", "epoch": cur_epoch, "global_step": gstep, "backup_path": bp})
-        return {"paused": True, "backup_path": bp, "epoch": cur_epoch, "global_step": gstep}
+    _paused_result = partial(paused_result, cb)
 
     concept_name = config.concept_name or concept_folder.name
 
@@ -593,10 +580,7 @@ def run_training(
                 # so start these fresh rather than loading it.
                 skip_opt_load = start_epoch == 1
         if not skip_opt_load:
-            optimizer.load_state_dict(resume_state["optimizer"])
-            prime_optimizer_after_resume(optimizer)
-            restore_optimizer_aux_state(optimizer, resume_state.get("optimizer_aux"), device)
-            scheduler.load_state_dict(resume_state["scheduler"])
+            restore_optimizer_state(resume_state, optimizer, scheduler, device)
         if ema is not None and resume_state.get("ema") is not None:
             ema.load_full_state_dict(resume_state["ema"])
         cb({
@@ -612,10 +596,7 @@ def run_training(
         "type": "training_progress", "stage": "preparing",
         "status_text": f"Batch size {eff_bs} — spawning data workers",
     })
-    _n_workers = max(0, int(config.dataloader_workers))
-    _loader_kwargs: dict = {"num_workers": _n_workers, "pin_memory": True}
-    if _n_workers > 0:
-        _loader_kwargs.update(persistent_workers=True, prefetch_factor=3)
+    _loader_kwargs = loader_kwargs(config.dataloader_workers, prefetch_factor=3)
 
     val_sampler = build_bucket_batch_sampler(val_ds, batch_size=eff_bs)
     val_loader = DataLoader(
@@ -639,36 +620,26 @@ def run_training(
     })
 
     def _collect_binary_state(cur_epoch: int) -> dict:
-        return {
-            "fingerprint": fingerprint,
-            "trainer": "binary",
-            "epoch": cur_epoch,
-            "batch_in_epoch": 0,  # binary resume is epoch-restart
-            "global_step": global_step,
-            "eff_bs": eff_bs,
-            "use_gradual_unfreeze": use_gradual_unfreeze,
-            "scheduler_t_max": scheduler_t_max,
-            "model": {k: v.detach().cpu() for k, v in model.state_dict().items()},
-            "optimizer": optimizer.state_dict(),
-            "optimizer_aux": capture_optimizer_aux_state(optimizer),
-            "scheduler": scheduler.state_dict(),
-            "ema": ema.full_state_dict() if ema is not None else None,
-            "best": {
+        return collect_epoch_state(
+            fingerprint=fingerprint, trainer="binary", epoch=cur_epoch,
+            global_step=global_step, eff_bs=eff_bs, scheduler_t_max=scheduler_t_max,
+            model=model, optimizer=optimizer, scheduler=scheduler,
+            best={
                 "best_val_f1": best_val_f1,
                 "best_epoch": best_epoch,
                 "patience_counter": patience_counter,
                 "best_checkpoint_path": best_checkpoint_path,
-                "best_metrics": sanitize_for_backup(best_metrics),
+                "best_metrics": best_metrics,
             },
-        }
+            use_gradual_unfreeze=use_gradual_unfreeze,
+            ema=ema.full_state_dict() if ema is not None else None,
+        )
 
     epoch = start_epoch - 1  # so epochs_completed is defined if the loop is empty
     _exc_epoch = start_epoch
     existing_best = checkpoint_dir / config.best_model_name
 
-    with backup_on_exception(
-        lambda: _collect_binary_state(_exc_epoch), coordinator.manager, cb=cb,
-    ):
+    with coordinator.backup_on_exception(lambda: _collect_binary_state(_exc_epoch)):
         for epoch in range(start_epoch, config.max_epochs):
             _exc_epoch = epoch
             if stop_now_event is not None and stop_now_event.is_set():
@@ -831,8 +802,7 @@ def run_training(
         )
 
     # Successful completion: the backups are obsolete.
-    if coordinator.manager is not None:
-        coordinator.manager.delete_all()
+    coordinator.delete_backups()
     return result
 
 

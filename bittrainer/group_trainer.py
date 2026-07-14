@@ -2674,19 +2674,20 @@ def run_group_training(
     (load the newest compatible backup and continue) it gives exact mid-epoch
     continuation when ``config.dataloader_workers == 0``.
     """
+    from functools import partial
+
     from bittrainer.progress import ProgressEmitter, Stage
     from bittrainer.runtime import configure_cuda_backend, maybe_compile, prewarm_compile
     from bittrainer.smart_cache import _noop_callback
     from bittrainer.training_state import (
-        BackupCoordinator,
         _FixedBatchSampler,
-        capture_optimizer_aux_state,
         capture_rng_states,
-        make_fingerprint,
-        prime_optimizer_after_resume,
-        restore_optimizer_aux_state,
+        collect_epoch_state,
+        init_backup,
+        loader_kwargs,
+        paused_result,
+        restore_optimizer_state,
         restore_rng_states,
-        sanitize_for_backup,
     )
     em = ProgressEmitter(progress_callback or config.progress_callback or _noop_callback)
     cb = em.raw
@@ -2697,19 +2698,12 @@ def run_group_training(
     checkpoint_dir = Path(config.checkpoint_dir) if config.checkpoint_dir else group_folder / "checkpoints"
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
-    coordinator = BackupCoordinator(
-        backup_dir=config.backup_dir, pause_event=pause_event,
-        backup_every_steps=config.backup_every_steps, cb=cb,
-    )
-    fingerprint = make_fingerprint(
+    coordinator, fingerprint, resume_state = init_backup(
+        config, pause_event, cb,
         class_names=config.class_names, num_classes=config.num_classes,
         max_epochs=config.max_epochs, multi_label=config.multi_label,
         ordinal=config.ordinal, best_model_name=config.best_model_name,
         model_size=config.backbone_variant,
-    )
-    resume_state = (
-        coordinator.load_resume(fingerprint, resume_from=config.resume_from)
-        if config.resume_from else None
     )
     if resume_state is not None:
         # Re-apply the sweep outcomes the interrupted run resolved (the sweeps
@@ -2718,14 +2712,10 @@ def run_group_training(
         _apply_resolved(config, resume_state.get("resolved") or {})
         em.stage(Stage.resuming, f"Resuming from backup (epoch {resume_state.get('epoch')})")
 
-    def _paused_result(cur_epoch: int, gstep: int, backup_path) -> dict:
-        bp = str(backup_path) if backup_path else None
-        cb({
-            "type": "training_paused", "stage": "backing_up",
-            "status_text": "Training paused — state backed up",
-            "epoch": cur_epoch, "global_step": gstep, "backup_path": bp,
-        })
-        return {"paused": True, "backup_path": bp, "epoch": cur_epoch, "global_step": gstep}
+    _paused_result = partial(
+        paused_result, cb,
+        stage="backing_up", status_text="Training paused — state backed up",
+    )
 
     use_soft = (
         config.ordinal
@@ -2904,10 +2894,7 @@ def run_group_training(
     ema = ModelEMA(model, decay=config.ema_decay) if config.use_ema else None
 
     if resume_state is not None:
-        optimizer.load_state_dict(resume_state["optimizer"])
-        prime_optimizer_after_resume(optimizer)  # Prodigy d_numerator beta3 re-seed
-        restore_optimizer_aux_state(optimizer, resume_state.get("optimizer_aux"), device)
-        scheduler.load_state_dict(resume_state["scheduler"])
+        restore_optimizer_state(resume_state, optimizer, scheduler, device)
         if ema is not None and resume_state.get("ema") is not None:
             ema.load_full_state_dict(resume_state["ema"])
 
@@ -2979,50 +2966,40 @@ def run_group_training(
         swa_payload = None
         if swa is not None and swa.state_dict() is not None:
             swa_payload = {"avg": swa.state_dict(), "n": swa.n}
-        return {
-            "fingerprint": fingerprint,
-            "trainer": "group",
-            "epoch": cur_epoch,
-            "batch_in_epoch": batch_in_epoch,
-            "global_step": global_step,
-            "eff_bs": eff_bs,
-            "model": {k: v.detach().cpu() for k, v in model.state_dict().items()},
-            "optimizer": optimizer.state_dict(),
-            "optimizer_aux": capture_optimizer_aux_state(optimizer),
-            "scheduler": scheduler.state_dict(),
-            "scheduler_t_max": scheduler_t_max,
-            "ema": ema.full_state_dict() if ema is not None else None,
-            "swa": swa_payload,
-            "soup_pool": [list(t) for t in soup_pool],
-            "best": {
+        return collect_epoch_state(
+            fingerprint=fingerprint, trainer="group", epoch=cur_epoch,
+            batch_in_epoch=batch_in_epoch, global_step=global_step, eff_bs=eff_bs,
+            scheduler_t_max=scheduler_t_max,
+            model=model, optimizer=optimizer, scheduler=scheduler,
+            best={
                 "best_val_macro_f1": best_val_macro_f1,
                 "best_val_qwk": best_val_qwk,
                 "best_validation_score": best_validation_score,
                 "best_epoch": best_epoch,
                 "patience_counter": patience_counter,
                 "best_checkpoint_path": best_checkpoint_path,
-                "best_metrics": sanitize_for_backup(best_metrics),
+                "best_metrics": best_metrics,
             },
-            "dcw": dcw_controller.to_dict() if dcw_controller is not None else None,
-            "class_weights": class_weights.detach().cpu() if class_weights is not None else None,
-            "resolved": _resolved_snapshot(config),
-            "rng_epoch_start": rng_epoch_start,
-            "rng_now": capture_rng_states(device),
-            "batch_schedule": (
+            ema=ema.full_state_dict() if ema is not None else None,
+            swa=swa_payload,
+            soup_pool=[list(t) for t in soup_pool],
+            dcw=dcw_controller.to_dict() if dcw_controller is not None else None,
+            class_weights=class_weights.detach().cpu() if class_weights is not None else None,
+            resolved=_resolved_snapshot(config),
+            rng_epoch_start=rng_epoch_start,
+            rng_now=capture_rng_states(device),
+            batch_schedule=(
                 [list(b) for b in schedule]
                 if (schedule is not None and batch_in_epoch > 0) else None
             ),
-            "head_hidden_size": head_hidden_size,
-        }
+            head_hidden_size=head_hidden_size,
+        )
 
     rng_epoch_start: dict | None = None
     epoch = start_epoch - 1  # so epochs_completed is defined if the loop is empty
     _exc_epoch = start_epoch
-    from bittrainer.training_state import backup_on_exception
 
-    with backup_on_exception(
-        lambda: _collect_state(_exc_epoch, 0, None), coordinator.manager, cb=cb,
-    ):
+    with coordinator.backup_on_exception(lambda: _collect_state(_exc_epoch, 0, None)):
         for epoch in range(start_epoch, config.max_epochs):
             _exc_epoch = epoch
             if stop_now_event is not None and stop_now_event.is_set():
@@ -3078,25 +3055,22 @@ def run_group_training(
                 schedule = [list(b) for b in train_sampler]
                 loader_batches = schedule
                 start_batch = 0
-            n_workers = max(0, int(config.dataloader_workers))
-            loader_kwargs = {"num_workers": n_workers, "pin_memory": True}
-            if n_workers > 0:
-                loader_kwargs.update(persistent_workers=True, prefetch_factor=4)
-            else:
+            lk = loader_kwargs(config.dataloader_workers)
+            if lk["num_workers"] == 0:
                 # workers=0 (bit-exact resume mode): a DataLoader iterator draws a
                 # base-seed from the GLOBAL torch RNG on creation, even with no
                 # workers. A mid-epoch resume builds a fresh iterator, so that
                 # extra draw would desync the augmentation stream from an
                 # uninterrupted run. A private generator keeps the base-seed off
                 # the global stream, leaving it purely augmentation-driven.
-                loader_kwargs["generator"] = torch.Generator().manual_seed(0)
+                lk["generator"] = torch.Generator().manual_seed(0)
             train_loader = DataLoader(
                 train_ds, batch_sampler=_FixedBatchSampler(loader_batches),
-                collate_fn=collate_fn, **loader_kwargs,
+                collate_fn=collate_fn, **lk,
             )
             val_sampler = build_group_bucket_sampler(val_ds, batch_size=eff_bs)
             val_loader = DataLoader(
-                val_ds, batch_sampler=val_sampler, collate_fn=collate_fn, **loader_kwargs,
+                val_ds, batch_sampler=val_sampler, collate_fn=collate_fn, **lk,
             )
 
             # One-shot: subsequent epochs are ordinary.
@@ -3491,6 +3465,5 @@ def run_group_training(
 
     # Training completed successfully (no pause, no exception): the backups are
     # obsolete — clear them so a later run doesn't resume a finished job.
-    if coordinator.manager is not None:
-        coordinator.manager.delete_all()
+    coordinator.delete_backups()
     return result

@@ -181,15 +181,15 @@ def run_dual_branch_training(
     stop_now_event: object | None = None,
     pause_event: object | None = None,
 ) -> dict:
+    from functools import partial
+
     from bittrainer.runtime import configure_cuda_backend, maybe_compile, prewarm_compile
     from bittrainer.training_state import (
-        BackupCoordinator,
-        backup_on_exception,
-        capture_optimizer_aux_state,
-        make_fingerprint,
-        prime_optimizer_after_resume,
-        restore_optimizer_aux_state,
-        sanitize_for_backup,
+        collect_epoch_state,
+        init_backup,
+        loader_kwargs,
+        paused_result,
+        restore_optimizer_state,
     )
 
     cb = progress_callback or config.progress_callback or (lambda _: None)
@@ -201,24 +201,13 @@ def run_dual_branch_training(
     checkpoint_dir = Path(config.checkpoint_dir) if config.checkpoint_dir else crops_folder / "checkpoints"
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
-    coordinator = BackupCoordinator(
-        backup_dir=config.backup_dir, pause_event=pause_event,
-        backup_every_steps=config.backup_every_steps, cb=cb,
-    )
-    fingerprint = make_fingerprint(
+    coordinator, fingerprint, resume_state = init_backup(
+        config, pause_event, cb,
         class_names=list(config.class_names), num_classes=config.num_classes,
         max_epochs=config.max_epochs, multi_label=False, ordinal=False,
         best_model_name=config.best_model_name, model_size=config.backbone_variant,
     )
-    resume_state = (
-        coordinator.load_resume(fingerprint, resume_from=config.resume_from)
-        if config.resume_from else None
-    )
-
-    def _paused_result(cur_epoch: int, gstep: int, backup_path) -> dict:
-        bp = str(backup_path) if backup_path else None
-        cb({"type": "training_paused", "epoch": cur_epoch, "global_step": gstep, "backup_path": bp})
-        return {"paused": True, "backup_path": bp, "epoch": cur_epoch, "global_step": gstep}
+    _paused_result = partial(paused_result, cb)
 
     train_transform = get_train_transform()
     val_transform = get_val_transform()
@@ -317,10 +306,7 @@ def run_dual_branch_training(
     start_epoch = 0
 
     if resume_state is not None:
-        optimizer.load_state_dict(resume_state["optimizer"])
-        prime_optimizer_after_resume(optimizer)
-        restore_optimizer_aux_state(optimizer, resume_state.get("optimizer_aux"), device)
-        scheduler.load_state_dict(resume_state["scheduler"])
+        restore_optimizer_state(resume_state, optimizer, scheduler, device)
         start_epoch = int(resume_state["epoch"])
         global_step = int(resume_state.get("global_step", 0))
         best = resume_state["best"]
@@ -336,31 +322,20 @@ def run_dual_branch_training(
         })
 
     def _collect_state(cur_epoch: int) -> dict:
-        return {
-            "fingerprint": fingerprint,
-            "trainer": "dual_branch",
-            "epoch": cur_epoch,
-            "batch_in_epoch": 0,  # epoch-restart resume
-            "global_step": global_step,
-            "eff_bs": eff_bs,
-            "scheduler_t_max": config.max_epochs,
-            "model": {k: v.detach().cpu() for k, v in model.state_dict().items()},
-            "optimizer": optimizer.state_dict(),
-            "optimizer_aux": capture_optimizer_aux_state(optimizer),
-            "scheduler": scheduler.state_dict(),
-            "best": {
+        return collect_epoch_state(
+            fingerprint=fingerprint, trainer="dual_branch", epoch=cur_epoch,
+            global_step=global_step, eff_bs=eff_bs, scheduler_t_max=config.max_epochs,
+            model=model, optimizer=optimizer, scheduler=scheduler,
+            best={
                 "best_val_macro_f1": best_val_macro_f1,
                 "best_epoch": best_epoch,
                 "patience_counter": patience_counter,
                 "best_checkpoint_path": best_checkpoint_path,
-                "best_metrics": sanitize_for_backup(best_metrics),
+                "best_metrics": best_metrics,
             },
-        }
+        )
 
-    _n_workers = max(0, int(config.dataloader_workers))
-    _lk: dict = {"num_workers": _n_workers, "pin_memory": (device.type == "cuda")}
-    if _n_workers > 0:
-        _lk.update(persistent_workers=True, prefetch_factor=4)
+    _lk = loader_kwargs(config.dataloader_workers, pin_memory=(device.type == "cuda"))
     train_loader = DataLoader(
         train_ds, batch_size=eff_bs, shuffle=True, collate_fn=_collate_dual, **_lk,
     )
@@ -370,7 +345,7 @@ def run_dual_branch_training(
 
     epoch = start_epoch - 1
     _exc_epoch = start_epoch
-    with backup_on_exception(lambda: _collect_state(_exc_epoch), coordinator.manager, cb=cb):
+    with coordinator.backup_on_exception(lambda: _collect_state(_exc_epoch)):
         for epoch in range(start_epoch, config.max_epochs):
             _exc_epoch = epoch
             if coordinator.paused:
@@ -463,8 +438,7 @@ def run_dual_branch_training(
                 break
 
     # Successful completion (no pause / no exception): backups are obsolete.
-    if coordinator.manager is not None:
-        coordinator.manager.delete_all()
+    coordinator.delete_backups()
 
     # Promote best checkpoint
     if best_checkpoint_path:
