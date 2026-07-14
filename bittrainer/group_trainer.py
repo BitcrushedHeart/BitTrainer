@@ -36,6 +36,7 @@ from bittrainer.group_validation import (
 )
 from bittrainer.dynamic_class_weights import DynamicClassWeightController
 from bittrainer.losses import AsymmetricLoss, FocalLoss
+from bittrainer.model_soup import average_state_dicts, greedy_soup
 from bittrainer.embedding_cache import EmbeddingCache
 from bittrainer.head_probe import (
     prepare_head_probe_tensors,
@@ -250,6 +251,19 @@ class GroupTrainConfig:
     dcw_ceiling: float = 1.0
     dcw_cooldown: int = 1
     dcw_min_delta: float = 0.005
+    # Per-epoch weight snapshots for snapshot-ensemble experiments (ISSUE-0392
+    # follow-up). When set, the deployable state_dict is written to
+    # {snapshot_dir}/epoch_NNN.pt after every epoch. Off by default.
+    snapshot_dir: str | None = None
+    # --- Greedy weight soup (ISSUE-0392): ON by default. After training, average
+    # the weights of the strongest epochs into ONE model, greedily accepting an
+    # epoch only when it does not lower the val selection score, and adopt the
+    # soup as the shipped checkpoint only when it strictly beats the best single
+    # epoch. Zero extra inference/storage cost (one model). By construction it
+    # can only match or beat best-single on val -> safe as a default for all
+    # trainable group types. Toggle off to ship the single best epoch. ---
+    use_greedy_soup: bool = True
+    soup_max_candidates: int = 8
     # RandAugment + RandomErasing (DeiT/ConvNeXt official fine-tune recipe)
     randaugment_n: int = 2
     randaugment_m: int = 9
@@ -775,6 +789,32 @@ def _build_dcw_controller(
         cooldown=config.dcw_cooldown,
         min_delta=config.dcw_min_delta,
     )
+
+
+def _update_soup_pool(
+    pool: list[tuple[float, int, str]],
+    soup_dir: Path,
+    score: float,
+    epoch: int,
+    state_dict: dict,
+    max_candidates: int,
+) -> None:
+    """Keep the top-``max_candidates`` epochs (by val selection score) on disk as
+    greedy-soup ingredients. Saves this epoch's (CPU) weights when it qualifies and
+    evicts the lowest-scoring candidate so at most ``max_candidates`` files exist."""
+    if len(pool) >= max_candidates and score <= min(s for s, _, _ in pool):
+        return
+    soup_dir.mkdir(parents=True, exist_ok=True)
+    path = str(soup_dir / f"cand_{epoch + 1:03d}.pt")
+    torch.save({k: v.detach().cpu() for k, v in state_dict.items()}, path)
+    pool.append((score, epoch, path))
+    pool.sort(key=lambda t: t[0], reverse=True)
+    while len(pool) > max_candidates:
+        _, _, drop = pool.pop()
+        try:
+            Path(drop).unlink()
+        except OSError:
+            pass
 
 
 class _SWA:
@@ -2711,6 +2751,9 @@ def run_group_training(
     patience_counter = 0
     best_checkpoint_path = None
     best_metrics: dict = {}
+    # Greedy-soup candidate pool (top-N epochs by selection score, kept on disk).
+    soup_pool: list[tuple[float, int, str]] = []
+    soup_dir = checkpoint_dir / "soup_cands"
 
     for epoch in range(config.max_epochs):
         if stop_now_event is not None and stop_now_event.is_set():
@@ -2912,6 +2955,32 @@ def run_group_training(
                 val_metrics.get("per_class_val_loss", {}),
             )
 
+        # Per-epoch snapshot dump for snapshot-ensemble experiments (ISSUE-0392
+        # follow-up: bank each class at its own val-F1 peak). Writes the
+        # deployable weights every epoch when snapshot_dir is set; off by default.
+        if config.snapshot_dir:
+            snap_dir = Path(config.snapshot_dir)
+            snap_dir.mkdir(parents=True, exist_ok=True)
+            snap_state = ema.state_dict() if ema is not None else model.state_dict()
+            snap_meta = {
+                "state_dict": snap_state,
+                "num_classes": config.num_classes,
+                "model_size": config.backbone_variant,
+                "class_names": list(config.class_names),
+                **_spatial_ckpt_meta(config),
+            }
+            if head_hidden_size is not None:
+                snap_meta["head_hidden_size"] = head_hidden_size
+            torch.save(snap_meta, snap_dir / f"epoch_{epoch + 1:03d}.pt")
+
+        # Track this epoch as a greedy-soup candidate (top-N by selection score).
+        if config.use_greedy_soup:
+            _update_soup_pool(
+                soup_pool, soup_dir, selected_score, epoch,
+                ema.state_dict() if ema is not None else model.state_dict(),
+                config.soup_max_candidates,
+            )
+
         epoch_msg = {
             "type": "epoch_complete",
             "stage": "training",
@@ -2995,6 +3064,74 @@ def run_group_training(
                 logger.info("SWA weights adopted (score %.4f)", swa_score)
         except Exception:
             logger.warning("SWA evaluation failed; keeping best single-epoch checkpoint", exc_info=True)
+
+    # --- Greedy weight soup: average the strongest epochs into ONE model, keeping
+    # only additions that don't lower the val selection score, and adopt the soup
+    # only when it strictly beats the best single-epoch checkpoint. One deployable
+    # model, no extra inference cost; safe for all group types (never worse on
+    # val by construction). ---
+    if config.use_greedy_soup and len(soup_pool) >= 2 and best_checkpoint_path:
+        none_index = _resolve_none_index(config.class_names)
+
+        def _soup_metrics(state: dict) -> dict:
+            model.load_state_dict({k: v.to(device) for k, v in state.items()})
+            if config.multi_label:
+                return _evaluate(
+                    model, val_loader, config.num_classes, device, dtype,
+                    multi_label=True, ordinal=config.ordinal,
+                    none_index=none_index, channels_last=config.channels_last,
+                )
+            logits, labels = _collect_val_logits(model, val_loader, config, device, dtype)
+            return _shipped_decode_metrics(logits, labels, config, none_index)
+
+        try:
+            candidates = [
+                (score, torch.load(path, map_location="cpu")) for score, _ep, path in soup_pool
+            ]
+            soup_state, soup_score, accepted = greedy_soup(
+                candidates, lambda s: _metric_score(_soup_metrics(s), config),
+            )
+            cb({
+                "type": "training_progress", "stage": "validating",
+                "status_text": (
+                    f"Greedy soup ({len(accepted)}/{len(candidates)} epochs): "
+                    f"score {soup_score:.4f} vs best {best_validation_score:.4f}"
+                ),
+            })
+            if soup_score > best_validation_score:
+                soup_metrics = _soup_metrics(soup_state)
+                ckpt_meta = {
+                    "state_dict": {k: v.detach().cpu() for k, v in soup_state.items()},
+                    "num_classes": config.num_classes,
+                    "model_size": config.backbone_variant,
+                    "class_names": list(config.class_names),
+                    "validation_metric": _primary_validation_metric(config),
+                    **_spatial_ckpt_meta(config),
+                }
+                if head_hidden_size is not None:
+                    ckpt_meta["head_hidden_size"] = head_hidden_size
+                if config.multi_label:
+                    ckpt_meta["multi_label"] = True
+                ckpt_path = checkpoint_dir / "candidate.pt"
+                torch.save(ckpt_meta, ckpt_path)
+                best_checkpoint_path = str(ckpt_path)
+                best_metrics = soup_metrics.copy()
+                best_val_macro_f1 = soup_metrics.get("macro_f1", best_val_macro_f1)
+                best_val_qwk = soup_metrics.get("qwk", best_val_qwk)
+                best_validation_score = soup_score
+                logger.info("Greedy soup adopted (%d epochs, score %.4f)", len(accepted), soup_score)
+        except Exception:
+            logger.warning("Greedy soup failed; keeping best single-epoch checkpoint", exc_info=True)
+        finally:
+            for _s, _e, _p in soup_pool:
+                try:
+                    Path(_p).unlink()
+                except OSError:
+                    pass
+            try:
+                soup_dir.rmdir()
+            except OSError:
+                pass
 
     return _compare_promote_finalize(
         config,
