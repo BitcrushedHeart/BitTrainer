@@ -34,6 +34,7 @@ from bittrainer.group_validation import (
     macro_f1_variants,
     ordinal_decode,
 )
+from bittrainer.dynamic_class_weights import DynamicClassWeightController
 from bittrainer.losses import AsymmetricLoss, FocalLoss
 from bittrainer.embedding_cache import EmbeddingCache
 from bittrainer.head_probe import (
@@ -230,6 +231,25 @@ class GroupTrainConfig:
     class_balance_auto_ratio: float = 4.0
     use_focal: bool = False
     focal_gamma: float = 2.0
+    # --- Dynamic per-class loss weighting (ISSUE-0392): OPT-IN, default OFF, a
+    # soft per-class early-stop. When a class's smoothed val-F1 declines from its
+    # per-class peak for ``dcw_patience`` epochs (for "both", corroborated by
+    # rising per-class val loss), its loss-weight multiplier is shrunk by
+    # ``dcw_decay``, clamped to [``dcw_floor``, ``dcw_ceiling``], with a
+    # ``dcw_cooldown``-epoch refractory gap. Weights are renormalised to mean 1,
+    # holding the effective LR constant (reallocation, not global scale-down).
+    # Single-label only (rides the CE ``weight=`` path); ignored for multi-label.
+    # Composes on top of ``class_balance_mode="reweight"`` (that becomes the base
+    # weight vector; otherwise the base is all-ones = a numerical no-op at start).
+    dynamic_class_weighting: bool = False
+    dcw_metric: str = "val_f1"  # "val_f1" | "val_loss" | "both"
+    dcw_patience: int = 2
+    dcw_ema_decay: float = 0.5
+    dcw_decay: float = 0.8
+    dcw_floor: float = 0.25
+    dcw_ceiling: float = 1.0
+    dcw_cooldown: int = 1
+    dcw_min_delta: float = 0.005
     # RandAugment + RandomErasing (DeiT/ConvNeXt official fine-tune recipe)
     randaugment_n: int = 2
     randaugment_m: int = 9
@@ -723,6 +743,40 @@ def _effective_number_weights(
     return weights.to(device)
 
 
+def _build_dcw_controller(
+    config: GroupTrainConfig,
+    class_weights: torch.Tensor | None,
+    device: torch.device,
+) -> DynamicClassWeightController | None:
+    """Construct the dynamic per-class loss-weight controller, or None.
+
+    Gated to single-label groups only (the multi-label ASL/BCE path has no
+    per-class weight parameter). The base weight vector is the static
+    ``class_weights`` when reweight balancing is active, else all-ones — and an
+    all-ones base with all-ones multipliers renormalises to all-ones, i.e. a
+    numerical no-op versus unweighted CE, so enabling the controller does not
+    perturb epoch 1.
+    """
+    if not config.dynamic_class_weighting or config.multi_label:
+        return None
+    base = (
+        class_weights
+        if class_weights is not None
+        else torch.ones(config.num_classes, device=device)
+    )
+    return DynamicClassWeightController(
+        config.num_classes, base,
+        metric=config.dcw_metric,
+        patience=config.dcw_patience,
+        ema_decay=config.dcw_ema_decay,
+        decay=config.dcw_decay,
+        floor=config.dcw_floor,
+        ceiling=config.dcw_ceiling,
+        cooldown=config.dcw_cooldown,
+        min_delta=config.dcw_min_delta,
+    )
+
+
 class _SWA:
     """Running average of model weights over the cosine tail (LayerNorm backbone
     => no BatchNorm recalibration needed). Captures a uniform average of the
@@ -766,11 +820,17 @@ def _train_one_epoch(
     ema: ModelEMA | None = None,
     class_weights: torch.Tensor | None = None,
     mixup_enabled: bool = False,
-) -> float:
+) -> tuple[float, dict[str, float]]:
     model.train()
     total_loss = 0.0
     num_batches = 0
     total_steps = len(dataloader)
+    # Per-class train-loss telemetry (diagnostic): mean hard-label CE per true
+    # class, mirroring _per_class_val_loss so train-vs-val divergence is visible
+    # per class. MixUp batches are skipped (hard labels no longer match the
+    # optimised soft target). Kept on-device; reduced to a dict at return.
+    per_class_loss_sum = torch.zeros(config.num_classes, device=device)
+    per_class_loss_count = torch.zeros(config.num_classes, device=device)
     accum = max(1, int(config.grad_accum_steps))
     _last_report = time.monotonic()
     none_index = _resolve_none_index(config.class_names)
@@ -862,13 +922,31 @@ def _train_one_epoch(
 
         total_loss += loss.item()
 
+        # Per-class train-loss telemetry — hard-label CE, diagnostic only, no
+        # grad. Skipped for MixUp batches where `labels` no longer matches the
+        # optimised (interpolated soft) target.
+        if mix_soft is None:
+            with torch.no_grad():
+                per_ex = nn.functional.cross_entropy(
+                    logits.float(), labels.long(), reduction="none"
+                )
+            per_class_loss_sum.index_add_(0, labels.long(), per_ex)
+            per_class_loss_count.index_add_(0, labels.long(), torch.ones_like(per_ex))
+
         if step_callback is not None:
             now = time.monotonic()
             if now - _last_report >= _STEP_REPORT_INTERVAL or num_batches == total_steps:
                 _last_report = now
                 step_callback(num_batches, total_steps, total_loss / num_batches)
 
-    return total_loss / max(num_batches, 1)
+    counts = per_class_loss_count.cpu()
+    sums = per_class_loss_sum.cpu()
+    per_class_train_loss = {
+        str(c): float(sums[c] / counts[c])
+        for c in range(config.num_classes)
+        if counts[c] > 0
+    }
+    return total_loss / max(num_batches, 1), per_class_train_loss
 
 
 @torch.no_grad()
@@ -966,6 +1044,32 @@ def _evaluate(
     return metrics
 
 
+def _per_class_val_loss(
+    logits: torch.Tensor,
+    labels: torch.Tensor,
+    num_classes: int,
+) -> dict[str, float]:
+    """Mean (unweighted, unsmoothed) cross-entropy per TRUE class.
+
+    Keyed by ``str(class_index)`` to match ``per_class_f1`` et al. Classes with
+    no samples in ``labels`` are omitted (their loss is undefined). By
+    construction the support-weighted mean of the returned values equals the
+    aggregate ``val_loss`` — this is the per-class overtraining signal the
+    dynamic-class-weight controller (and the diagnostics) read.
+    """
+    if labels.numel() == 0:
+        return {}
+    per_example = nn.functional.cross_entropy(
+        logits.float(), labels.long(), reduction="none"
+    )
+    out: dict[str, float] = {}
+    for c in range(num_classes):
+        mask = labels == c
+        if bool(mask.any()):
+            out[str(c)] = float(per_example[mask].mean().item())
+    return out
+
+
 def _metrics_from_logits(
     logits: torch.Tensor,
     labels: torch.Tensor,
@@ -995,6 +1099,7 @@ def _metrics_from_logits(
         ))
     _augment_metric_variants(metrics, config.num_classes, none_index)
     metrics["val_loss"] = float(nn.CrossEntropyLoss()(logits.float(), labels.long()).item())
+    metrics["per_class_val_loss"] = _per_class_val_loss(logits, labels, config.num_classes)
     return metrics
 
 
@@ -2555,6 +2660,20 @@ def run_group_training(
             "status_text": "Class balance: reweight (natural sampling + effective-number weights)",
         })
 
+    # --- Dynamic per-class loss weighting (ISSUE-0392): soft per-class
+    # early-stop. Composes on top of whatever class_weights resolved above
+    # (reweight vector, or all-ones = no-op at start). Single-label only. ---
+    dcw_controller = _build_dcw_controller(config, class_weights, device)
+    if dcw_controller is not None:
+        class_weights = dcw_controller.current_weights()
+        cb({
+            "type": "training_progress", "stage": "preparing",
+            "status_text": (
+                f"Dynamic per-class loss weighting ON "
+                f"(trigger={config.dcw_metric}, patience={config.dcw_patience})"
+            ),
+        })
+
     # --- MixUp/CutMix gate: skip on tiny datasets where the full aug stack
     # over-regularises, and for multi-label (single-label soft-target path only). ---
     mixup_enabled = (
@@ -2655,7 +2774,7 @@ def run_group_training(
                 "best_epoch": best_epoch + 1 if best_val_macro_f1 >= 0 else None,
             })
 
-        train_loss = _train_one_epoch(
+        train_loss, per_class_train_loss = _train_one_epoch(
             fwd_model, train_loader, optimizer, config, device, dtype,
             use_soft_targets=use_soft,
             step_callback=_on_step,
@@ -2783,6 +2902,16 @@ def run_group_training(
         else:
             patience_counter += 1
 
+        # Dynamic per-class loss weighting: fold this epoch's per-class val
+        # signal into the controller and reassign class_weights for the NEXT
+        # epoch. The loss_fn is rebuilt fresh inside _train_one_epoch, so the
+        # updated tensor takes effect immediately with no other plumbing.
+        if dcw_controller is not None:
+            class_weights = dcw_controller.update(
+                val_metrics.get("per_class_f1", {}),
+                val_metrics.get("per_class_val_loss", {}),
+            )
+
         epoch_msg = {
             "type": "epoch_complete",
             "stage": "training",
@@ -2799,6 +2928,8 @@ def run_group_training(
             "per_class_precision": val_metrics.get("per_class_precision", {}),
             "per_class_recall": val_metrics.get("per_class_recall", {}),
             "per_class_support": val_metrics.get("per_class_support", {}),
+            "per_class_val_loss": val_metrics.get("per_class_val_loss", {}),
+            "per_class_train_loss": per_class_train_loss,
             "val_none_precision": val_metrics.get("none_precision"),
             "val_none_recall": val_metrics.get("none_recall"),
             "val_none_f1": val_metrics.get("none_f1"),
@@ -2809,6 +2940,8 @@ def run_group_training(
             "validation_metric": _primary_validation_metric(config),
             "best_epoch": best_epoch + 1,
         }
+        if dcw_controller is not None:
+            epoch_msg["per_class_weight_multiplier"] = dcw_controller.multipliers()
         if config.ordinal:
             epoch_msg["val_qwk"] = val_qwk
             epoch_msg["val_ordinal_mae"] = val_metrics.get("ordinal_mae")
