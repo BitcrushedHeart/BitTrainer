@@ -310,6 +310,16 @@ class GroupTrainConfig:
     channels_last: bool = True
     # Gradient accumulation escape hatch: optimizer steps every N batches.
     grad_accum_steps: int = 1
+    # --- Backup / Pause / Resume (Bitcrush ISSUE-0405) ---
+    # backup_dir=None => NO backups written and NO resume attempted (exact
+    # legacy behaviour). backup_every_steps=0 => epoch-boundary backups only.
+    # resume_from points at a backup dir (newest-compatible is loaded) or a
+    # specific backup file. dataloader_workers replaces the previously-hardcoded
+    # DataLoader num_workers=6; 0 makes a mid-epoch resume bit-exact.
+    backup_dir: str | None = None
+    backup_every_steps: int = 500
+    resume_from: str | None = None
+    dataloader_workers: int = 6
 
 
 def _spatial_ckpt_meta(config: GroupTrainConfig) -> dict:
@@ -840,6 +850,17 @@ class _SWA:
     def state_dict(self) -> dict[str, torch.Tensor] | None:
         return self._avg
 
+    def load_state_dict(self, avg: dict[str, torch.Tensor] | None, n: int) -> None:
+        """Restore the running average and its sample count (for resume).
+
+        Cloned onto CPU float tensors so a subsequent ``update`` keeps compositing
+        into the same accumulator the interrupted run held."""
+        if avg is None:
+            self._avg = None
+        else:
+            self._avg = {k: v.detach().float().cpu().clone() for k, v in avg.items()}
+        self.n = int(n)
+
 
 # ---------------------------------------------------------------------------
 # Training loop
@@ -860,11 +881,20 @@ def _train_one_epoch(
     ema: ModelEMA | None = None,
     class_weights: torch.Tensor | None = None,
     mixup_enabled: bool = False,
+    pause_event: object | None = None,
+    boundary_hook: Callable[[int], str | None] | None = None,
+    start_batch: int = 0,
 ) -> tuple[float, dict[str, float]]:
     model.train()
     total_loss = 0.0
-    num_batches = 0
-    total_steps = len(dataloader)
+    # ``num_batches`` is the ABSOLUTE position within the epoch: it starts at
+    # ``start_batch`` on a mid-epoch resume so the accumulation modulo and the
+    # ``== total_steps`` final-flush check stay aligned with the full epoch, while
+    # the dataloader only yields the remaining ``schedule[start_batch:]`` batches.
+    # ``ran`` counts locally-run batches for loss averaging.
+    num_batches = start_batch
+    ran = 0
+    total_steps = start_batch + len(dataloader)
     # Per-class train-loss telemetry (diagnostic): mean hard-label CE per true
     # class, mirroring _per_class_val_loss so train-vs-val divergence is visible
     # per class. MixUp batches are skipped (hard labels no longer match the
@@ -901,6 +931,12 @@ def _train_one_epoch(
     optimizer.zero_grad()
     for images, labels in dataloader:
         if stop_now_event is not None and stop_now_event.is_set():
+            break
+        # Pause between clean boundaries (accum==1 only, where every top-of-loop
+        # is a boundary): the boundary_hook below owns the pause save at true
+        # gradient-accumulation boundaries, so this is a secondary early-out when
+        # no boundary_hook is wired.
+        if boundary_hook is None and pause_event is not None and pause_event.is_set():
             break
         images = images.to(device, non_blocking=True)
         labels = labels.to(device)
@@ -954,11 +990,17 @@ def _train_one_epoch(
         scaled = loss / accum if accum > 1 else loss
         scaled.backward()
         num_batches += 1
+        ran += 1
+        boundary_signal = None
         if num_batches % accum == 0 or num_batches == total_steps:
             optimizer.step()
             optimizer.zero_grad()
             if ema is not None:
                 ema.update(model)
+            # Backups fire ONLY here — at a real gradient-accumulation boundary,
+            # with no in-flight grads — so a restored optimizer state is coherent.
+            if boundary_hook is not None:
+                boundary_signal = boundary_hook(num_batches)
 
         total_loss += loss.item()
 
@@ -977,7 +1019,12 @@ def _train_one_epoch(
             now = time.monotonic()
             if now - _last_report >= _STEP_REPORT_INTERVAL or num_batches == total_steps:
                 _last_report = now
-                step_callback(num_batches, total_steps, total_loss / num_batches)
+                step_callback(num_batches, total_steps, total_loss / max(ran, 1))
+
+        # Pause requested at this boundary: the boundary_hook already saved the
+        # backup; stop consuming batches.
+        if boundary_signal == "stop":
+            break
 
     counts = per_class_loss_count.cpu()
     sums = per_class_loss_sum.cpu()
@@ -986,7 +1033,7 @@ def _train_one_epoch(
         for c in range(config.num_classes)
         if counts[c] > 0
     }
-    return total_loss / max(num_batches, 1), per_class_train_loss
+    return total_loss / max(ran, 1), per_class_train_loss
 
 
 @torch.no_grad()
@@ -1800,20 +1847,42 @@ def _auto_softness_candidates(kind: str) -> list[float]:
 
 
 def _capture_rng_state(device: torch.device) -> dict:
-    state = {
-        "torch": torch.get_rng_state(),
-        "numpy": np.random.get_state(),
-    }
-    if device.type == "cuda" and torch.cuda.is_available():
-        state["cuda"] = torch.cuda.get_rng_state_all()
-    return state
+    # Delegate to training_state so the soft-label/oversample sweeps snapshot the
+    # SAME generators (incl. python ``random``, which the samplers shuffle with)
+    # that the backup/resume path relies on — one source of truth, no drift.
+    from bittrainer.training_state import capture_rng_states
+
+    return capture_rng_states(device)
 
 
 def _restore_rng_state(state: dict, device: torch.device) -> None:
-    torch.set_rng_state(state["torch"])
-    np.random.set_state(state["numpy"])
-    if device.type == "cuda" and torch.cuda.is_available() and "cuda" in state:
-        torch.cuda.set_rng_state_all(state["cuda"])
+    from bittrainer.training_state import restore_rng_states
+
+    restore_rng_states(state, device)
+
+
+def _resolved_snapshot(config: GroupTrainConfig) -> dict:
+    """Sweep/probe outcomes the pre-loop phase writes onto the config.
+
+    The soft-label + __none__-oversample sweeps mutate these before the fine-tune
+    loop; a resume skips those sweeps, so the backup must carry the RESOLVED
+    values and re-apply them (via :func:`_apply_resolved`) so the loss, soft
+    targets and dataset composition match the interrupted run exactly. Everything
+    else (``use_soft``, ``mixup_enabled``, ``swa_start_epoch``, ``balance_mode``)
+    is recomputed deterministically from these fields, so it needn't be stored.
+    """
+    return {
+        "oversample_none": bool(config.oversample_none),
+        "label_smoothing": float(config.label_smoothing),
+        "ordinal_sigma": float(config.ordinal_sigma),
+        "class_balance_mode": config.class_balance_mode,
+    }
+
+
+def _apply_resolved(config: GroupTrainConfig, resolved: dict) -> None:
+    for key in ("oversample_none", "label_smoothing", "ordinal_sigma", "class_balance_mode"):
+        if key in resolved:
+            setattr(config, key, resolved[key])
 
 
 def _apply_softness(config: GroupTrainConfig, kind: str, value: float) -> None:
@@ -2589,16 +2658,36 @@ def run_group_training(
     progress_callback: Callable[[dict], None] | None = None,
     stop_event: object | None = None,
     stop_now_event: object | None = None,
+    pause_event: object | None = None,
 ) -> dict:
     """Run the full multi-class training loop.
 
     stop_event signals a graceful stop at the next epoch boundary.
     stop_now_event additionally interrupts the current epoch's training loop
     mid-batch; validation and the fair-comparison block still run.
+
+    pause_event (Bitcrush ISSUE-0405) requests a *resumable* pause: at the next
+    gradient-accumulation boundary the full training state is backed up and the
+    loop returns ``{"paused": True, "backup_path", "epoch", "global_step"}``
+    WITHOUT running SWA finalisation / greedy soup / promotion. Combined with
+    ``config.backup_dir`` (periodic/exception backups) and ``config.resume_from``
+    (load the newest compatible backup and continue) it gives exact mid-epoch
+    continuation when ``config.dataloader_workers == 0``.
     """
     from bittrainer.progress import ProgressEmitter, Stage
     from bittrainer.runtime import configure_cuda_backend, maybe_compile, prewarm_compile
     from bittrainer.smart_cache import _noop_callback
+    from bittrainer.training_state import (
+        BackupCoordinator,
+        _FixedBatchSampler,
+        capture_optimizer_aux_state,
+        capture_rng_states,
+        make_fingerprint,
+        prime_optimizer_after_resume,
+        restore_optimizer_aux_state,
+        restore_rng_states,
+        sanitize_for_backup,
+    )
     em = ProgressEmitter(progress_callback or config.progress_callback or _noop_callback)
     cb = em.raw
     device = torch.device(config.device)
@@ -2607,6 +2696,36 @@ def run_group_training(
     group_folder = Path(config.group_folder)
     checkpoint_dir = Path(config.checkpoint_dir) if config.checkpoint_dir else group_folder / "checkpoints"
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
+
+    coordinator = BackupCoordinator(
+        backup_dir=config.backup_dir, pause_event=pause_event,
+        backup_every_steps=config.backup_every_steps, cb=cb,
+    )
+    fingerprint = make_fingerprint(
+        class_names=config.class_names, num_classes=config.num_classes,
+        max_epochs=config.max_epochs, multi_label=config.multi_label,
+        ordinal=config.ordinal, best_model_name=config.best_model_name,
+        model_size=config.backbone_variant,
+    )
+    resume_state = (
+        coordinator.load_resume(fingerprint, resume_from=config.resume_from)
+        if config.resume_from else None
+    )
+    if resume_state is not None:
+        # Re-apply the sweep outcomes the interrupted run resolved (the sweeps
+        # themselves are skipped below) before anything reads label_smoothing /
+        # ordinal_sigma / oversample_none / class_balance_mode.
+        _apply_resolved(config, resume_state.get("resolved") or {})
+        em.stage(Stage.resuming, f"Resuming from backup (epoch {resume_state.get('epoch')})")
+
+    def _paused_result(cur_epoch: int, gstep: int, backup_path) -> dict:
+        bp = str(backup_path) if backup_path else None
+        cb({
+            "type": "training_paused", "stage": "backing_up",
+            "status_text": "Training paused — state backed up",
+            "epoch": cur_epoch, "global_step": gstep, "backup_path": bp,
+        })
+        return {"paused": True, "backup_path": bp, "epoch": cur_epoch, "global_step": gstep}
 
     use_soft = (
         config.ordinal
@@ -2619,28 +2738,49 @@ def run_group_training(
     train_ds, val_ds, smart_cache, bucket_counts = _prepare_datasets_and_cache(
         config, cb=cb, stop_event=stop_event,
     )
+    if coordinator.paused:  # pause requested during scan/cache — nothing to finalise
+        return _paused_result(resume_state["epoch"] if resume_state else 0, 0, None)
 
     # Create model â€” warm-start from best.pt unless from_scratch is set.
     head_hidden_size = config.probe_mlp_hidden if config.probe_head == "mlp" else None
-    _emit_model_load_stage(em, config, checkpoint_dir)
-    model = _create_or_warmstart_model(
-        config, device=device, dtype=dtype,
-        head_hidden_size=head_hidden_size, checkpoint_dir=checkpoint_dir,
-    )
     memory_format = torch.channels_last if config.channels_last else None
-    if memory_format is not None:
-        model = model.to(memory_format=memory_format)
+    if resume_state is None:
+        _emit_model_load_stage(em, config, checkpoint_dir)
+        model = _create_or_warmstart_model(
+            config, device=device, dtype=dtype,
+            head_hidden_size=head_hidden_size, checkpoint_dir=checkpoint_dir,
+        )
+        if memory_format is not None:
+            model = model.to(memory_format=memory_format)
 
-    # Head warmup on cached features (replaces the fixed 1-epoch frozen warmup),
-    # then fine-tune fully unfrozen. A converged head removes the
-    # feature-distortion risk a random head poses, so there is no
-    # gradual-unfreeze ramp.
-    _warmup_head_probe(
-        model, config, train_ds, val_ds, smart_cache,
-        device=device, dtype=dtype, cb=cb,
-        stop_event=stop_event, stop_now_event=stop_now_event,
-    )
-    unfreeze_backbone(model)  # the probe froze the backbone â€” restore full grad
+        # Head warmup on cached features (replaces the fixed 1-epoch frozen
+        # warmup), then fine-tune fully unfrozen. A converged head removes the
+        # feature-distortion risk a random head poses, so there is no
+        # gradual-unfreeze ramp.
+        _warmup_head_probe(
+            model, config, train_ds, val_ds, smart_cache,
+            device=device, dtype=dtype, cb=cb,
+            stop_event=stop_event, stop_now_event=stop_now_event,
+        )
+        unfreeze_backbone(model)  # the probe froze the backbone â€” restore full grad
+        if coordinator.paused:  # pause requested during warmup/sweeps
+            return _paused_result(0, 0, None)
+    else:
+        # Resume: rebuild the architecture directly and load the backed-up
+        # weights (skip warm-start, warmup probe and the sweeps entirely).
+        model = create_model(
+            model_size=config.backbone_variant, pretrained=False,
+            num_classes=config.num_classes, head_hidden_size=head_hidden_size,
+        )
+        if config.cell_masks:
+            from bittrainer.spatial import install_spatial_head
+
+            install_spatial_head(model, config.cell_masks, config.grid_rows * config.grid_cols)
+        model.load_state_dict(resume_state["model"])
+        model = model.to(device)
+        if memory_format is not None:
+            model = model.to(memory_format=memory_format)
+        unfreeze_backbone(model)
 
     # The warmup oversample sweep may have flipped config.oversample_none; rebuild
     # the train set (and bucket histogram) so the full fine-tune trains on the
@@ -2657,7 +2797,21 @@ def run_group_training(
     # bytes, allocated lazily on first .step()) is budgeted explicitly inside
     # determine_batch_size via param_overhead_bytes, so the fraction only needs
     # to absorb allocator fragmentation and activation variance across buckets.
-    if config.batch_size is not None and config.batch_size > 0:
+    resume_bs_changed = False
+    if resume_state is not None:
+        # Resume: reuse the backed-up batch size (skip the probe). If the caller
+        # now forces a different batch_size (Engine's OOM degrade halves it) the
+        # backed-up batch_schedule no longer maps, so honour the new size and
+        # fall back to epoch-restart resume (schedule discarded below).
+        backup_bs = int(resume_state["eff_bs"])
+        if config.batch_size and int(config.batch_size) > 0 and int(config.batch_size) != backup_bs:
+            eff_bs = int(config.batch_size)
+            resume_bs_changed = True
+            logger.info("Resume batch size changed %d -> %d; epoch-restart resume", backup_bs, eff_bs)
+        else:
+            eff_bs = backup_bs
+        cb({"type": "autobatch", "batch_size": eff_bs, "resumed": True})
+    elif config.batch_size is not None and config.batch_size > 0:
         eff_bs = int(config.batch_size)
         cb({
             "type": "autobatch",
@@ -2705,6 +2859,11 @@ def run_group_training(
     # (reweight vector, or all-ones = no-op at start). Single-label only. ---
     dcw_controller = _build_dcw_controller(config, class_weights, device)
     if dcw_controller is not None:
+        if resume_state is not None and resume_state.get("dcw") is not None:
+            # Restore the controller's full mutable history so its next update
+            # continues exactly where the interrupted run left off.
+            base = class_weights if class_weights is not None else torch.ones(config.num_classes, device=device)
+            dcw_controller = DynamicClassWeightController.from_dict(resume_state["dcw"], base)
         class_weights = dcw_controller.current_weights()
         cb({
             "type": "training_progress", "stage": "preparing",
@@ -2713,6 +2872,10 @@ def run_group_training(
                 f"(trigger={config.dcw_metric}, patience={config.dcw_patience})"
             ),
         })
+    if resume_state is not None and resume_state.get("class_weights") is not None and dcw_controller is None:
+        # Reweight (non-dcw) vector: recomputed deterministically above, but adopt
+        # the backed-up tensor verbatim so a resume is bit-identical.
+        class_weights = resume_state["class_weights"].to(device)
 
     # --- MixUp/CutMix gate: skip on tiny datasets where the full aug stack
     # over-regularises, and for multi-label (single-label soft-target path only). ---
@@ -2723,16 +2886,30 @@ def run_group_training(
     # --- SWA: average weights over the cosine tail (epoch >= swa_start_epoch). ---
     swa = _SWA() if (config.use_swa and not config.multi_label) else None
     swa_start_epoch = int(config.swa_start_frac * config.max_epochs)
+    if swa is not None and resume_state is not None and resume_state.get("swa") is not None:
+        swa.load_state_dict(resume_state["swa"]["avg"], resume_state["swa"]["n"])
 
     # Optimizer (LLRD param groups when config.llrd, else flat). Built once over
     # the fully-unfrozen model â€” the warm head means no epoch-1 rebuild.
     optimizer = _make_optimizer(model, config)
-    scheduler = CosineAnnealingLR(optimizer, T_max=config.max_epochs)
+    # The group trainer never recreates the scheduler mid-run, so T_max is always
+    # config.max_epochs; carried in the backup for schema symmetry with the
+    # binary trainer's epoch-1 unfreeze rebuild.
+    scheduler_t_max = int(resume_state["scheduler_t_max"]) if resume_state is not None else config.max_epochs
+    scheduler = CosineAnnealingLR(optimizer, T_max=scheduler_t_max)
 
     # EMA tracks all params from the start; freeze/unfreeze only affects which
     # ones receive gradient updates, but the EMA still mirrors the live tensor
     # values, which is what we want for inference-time smoothing.
     ema = ModelEMA(model, decay=config.ema_decay) if config.use_ema else None
+
+    if resume_state is not None:
+        optimizer.load_state_dict(resume_state["optimizer"])
+        prime_optimizer_after_resume(optimizer)  # Prodigy d_numerator beta3 re-seed
+        restore_optimizer_aux_state(optimizer, resume_state.get("optimizer_aux"), device)
+        scheduler.load_state_dict(resume_state["scheduler"])
+        if ema is not None and resume_state.get("ema") is not None:
+            ema.load_full_state_dict(resume_state["ema"])
 
     # fwd_model shares parameters with the eager model â€” optimizer, EMA and
     # checkpoint saves keep operating on `model`; only forward calls go
@@ -2751,357 +2928,339 @@ def run_group_training(
     patience_counter = 0
     best_checkpoint_path = None
     best_metrics: dict = {}
+    global_step = 0
+    start_epoch = 0
     # Greedy-soup candidate pool (top-N epochs by selection score, kept on disk).
     soup_pool: list[tuple[float, int, str]] = []
     soup_dir = checkpoint_dir / "soup_cands"
+    # Mid-epoch resume state (one-shot; cleared after the first resumed epoch).
+    resume_batch_in_epoch = 0
+    resume_schedule: list[list[int]] | None = None
+    resume_rng_epoch_start: dict | None = None
+    resume_rng_now: dict | None = None
 
-    for epoch in range(config.max_epochs):
-        if stop_now_event is not None and stop_now_event.is_set():
-            logger.info("Stop-now requested before epoch %d â€” running final comparison", epoch)
-            cb({"type": "stop_now", "epoch": epoch, "max_epochs": config.max_epochs})
-            break
-        if stop_event is not None and stop_event.is_set():
-            logger.info("Graceful stop requested after epoch %d â€” running final comparison", epoch)
-            cb({"type": "graceful_stop", "epoch": epoch, "max_epochs": config.max_epochs})
-            break
-
-        # Reshuffle for class-balanced sampling
-        train_ds.reshuffle()
-
-        if epoch == 0:
-            cb({
-                "type": "training_progress", "stage": "preparing",
-                "status_text": f"Batch size {eff_bs} â€” spawning data workers",
-            })
-
-        # Build dataloaders
-        collate_fn = _collate_multilabel_batch if config.multi_label else _collate_bucket_batch
-        train_sampler = build_group_bucket_sampler(train_ds, batch_size=eff_bs)
-        train_loader = DataLoader(
-            train_ds, batch_sampler=train_sampler, collate_fn=collate_fn,
-            num_workers=6, pin_memory=True, persistent_workers=True, prefetch_factor=4,
-        )
-        val_sampler = build_group_bucket_sampler(val_ds, batch_size=eff_bs)
-        val_loader = DataLoader(
-            val_ds, batch_sampler=val_sampler, collate_fn=collate_fn,
-            num_workers=6, pin_memory=True, persistent_workers=True, prefetch_factor=4,
-        )
-
-        # Train
-        epoch_start_mono = time.monotonic()
-
-        def _on_step(step: int, total_steps: int, avg_loss: float) -> None:
-            elapsed = time.monotonic() - epoch_start_mono
-            throughput = step / elapsed if elapsed > 0 else None
-            eta_seconds = (total_steps - step) / throughput if throughput and throughput > 0 else None
-            cb({
-                "type": "training_progress",
-                "stage": "training",
-                "status_text": f"Training (epoch {epoch + 1}/{config.max_epochs}, step {step}/{total_steps})",
-                "epoch": epoch + 1,
-                "max_epochs": config.max_epochs,
-                "step": step,
-                "total_steps": total_steps,
-                "eta_seconds": eta_seconds,
-                "throughput": throughput,
-                "throughput_unit": "batch/s",
-                "images_per_s": round(throughput * eff_bs, 1) if throughput else None,
-                "batch_size": eff_bs,
-                "train_loss": round(avg_loss, 4),
-                "best_val_macro_f1": best_val_macro_f1 if best_val_macro_f1 >= 0 else None,
-                "best_validation_score": best_validation_score if best_validation_score >= 0 else None,
-                "validation_metric": _primary_validation_metric(config),
-                "best_val_qwk": (
-                    best_val_qwk if config.ordinal and best_val_qwk > -1.0 else None
-                ),
-                "best_epoch": best_epoch + 1 if best_val_macro_f1 >= 0 else None,
-            })
-
-        train_loss, per_class_train_loss = _train_one_epoch(
-            fwd_model, train_loader, optimizer, config, device, dtype,
-            use_soft_targets=use_soft,
-            step_callback=_on_step,
-            stop_now_event=stop_now_event,
-            ema=ema,
-            class_weights=class_weights,
-            mixup_enabled=mixup_enabled,
-        )
-        if stop_now_event is not None and stop_now_event.is_set():
-            cb({
-                "type": "stop_now",
-                "epoch": epoch + 1,
-                "max_epochs": config.max_epochs,
-                "status_text": f"Stop-now triggered mid-epoch {epoch + 1} â€” finishing up",
-            })
-        scheduler.step()
-
-        # Capture the post-epoch weights into the SWA running average over the
-        # cosine tail (uniform average; LayerNorm backbone needs no BN update).
-        if swa is not None and epoch >= swa_start_epoch:
-            swa.update(model)
-
-        # Validate (against EMA weights when enabled â€” they generalise better)
-        em.stage(
-            Stage.validating,
-            f"Validating (epoch {epoch + 1}/{config.max_epochs})",
-            epoch=epoch + 1, max_epochs=config.max_epochs,
-        )
-        eval_model = ema.module if ema is not None else fwd_model
-        if config.multi_label:
-            val_metrics = _evaluate(
-                eval_model, val_loader, config.num_classes, device, dtype,
-                multi_label=True,
-                ordinal=config.ordinal,
-                none_index=_resolve_none_index(config.class_names),
-                channels_last=config.channels_last,
-            )
+    if resume_state is not None:
+        best = resume_state["best"]
+        best_val_macro_f1 = best["best_val_macro_f1"]
+        best_val_qwk = best["best_val_qwk"]
+        best_validation_score = best["best_validation_score"]
+        best_epoch = best["best_epoch"]
+        patience_counter = best["patience_counter"]
+        best_checkpoint_path = best["best_checkpoint_path"]
+        best_metrics = dict(best.get("best_metrics") or {})
+        soup_pool = [tuple(t) for t in (resume_state.get("soup_pool") or [])]
+        global_step = int(resume_state.get("global_step", 0))
+        resume_batch_in_epoch = int(resume_state.get("batch_in_epoch", 0))
+        resume_rng_epoch_start = resume_state.get("rng_epoch_start")
+        resume_rng_now = resume_state.get("rng_now")
+        # ``epoch`` in the envelope is always the epoch to resume INTO (a
+        # boundary backup stores epoch+1, so it never re-runs a finished epoch).
+        start_epoch = int(resume_state["epoch"])
+        if resume_batch_in_epoch > 0 and not resume_bs_changed:
+            # Mid-epoch backup: continue the SAME epoch from the stored schedule.
+            resume_schedule = resume_state.get("batch_schedule")
         else:
-            # Score the epoch under the decode the model ships with
-            # (temperature + __none__ bias + ordinal cut-points) so selection
-            # and the shipped model agree on what "best" means.
-            epoch_logits, epoch_labels = _collect_val_logits(
-                eval_model, val_loader, config, device, dtype,
+            # Epoch boundary, or a batch-size change that invalidated the
+            # schedule → start ``start_epoch`` fresh from batch 0.
+            resume_batch_in_epoch = 0
+        cb({
+            "type": "training_resumed",
+            "resumed_from": str(config.resume_from),
+            "epoch": start_epoch,
+            "global_step": global_step,
+            "best_val_macro_f1": best_val_macro_f1,
+            "best_validation_score": best_validation_score,
+            "best_val_qwk": best_val_qwk if config.ordinal else None,
+            "best_epoch": best_epoch + 1,
+        })
+
+    def _collect_state(cur_epoch: int, batch_in_epoch: int, schedule) -> dict:
+        """Assemble the schema-v1 backup envelope from the live run state."""
+        swa_payload = None
+        if swa is not None and swa.state_dict() is not None:
+            swa_payload = {"avg": swa.state_dict(), "n": swa.n}
+        return {
+            "fingerprint": fingerprint,
+            "trainer": "group",
+            "epoch": cur_epoch,
+            "batch_in_epoch": batch_in_epoch,
+            "global_step": global_step,
+            "eff_bs": eff_bs,
+            "model": {k: v.detach().cpu() for k, v in model.state_dict().items()},
+            "optimizer": optimizer.state_dict(),
+            "optimizer_aux": capture_optimizer_aux_state(optimizer),
+            "scheduler": scheduler.state_dict(),
+            "scheduler_t_max": scheduler_t_max,
+            "ema": ema.full_state_dict() if ema is not None else None,
+            "swa": swa_payload,
+            "soup_pool": [list(t) for t in soup_pool],
+            "best": {
+                "best_val_macro_f1": best_val_macro_f1,
+                "best_val_qwk": best_val_qwk,
+                "best_validation_score": best_validation_score,
+                "best_epoch": best_epoch,
+                "patience_counter": patience_counter,
+                "best_checkpoint_path": best_checkpoint_path,
+                "best_metrics": sanitize_for_backup(best_metrics),
+            },
+            "dcw": dcw_controller.to_dict() if dcw_controller is not None else None,
+            "class_weights": class_weights.detach().cpu() if class_weights is not None else None,
+            "resolved": _resolved_snapshot(config),
+            "rng_epoch_start": rng_epoch_start,
+            "rng_now": capture_rng_states(device),
+            "batch_schedule": (
+                [list(b) for b in schedule]
+                if (schedule is not None and batch_in_epoch > 0) else None
+            ),
+            "head_hidden_size": head_hidden_size,
+        }
+
+    rng_epoch_start: dict | None = None
+    epoch = start_epoch - 1  # so epochs_completed is defined if the loop is empty
+    _exc_epoch = start_epoch
+    from bittrainer.training_state import backup_on_exception
+
+    with backup_on_exception(
+        lambda: _collect_state(_exc_epoch, 0, None), coordinator.manager, cb=cb,
+    ):
+        for epoch in range(start_epoch, config.max_epochs):
+            _exc_epoch = epoch
+            if stop_now_event is not None and stop_now_event.is_set():
+                logger.info("Stop-now requested before epoch %d â€” running final comparison", epoch)
+                cb({"type": "stop_now", "epoch": epoch, "max_epochs": config.max_epochs})
+                break
+            if stop_event is not None and stop_event.is_set():
+                logger.info("Graceful stop requested after epoch %d â€” running final comparison", epoch)
+                cb({"type": "graceful_stop", "epoch": epoch, "max_epochs": config.max_epochs})
+                break
+            if coordinator.paused:
+                # Pause at an epoch boundary (before any training this epoch):
+                # back up a clean batch_in_epoch=0 snapshot and stop.
+                path = coordinator.save(_collect_state(epoch, 0, None), reason="pause")
+                return _paused_result(epoch, global_step, path)
+
+            # Exact mid-epoch continuation only for the FIRST resumed epoch.
+            mid_resume = (
+                epoch == start_epoch and resume_schedule is not None and resume_batch_in_epoch > 0
             )
-            val_metrics = _shipped_decode_metrics(
-                epoch_logits, epoch_labels, config,
-                _resolve_none_index(config.class_names),
+
+            # Capture the epoch-start RNG BEFORE reshuffle so the sample layout is
+            # reproducible; on a mid-epoch resume restore the stored epoch-start
+            # RNG instead so reshuffle rebuilds the identical sample list.
+            if mid_resume:
+                restore_rng_states(resume_rng_epoch_start, device)
+                rng_epoch_start = resume_rng_epoch_start
+            else:
+                if epoch == start_epoch and resume_rng_now is not None:
+                    # Epoch-boundary resume: continue the RNG stream from the
+                    # backup point so this fresh epoch matches the control run.
+                    restore_rng_states(resume_rng_now, device)
+                rng_epoch_start = capture_rng_states(device)
+            train_ds.reshuffle()
+
+            if epoch == 0:
+                cb({
+                    "type": "training_progress", "stage": "preparing",
+                    "status_text": f"Batch size {eff_bs} â€” spawning data workers",
+                })
+
+            # Build dataloaders. The batch order is materialised into a fixed
+            # schedule so a backup can replay it exactly on resume.
+            collate_fn = _collate_multilabel_batch if config.multi_label else _collate_bucket_batch
+            train_sampler = build_group_bucket_sampler(train_ds, batch_size=eff_bs)
+            if mid_resume:
+                schedule = [list(b) for b in resume_schedule]
+                loader_batches = schedule[resume_batch_in_epoch:]
+                start_batch = resume_batch_in_epoch
+                # Jump the augmentation/mixup RNG to the mid-epoch backup point.
+                restore_rng_states(resume_rng_now, device)
+            else:
+                schedule = [list(b) for b in train_sampler]
+                loader_batches = schedule
+                start_batch = 0
+            n_workers = max(0, int(config.dataloader_workers))
+            loader_kwargs = {"num_workers": n_workers, "pin_memory": True}
+            if n_workers > 0:
+                loader_kwargs.update(persistent_workers=True, prefetch_factor=4)
+            else:
+                # workers=0 (bit-exact resume mode): a DataLoader iterator draws a
+                # base-seed from the GLOBAL torch RNG on creation, even with no
+                # workers. A mid-epoch resume builds a fresh iterator, so that
+                # extra draw would desync the augmentation stream from an
+                # uninterrupted run. A private generator keeps the base-seed off
+                # the global stream, leaving it purely augmentation-driven.
+                loader_kwargs["generator"] = torch.Generator().manual_seed(0)
+            train_loader = DataLoader(
+                train_ds, batch_sampler=_FixedBatchSampler(loader_batches),
+                collate_fn=collate_fn, **loader_kwargs,
             )
-            # Skin Tone V2 dual-view (ISSUE-0217, spec §8): score the
-            # colour-normalised view and the averaged-logit combination as
-            # separate tracks. Selection stays on the ORIGINAL view — raw
-            # inference is the deployment default (spec §9).
-            if getattr(val_ds, "skin_tone_views", None) is not None:
-                val_ds.skin_tone_force_view = True
-                try:
-                    # A FRESH in-process loader is load-bearing: val_loader's
-                    # persistent workers hold a dataset copy pickled before
-                    # the flag flip and would silently re-score the ORIGINAL
-                    # view. num_workers=0 runs __getitem__ in this process,
-                    # so the flag is guaranteed visible.
-                    view_loader = DataLoader(
-                        val_ds, batch_sampler=val_sampler, collate_fn=collate_fn,
-                        num_workers=0, pin_memory=True,
-                    )
-                    view_logits, view_labels = _collect_val_logits(
-                        eval_model, view_loader, config, device, dtype,
-                    )
-                finally:
-                    val_ds.skin_tone_force_view = False
-                view_metrics = _shipped_decode_metrics(
-                    view_logits, view_labels, config,
+            val_sampler = build_group_bucket_sampler(val_ds, batch_size=eff_bs)
+            val_loader = DataLoader(
+                val_ds, batch_sampler=val_sampler, collate_fn=collate_fn, **loader_kwargs,
+            )
+
+            # One-shot: subsequent epochs are ordinary.
+            resume_schedule = None
+
+            # Train
+            epoch_start_mono = time.monotonic()
+
+            def _on_step(step: int, total_steps: int, avg_loss: float) -> None:
+                elapsed = time.monotonic() - epoch_start_mono
+                throughput = step / elapsed if elapsed > 0 else None
+                eta_seconds = (total_steps - step) / throughput if throughput and throughput > 0 else None
+                cb({
+                    "type": "training_progress",
+                    "stage": "training",
+                    "status_text": f"Training (epoch {epoch + 1}/{config.max_epochs}, step {step}/{total_steps})",
+                    "epoch": epoch + 1,
+                    "max_epochs": config.max_epochs,
+                    "step": step,
+                    "total_steps": total_steps,
+                    "eta_seconds": eta_seconds,
+                    "throughput": throughput,
+                    "throughput_unit": "batch/s",
+                    "images_per_s": round(throughput * eff_bs, 1) if throughput else None,
+                    "batch_size": eff_bs,
+                    "train_loss": round(avg_loss, 4),
+                    "best_val_macro_f1": best_val_macro_f1 if best_val_macro_f1 >= 0 else None,
+                    "best_validation_score": best_validation_score if best_validation_score >= 0 else None,
+                    "validation_metric": _primary_validation_metric(config),
+                    "best_val_qwk": (
+                        best_val_qwk if config.ordinal and best_val_qwk > -1.0 else None
+                    ),
+                    "best_epoch": best_epoch + 1 if best_val_macro_f1 >= 0 else None,
+                })
+
+            def _boundary_hook(num_batches: int) -> str | None:
+                # Fires at every gradient-accumulation boundary. Owns the global
+                # optimizer-step counter and the pause/periodic backup cadence.
+                nonlocal global_step
+                global_step += 1
+                return coordinator.on_boundary(
+                    lambda: _collect_state(epoch, num_batches, schedule), global_step,
+                )
+
+            train_loss, per_class_train_loss = _train_one_epoch(
+                fwd_model, train_loader, optimizer, config, device, dtype,
+                use_soft_targets=use_soft,
+                step_callback=_on_step,
+                stop_now_event=stop_now_event,
+                ema=ema,
+                class_weights=class_weights,
+                mixup_enabled=mixup_enabled,
+                pause_event=pause_event,
+                boundary_hook=_boundary_hook,
+                start_batch=start_batch,
+            )
+
+            if coordinator.paused:
+                # Pause fired mid-epoch — the boundary hook already wrote the
+                # backup. Return WITHOUT SWA / greedy soup / promotion so a pause
+                # can never ship or promote a model.
+                return _paused_result(epoch, global_step, coordinator.last_backup_path)
+
+            if stop_now_event is not None and stop_now_event.is_set():
+                cb({
+                    "type": "stop_now",
+                    "epoch": epoch + 1,
+                    "max_epochs": config.max_epochs,
+                    "status_text": f"Stop-now triggered mid-epoch {epoch + 1} â€” finishing up",
+                })
+            scheduler.step()
+
+            # Capture the post-epoch weights into the SWA running average over the
+            # cosine tail (uniform average; LayerNorm backbone needs no BN update).
+            if swa is not None and epoch >= swa_start_epoch:
+                swa.update(model)
+
+            # Validate (against EMA weights when enabled â€” they generalise better)
+            em.stage(
+                Stage.validating,
+                f"Validating (epoch {epoch + 1}/{config.max_epochs})",
+                epoch=epoch + 1, max_epochs=config.max_epochs,
+            )
+            eval_model = ema.module if ema is not None else fwd_model
+            if config.multi_label:
+                val_metrics = _evaluate(
+                    eval_model, val_loader, config.num_classes, device, dtype,
+                    multi_label=True,
+                    ordinal=config.ordinal,
+                    none_index=_resolve_none_index(config.class_names),
+                    channels_last=config.channels_last,
+                )
+            else:
+                # Score the epoch under the decode the model ships with
+                # (temperature + __none__ bias + ordinal cut-points) so selection
+                # and the shipped model agree on what "best" means.
+                epoch_logits, epoch_labels = _collect_val_logits(
+                    eval_model, val_loader, config, device, dtype,
+                )
+                val_metrics = _shipped_decode_metrics(
+                    epoch_logits, epoch_labels, config,
                     _resolve_none_index(config.class_names),
                 )
-                val_metrics["macro_f1_original"] = val_metrics["macro_f1"]
-                val_metrics["macro_f1_normalized"] = view_metrics["macro_f1"]
-                # Averaged logits are only meaningful if both passes saw the
-                # samples in the same order (val sampler is deterministic;
-                # guard anyway).
-                if torch.equal(epoch_labels, view_labels):
-                    dual_metrics = _shipped_decode_metrics(
-                        (epoch_logits + view_logits) / 2.0, epoch_labels, config,
+                # Skin Tone V2 dual-view (ISSUE-0217, spec §8): score the
+                # colour-normalised view and the averaged-logit combination as
+                # separate tracks. Selection stays on the ORIGINAL view — raw
+                # inference is the deployment default (spec §9).
+                if getattr(val_ds, "skin_tone_views", None) is not None:
+                    val_ds.skin_tone_force_view = True
+                    try:
+                        # A FRESH in-process loader is load-bearing: val_loader's
+                        # persistent workers hold a dataset copy pickled before
+                        # the flag flip and would silently re-score the ORIGINAL
+                        # view. num_workers=0 runs __getitem__ in this process,
+                        # so the flag is guaranteed visible.
+                        view_loader = DataLoader(
+                            val_ds, batch_sampler=val_sampler, collate_fn=collate_fn,
+                            num_workers=0, pin_memory=True,
+                        )
+                        view_logits, view_labels = _collect_val_logits(
+                            eval_model, view_loader, config, device, dtype,
+                        )
+                    finally:
+                        val_ds.skin_tone_force_view = False
+                    view_metrics = _shipped_decode_metrics(
+                        view_logits, view_labels, config,
                         _resolve_none_index(config.class_names),
                     )
-                    val_metrics["macro_f1_dual"] = dual_metrics["macro_f1"]
-        val_metrics["train_loss"] = train_loss
+                    val_metrics["macro_f1_original"] = val_metrics["macro_f1"]
+                    val_metrics["macro_f1_normalized"] = view_metrics["macro_f1"]
+                    # Averaged logits are only meaningful if both passes saw the
+                    # samples in the same order (val sampler is deterministic;
+                    # guard anyway).
+                    if torch.equal(epoch_labels, view_labels):
+                        dual_metrics = _shipped_decode_metrics(
+                            (epoch_logits + view_logits) / 2.0, epoch_labels, config,
+                            _resolve_none_index(config.class_names),
+                        )
+                        val_metrics["macro_f1_dual"] = dual_metrics["macro_f1"]
+            val_metrics["train_loss"] = train_loss
 
-        val_macro_f1 = val_metrics["macro_f1"]
-        val_qwk = val_metrics.get("qwk", 0.0)
+            val_macro_f1 = val_metrics["macro_f1"]
+            val_qwk = val_metrics.get("qwk", 0.0)
 
-        selected_score = _metric_score(val_metrics, config)
-        # Require a minimum gain so epoch-to-epoch noise can't flip the
-        # selection onto a marginally-higher but less robust checkpoint. The
-        # first epoch always clears this (incumbent starts at -1.0).
-        improved = selected_score > best_validation_score + _SELECTION_MIN_DELTA
-        if improved:
-            best_val_macro_f1 = val_macro_f1
-            best_val_qwk = val_qwk
-            best_validation_score = selected_score
-            best_epoch = epoch
-            patience_counter = 0
-            best_metrics = val_metrics.copy()
+            selected_score = _metric_score(val_metrics, config)
+            # Require a minimum gain so epoch-to-epoch noise can't flip the
+            # selection onto a marginally-higher but less robust checkpoint. The
+            # first epoch always clears this (incumbent starts at -1.0).
+            improved = selected_score > best_validation_score + _SELECTION_MIN_DELTA
+            if improved:
+                best_val_macro_f1 = val_macro_f1
+                best_val_qwk = val_qwk
+                best_validation_score = selected_score
+                best_epoch = epoch
+                patience_counter = 0
+                best_metrics = val_metrics.copy()
 
-            ckpt_path = checkpoint_dir / "candidate.pt"
-            # When EMA is active, persist the EMA weights as the primary
-            # state_dict (downstream inference loads this key unchanged). Raw
-            # weights survive under model_state_dict for diagnostic purposes.
-            primary_state = ema.state_dict() if ema is not None else model.state_dict()
-            ckpt_meta = {
-                "state_dict": primary_state,
-                "num_classes": config.num_classes,
-                "model_size": config.backbone_variant,
-                "class_names": list(config.class_names),
-                "validation_metric": _primary_validation_metric(config),
-                **_spatial_ckpt_meta(config),
-            }
-            if head_hidden_size is not None:
-                ckpt_meta["head_hidden_size"] = head_hidden_size
-            if ema is not None:
-                ckpt_meta["model_state_dict"] = model.state_dict()
-                ckpt_meta["ema_decay"] = config.ema_decay
-            if config.multi_label:
-                ckpt_meta["multi_label"] = True
-            torch.save(ckpt_meta, ckpt_path)
-            best_checkpoint_path = str(ckpt_path)
-        else:
-            patience_counter += 1
-
-        # Dynamic per-class loss weighting: fold this epoch's per-class val
-        # signal into the controller and reassign class_weights for the NEXT
-        # epoch. The loss_fn is rebuilt fresh inside _train_one_epoch, so the
-        # updated tensor takes effect immediately with no other plumbing.
-        if dcw_controller is not None:
-            class_weights = dcw_controller.update(
-                val_metrics.get("per_class_f1", {}),
-                val_metrics.get("per_class_val_loss", {}),
-            )
-
-        # Per-epoch snapshot dump for snapshot-ensemble experiments (ISSUE-0392
-        # follow-up: bank each class at its own val-F1 peak). Writes the
-        # deployable weights every epoch when snapshot_dir is set; off by default.
-        if config.snapshot_dir:
-            snap_dir = Path(config.snapshot_dir)
-            snap_dir.mkdir(parents=True, exist_ok=True)
-            snap_state = ema.state_dict() if ema is not None else model.state_dict()
-            snap_meta = {
-                "state_dict": snap_state,
-                "num_classes": config.num_classes,
-                "model_size": config.backbone_variant,
-                "class_names": list(config.class_names),
-                **_spatial_ckpt_meta(config),
-            }
-            if head_hidden_size is not None:
-                snap_meta["head_hidden_size"] = head_hidden_size
-            torch.save(snap_meta, snap_dir / f"epoch_{epoch + 1:03d}.pt")
-
-        # Track this epoch as a greedy-soup candidate (top-N by selection score).
-        if config.use_greedy_soup:
-            _update_soup_pool(
-                soup_pool, soup_dir, selected_score, epoch,
-                ema.state_dict() if ema is not None else model.state_dict(),
-                config.soup_max_candidates,
-            )
-
-        epoch_msg = {
-            "type": "epoch_complete",
-            "stage": "training",
-            "status_text": f"Epoch {epoch + 1}/{config.max_epochs} complete (val macro F1 {val_macro_f1:.3f})",
-            "epoch": epoch + 1,
-            "max_epochs": config.max_epochs,
-            "train_loss": train_loss,
-            "val_loss": val_metrics["val_loss"],
-            "val_macro_f1": val_macro_f1,
-            "val_macro_f1_supported": val_metrics.get("macro_f1_supported"),
-            "val_macro_precision": val_metrics.get("macro_precision", 0.0),
-            "val_macro_recall": val_metrics.get("macro_recall", 0.0),
-            "per_class_f1": val_metrics.get("per_class_f1", {}),
-            "per_class_precision": val_metrics.get("per_class_precision", {}),
-            "per_class_recall": val_metrics.get("per_class_recall", {}),
-            "per_class_support": val_metrics.get("per_class_support", {}),
-            "per_class_val_loss": val_metrics.get("per_class_val_loss", {}),
-            "per_class_train_loss": per_class_train_loss,
-            "val_none_precision": val_metrics.get("none_precision"),
-            "val_none_recall": val_metrics.get("none_recall"),
-            "val_none_f1": val_metrics.get("none_f1"),
-            "val_none_false_positive_rate": val_metrics.get("none_false_positive_rate"),
-            "best_val_macro_f1": best_val_macro_f1,
-            "selected_validation_score": selected_score,
-            "best_validation_score": best_validation_score,
-            "validation_metric": _primary_validation_metric(config),
-            "best_epoch": best_epoch + 1,
-        }
-        if dcw_controller is not None:
-            epoch_msg["per_class_weight_multiplier"] = dcw_controller.multipliers()
-        if config.ordinal:
-            epoch_msg["val_qwk"] = val_qwk
-            epoch_msg["val_ordinal_mae"] = val_metrics.get("ordinal_mae")
-            epoch_msg["val_adjacent_accuracy"] = val_metrics.get("adjacent_accuracy")
-            epoch_msg["best_val_qwk"] = best_val_qwk
-        cb(epoch_msg)
-
-        if patience_counter >= config.patience:
-            logger.info("Early stopping at epoch %d (patience=%d)", epoch + 1, config.patience)
-            break
-
-    # --- SWA finalisation: materialise the averaged weights, evaluate them, and
-    # adopt as the candidate only when they beat the best single-epoch checkpoint
-    # on the selection score (so calibration/cut-points then fit on them). ---
-    if swa is not None and swa.n >= 2 and best_checkpoint_path:
-        try:
-            swa_sd_cpu = swa.state_dict()
-            model.load_state_dict({k: v.to(device) for k, v in swa_sd_cpu.items()})
-            # SWA competes against per-epoch bests, so it must be scored under
-            # the same shipped decode (SWA is single-label-only by the gate).
-            swa_logits, swa_labels = _collect_val_logits(model, val_loader, config, device, dtype)
-            swa_metrics = _shipped_decode_metrics(
-                swa_logits, swa_labels, config, _resolve_none_index(config.class_names),
-            )
-            swa_score = _metric_score(swa_metrics, config)
-            cb({
-                "type": "training_progress", "stage": "validating",
-                "status_text": (
-                    f"SWA ({swa.n} snapshots): score {swa_score:.4f} "
-                    f"vs best {best_validation_score:.4f}"
-                ),
-            })
-            if swa_score > best_validation_score:
-                ckpt_meta = {
-                    "state_dict": swa_sd_cpu,
-                    "num_classes": config.num_classes,
-                    "model_size": config.backbone_variant,
-                    "class_names": list(config.class_names),
-                    "validation_metric": _primary_validation_metric(config),
-                    **_spatial_ckpt_meta(config),
-                }
-                if head_hidden_size is not None:
-                    ckpt_meta["head_hidden_size"] = head_hidden_size
                 ckpt_path = checkpoint_dir / "candidate.pt"
-                torch.save(ckpt_meta, ckpt_path)
-                best_checkpoint_path = str(ckpt_path)
-                best_metrics = swa_metrics.copy()
-                best_val_macro_f1 = swa_metrics["macro_f1"]
-                best_val_qwk = swa_metrics.get("qwk", 0.0)
-                best_validation_score = swa_score
-                logger.info("SWA weights adopted (score %.4f)", swa_score)
-        except Exception:
-            logger.warning("SWA evaluation failed; keeping best single-epoch checkpoint", exc_info=True)
-
-    # --- Greedy weight soup: average the strongest epochs into ONE model, keeping
-    # only additions that don't lower the val selection score, and adopt the soup
-    # only when it strictly beats the best single-epoch checkpoint. One deployable
-    # model, no extra inference cost; safe for all group types (never worse on
-    # val by construction). ---
-    if config.use_greedy_soup and len(soup_pool) >= 2 and best_checkpoint_path:
-        none_index = _resolve_none_index(config.class_names)
-
-        def _soup_metrics(state: dict) -> dict:
-            model.load_state_dict({k: v.to(device) for k, v in state.items()})
-            if config.multi_label:
-                return _evaluate(
-                    model, val_loader, config.num_classes, device, dtype,
-                    multi_label=True, ordinal=config.ordinal,
-                    none_index=none_index, channels_last=config.channels_last,
-                )
-            logits, labels = _collect_val_logits(model, val_loader, config, device, dtype)
-            return _shipped_decode_metrics(logits, labels, config, none_index)
-
-        try:
-            candidates = [
-                (score, torch.load(path, map_location="cpu")) for score, _ep, path in soup_pool
-            ]
-            soup_state, soup_score, accepted = greedy_soup(
-                candidates, lambda s: _metric_score(_soup_metrics(s), config),
-            )
-            cb({
-                "type": "training_progress", "stage": "validating",
-                "status_text": (
-                    f"Greedy soup ({len(accepted)}/{len(candidates)} epochs): "
-                    f"score {soup_score:.4f} vs best {best_validation_score:.4f}"
-                ),
-            })
-            if soup_score > best_validation_score:
-                soup_metrics = _soup_metrics(soup_state)
+                # When EMA is active, persist the EMA weights as the primary
+                # state_dict (downstream inference loads this key unchanged). Raw
+                # weights survive under model_state_dict for diagnostic purposes.
+                primary_state = ema.state_dict() if ema is not None else model.state_dict()
                 ckpt_meta = {
-                    "state_dict": {k: v.detach().cpu() for k, v in soup_state.items()},
+                    "state_dict": primary_state,
                     "num_classes": config.num_classes,
                     "model_size": config.backbone_variant,
                     "class_names": list(config.class_names),
@@ -3110,41 +3269,228 @@ def run_group_training(
                 }
                 if head_hidden_size is not None:
                     ckpt_meta["head_hidden_size"] = head_hidden_size
+                if ema is not None:
+                    ckpt_meta["model_state_dict"] = model.state_dict()
+                    ckpt_meta["ema_decay"] = config.ema_decay
                 if config.multi_label:
                     ckpt_meta["multi_label"] = True
-                ckpt_path = checkpoint_dir / "candidate.pt"
                 torch.save(ckpt_meta, ckpt_path)
                 best_checkpoint_path = str(ckpt_path)
-                best_metrics = soup_metrics.copy()
-                best_val_macro_f1 = soup_metrics.get("macro_f1", best_val_macro_f1)
-                best_val_qwk = soup_metrics.get("qwk", best_val_qwk)
-                best_validation_score = soup_score
-                logger.info("Greedy soup adopted (%d epochs, score %.4f)", len(accepted), soup_score)
-        except Exception:
-            logger.warning("Greedy soup failed; keeping best single-epoch checkpoint", exc_info=True)
-        finally:
-            for _s, _e, _p in soup_pool:
+            else:
+                patience_counter += 1
+
+            # Dynamic per-class loss weighting: fold this epoch's per-class val
+            # signal into the controller and reassign class_weights for the NEXT
+            # epoch. The loss_fn is rebuilt fresh inside _train_one_epoch, so the
+            # updated tensor takes effect immediately with no other plumbing.
+            if dcw_controller is not None:
+                class_weights = dcw_controller.update(
+                    val_metrics.get("per_class_f1", {}),
+                    val_metrics.get("per_class_val_loss", {}),
+                )
+
+            # Per-epoch snapshot dump for snapshot-ensemble experiments (ISSUE-0392
+            # follow-up: bank each class at its own val-F1 peak). Writes the
+            # deployable weights every epoch when snapshot_dir is set; off by default.
+            if config.snapshot_dir:
+                snap_dir = Path(config.snapshot_dir)
+                snap_dir.mkdir(parents=True, exist_ok=True)
+                snap_state = ema.state_dict() if ema is not None else model.state_dict()
+                snap_meta = {
+                    "state_dict": snap_state,
+                    "num_classes": config.num_classes,
+                    "model_size": config.backbone_variant,
+                    "class_names": list(config.class_names),
+                    **_spatial_ckpt_meta(config),
+                }
+                if head_hidden_size is not None:
+                    snap_meta["head_hidden_size"] = head_hidden_size
+                torch.save(snap_meta, snap_dir / f"epoch_{epoch + 1:03d}.pt")
+
+            # Track this epoch as a greedy-soup candidate (top-N by selection score).
+            if config.use_greedy_soup:
+                _update_soup_pool(
+                    soup_pool, soup_dir, selected_score, epoch,
+                    ema.state_dict() if ema is not None else model.state_dict(),
+                    config.soup_max_candidates,
+                )
+
+            epoch_msg = {
+                "type": "epoch_complete",
+                "stage": "training",
+                "status_text": f"Epoch {epoch + 1}/{config.max_epochs} complete (val macro F1 {val_macro_f1:.3f})",
+                "epoch": epoch + 1,
+                "max_epochs": config.max_epochs,
+                "train_loss": train_loss,
+                "val_loss": val_metrics["val_loss"],
+                "val_macro_f1": val_macro_f1,
+                "val_macro_f1_supported": val_metrics.get("macro_f1_supported"),
+                "val_macro_precision": val_metrics.get("macro_precision", 0.0),
+                "val_macro_recall": val_metrics.get("macro_recall", 0.0),
+                "per_class_f1": val_metrics.get("per_class_f1", {}),
+                "per_class_precision": val_metrics.get("per_class_precision", {}),
+                "per_class_recall": val_metrics.get("per_class_recall", {}),
+                "per_class_support": val_metrics.get("per_class_support", {}),
+                "per_class_val_loss": val_metrics.get("per_class_val_loss", {}),
+                "per_class_train_loss": per_class_train_loss,
+                "val_none_precision": val_metrics.get("none_precision"),
+                "val_none_recall": val_metrics.get("none_recall"),
+                "val_none_f1": val_metrics.get("none_f1"),
+                "val_none_false_positive_rate": val_metrics.get("none_false_positive_rate"),
+                "best_val_macro_f1": best_val_macro_f1,
+                "selected_validation_score": selected_score,
+                "best_validation_score": best_validation_score,
+                "validation_metric": _primary_validation_metric(config),
+                "best_epoch": best_epoch + 1,
+            }
+            if dcw_controller is not None:
+                epoch_msg["per_class_weight_multiplier"] = dcw_controller.multipliers()
+            if config.ordinal:
+                epoch_msg["val_qwk"] = val_qwk
+                epoch_msg["val_ordinal_mae"] = val_metrics.get("ordinal_mae")
+                epoch_msg["val_adjacent_accuracy"] = val_metrics.get("adjacent_accuracy")
+                epoch_msg["best_val_qwk"] = best_val_qwk
+            cb(epoch_msg)
+
+            # Epoch-boundary backup: the cleanest resume point (scheduler stepped,
+            # best/dcw/soup updated). Stored as epoch+1/batch_in_epoch=0 so a
+            # resume starts the NEXT epoch fresh, never re-running this one.
+            if coordinator.enabled:
+                coordinator.save(_collect_state(epoch + 1, 0, None), reason="periodic")
+
+            if patience_counter >= config.patience:
+                logger.info("Early stopping at epoch %d (patience=%d)", epoch + 1, config.patience)
+                break
+
+        # --- SWA finalisation: materialise the averaged weights, evaluate them, and
+        # adopt as the candidate only when they beat the best single-epoch checkpoint
+        # on the selection score (so calibration/cut-points then fit on them). ---
+        if swa is not None and swa.n >= 2 and best_checkpoint_path:
+            try:
+                swa_sd_cpu = swa.state_dict()
+                model.load_state_dict({k: v.to(device) for k, v in swa_sd_cpu.items()})
+                # SWA competes against per-epoch bests, so it must be scored under
+                # the same shipped decode (SWA is single-label-only by the gate).
+                swa_logits, swa_labels = _collect_val_logits(model, val_loader, config, device, dtype)
+                swa_metrics = _shipped_decode_metrics(
+                    swa_logits, swa_labels, config, _resolve_none_index(config.class_names),
+                )
+                swa_score = _metric_score(swa_metrics, config)
+                cb({
+                    "type": "training_progress", "stage": "validating",
+                    "status_text": (
+                        f"SWA ({swa.n} snapshots): score {swa_score:.4f} "
+                        f"vs best {best_validation_score:.4f}"
+                    ),
+                })
+                if swa_score > best_validation_score:
+                    ckpt_meta = {
+                        "state_dict": swa_sd_cpu,
+                        "num_classes": config.num_classes,
+                        "model_size": config.backbone_variant,
+                        "class_names": list(config.class_names),
+                        "validation_metric": _primary_validation_metric(config),
+                        **_spatial_ckpt_meta(config),
+                    }
+                    if head_hidden_size is not None:
+                        ckpt_meta["head_hidden_size"] = head_hidden_size
+                    ckpt_path = checkpoint_dir / "candidate.pt"
+                    torch.save(ckpt_meta, ckpt_path)
+                    best_checkpoint_path = str(ckpt_path)
+                    best_metrics = swa_metrics.copy()
+                    best_val_macro_f1 = swa_metrics["macro_f1"]
+                    best_val_qwk = swa_metrics.get("qwk", 0.0)
+                    best_validation_score = swa_score
+                    logger.info("SWA weights adopted (score %.4f)", swa_score)
+            except Exception:
+                logger.warning("SWA evaluation failed; keeping best single-epoch checkpoint", exc_info=True)
+
+        # --- Greedy weight soup: average the strongest epochs into ONE model, keeping
+        # only additions that don't lower the val selection score, and adopt the soup
+        # only when it strictly beats the best single-epoch checkpoint. One deployable
+        # model, no extra inference cost; safe for all group types (never worse on
+        # val by construction). ---
+        if config.use_greedy_soup and len(soup_pool) >= 2 and best_checkpoint_path:
+            none_index = _resolve_none_index(config.class_names)
+
+            def _soup_metrics(state: dict) -> dict:
+                model.load_state_dict({k: v.to(device) for k, v in state.items()})
+                if config.multi_label:
+                    return _evaluate(
+                        model, val_loader, config.num_classes, device, dtype,
+                        multi_label=True, ordinal=config.ordinal,
+                        none_index=none_index, channels_last=config.channels_last,
+                    )
+                logits, labels = _collect_val_logits(model, val_loader, config, device, dtype)
+                return _shipped_decode_metrics(logits, labels, config, none_index)
+
+            try:
+                candidates = [
+                    (score, torch.load(path, map_location="cpu")) for score, _ep, path in soup_pool
+                ]
+                soup_state, soup_score, accepted = greedy_soup(
+                    candidates, lambda s: _metric_score(_soup_metrics(s), config),
+                )
+                cb({
+                    "type": "training_progress", "stage": "validating",
+                    "status_text": (
+                        f"Greedy soup ({len(accepted)}/{len(candidates)} epochs): "
+                        f"score {soup_score:.4f} vs best {best_validation_score:.4f}"
+                    ),
+                })
+                if soup_score > best_validation_score:
+                    soup_metrics = _soup_metrics(soup_state)
+                    ckpt_meta = {
+                        "state_dict": {k: v.detach().cpu() for k, v in soup_state.items()},
+                        "num_classes": config.num_classes,
+                        "model_size": config.backbone_variant,
+                        "class_names": list(config.class_names),
+                        "validation_metric": _primary_validation_metric(config),
+                        **_spatial_ckpt_meta(config),
+                    }
+                    if head_hidden_size is not None:
+                        ckpt_meta["head_hidden_size"] = head_hidden_size
+                    if config.multi_label:
+                        ckpt_meta["multi_label"] = True
+                    ckpt_path = checkpoint_dir / "candidate.pt"
+                    torch.save(ckpt_meta, ckpt_path)
+                    best_checkpoint_path = str(ckpt_path)
+                    best_metrics = soup_metrics.copy()
+                    best_val_macro_f1 = soup_metrics.get("macro_f1", best_val_macro_f1)
+                    best_val_qwk = soup_metrics.get("qwk", best_val_qwk)
+                    best_validation_score = soup_score
+                    logger.info("Greedy soup adopted (%d epochs, score %.4f)", len(accepted), soup_score)
+            except Exception:
+                logger.warning("Greedy soup failed; keeping best single-epoch checkpoint", exc_info=True)
+            finally:
+                for _s, _e, _p in soup_pool:
+                    try:
+                        Path(_p).unlink()
+                    except OSError:
+                        pass
                 try:
-                    Path(_p).unlink()
+                    soup_dir.rmdir()
                 except OSError:
                     pass
-            try:
-                soup_dir.rmdir()
-            except OSError:
-                pass
 
-    return _compare_promote_finalize(
-        config,
-        candidate_path=best_checkpoint_path,
-        best_metrics=best_metrics,
-        candidate_macro_f1=best_val_macro_f1,
-        candidate_qwk=best_val_qwk,
-        best_epoch_display=best_epoch + 1,
-        epochs_completed=epoch + 1,
-        val_loader=val_loader,
-        device=device, dtype=dtype,
-        checkpoint_dir=checkpoint_dir,
-        class_counts=train_ds.get_class_counts(),
-        total_raw=total_raw,
-        cb=cb,
-    )
+        result = _compare_promote_finalize(
+            config,
+            candidate_path=best_checkpoint_path,
+            best_metrics=best_metrics,
+            candidate_macro_f1=best_val_macro_f1,
+            candidate_qwk=best_val_qwk,
+            best_epoch_display=best_epoch + 1,
+            epochs_completed=epoch + 1,
+            val_loader=val_loader,
+            device=device, dtype=dtype,
+            checkpoint_dir=checkpoint_dir,
+            class_counts=train_ds.get_class_counts(),
+            total_raw=total_raw,
+            cb=cb,
+        )
+
+    # Training completed successfully (no pause, no exception): the backups are
+    # obsolete — clear them so a later run doesn't resume a finished job.
+    if coordinator.manager is not None:
+        coordinator.manager.delete_all()
+    return result

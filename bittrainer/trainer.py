@@ -85,6 +85,14 @@ class TrainConfig:
     randaugment_n: int = 2
     randaugment_m: int = 9
     random_erasing_p: float = 0.25
+    # --- Backup / Pause / Resume (Bitcrush ISSUE-0405) ---
+    # backup_dir=None => NO backups written and NO resume attempted (legacy).
+    # backup_every_steps=0 => epoch-boundary backups only. resume_from points at
+    # a backup dir/file. dataloader_workers replaces the hardcoded num_workers=4.
+    backup_dir: str | None = None
+    backup_every_steps: int = 500
+    resume_from: str | None = None
+    dataloader_workers: int = 4
 
 
 def _fresh_binary_model(config: "TrainConfig", *, dtype: torch.dtype) -> nn.Module:
@@ -152,6 +160,7 @@ def train_one_epoch(
     randaugment_n: int = 0,
     randaugment_m: int = 0,
     random_erasing_p: float = 0.0,
+    boundary_hook: Callable[[int], str | None] | None = None,
 ) -> float:
     from bittrainer.gpu_augment import apply_train_augment
 
@@ -187,11 +196,18 @@ def train_one_epoch(
         total_loss += loss.item()
         num_batches += 1
 
+        # Backup/pause boundary (every batch — the binary trainer has no grad
+        # accumulation). "stop" => a pause was requested and backed up; break.
+        boundary_signal = boundary_hook(num_batches) if boundary_hook is not None else None
+
         if step_callback is not None:
             now = time.monotonic()
             if now - _last_report >= 2.0 or num_batches == total_steps:
                 _last_report = now
                 step_callback(num_batches, total_steps, total_loss / num_batches)
+
+        if boundary_signal == "stop":
+            break
 
     return total_loss / max(num_batches, 1)
 
@@ -295,6 +311,7 @@ def run_training(
     progress_callback: Callable[[dict], None] | None = None,
     stop_event: object | None = None,
     stop_now_event: object | None = None,
+    pause_event: object | None = None,
 ) -> dict:
     """Run the full training loop. Returns a result dict with metrics and checkpoint path.
 
@@ -302,9 +319,26 @@ def run_training(
     boundary. stop_now_event additionally interrupts the current epoch's
     training loop mid-batch; validation and the final fair-comparison block
     still run on the partial-epoch state.
+
+    pause_event (Bitcrush ISSUE-0405) requests a resumable pause: the training
+    state is backed up and the loop returns ``{"paused": True, ...}`` without
+    running the fair-comparison / promotion block. Combined with
+    ``config.backup_dir`` / ``config.resume_from`` a resume rebuilds the model,
+    replays the gradual-unfreeze reconstruction, and **restarts the interrupted
+    epoch** (mid-epoch snapshot, epoch-restart resume — the per-epoch scheduler
+    keeps it consistent).
     """
     from bittrainer.runtime import configure_cuda_backend
     from bittrainer.smart_cache import _noop_callback, _never_stop
+    from bittrainer.training_state import (
+        BackupCoordinator,
+        backup_on_exception,
+        capture_optimizer_aux_state,
+        make_fingerprint,
+        prime_optimizer_after_resume,
+        restore_optimizer_aux_state,
+        sanitize_for_backup,
+    )
     cb = progress_callback or config.progress_callback or _noop_callback
     device = torch.device(config.device)
     dtype = _get_dtype(config.dtype)
@@ -312,6 +346,25 @@ def run_training(
     concept_folder = Path(config.concept_folder)
     checkpoint_dir = Path(config.checkpoint_dir) if config.checkpoint_dir else concept_folder / "checkpoints"
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
+
+    coordinator = BackupCoordinator(
+        backup_dir=config.backup_dir, pause_event=pause_event,
+        backup_every_steps=config.backup_every_steps, cb=cb,
+    )
+    fingerprint = make_fingerprint(
+        class_names=["negative", "positive"], num_classes=2,
+        max_epochs=config.max_epochs, multi_label=False, ordinal=False,
+        best_model_name=config.best_model_name, model_size=config.model_size,
+    )
+    resume_state = (
+        coordinator.load_resume(fingerprint, resume_from=config.resume_from)
+        if config.resume_from else None
+    )
+
+    def _paused_result(cur_epoch: int, gstep: int, backup_path) -> dict:
+        bp = str(backup_path) if backup_path else None
+        cb({"type": "training_paused", "epoch": cur_epoch, "global_step": gstep, "backup_path": bp})
+        return {"paused": True, "backup_path": bp, "epoch": cur_epoch, "global_step": gstep}
 
     concept_name = config.concept_name or concept_folder.name
 
@@ -435,13 +488,19 @@ def run_training(
         b = s["bucket"]
         bucket_counts[b] = bucket_counts.get(b, 0) + 1
 
-    # Create model — warm-start from best.pt unless from_scratch is set
+    # Create model — warm-start from best.pt, rebuild from a resume backup, or
+    # start fresh.
     existing_best = checkpoint_dir / config.best_model_name
+    use_gradual_unfreeze = num_positives < 50
     cb({
         "type": "training_progress", "stage": "preparing",
         "status_text": "Loading model",
     })
-    if not config.from_scratch and existing_best.exists():
+    if resume_state is not None:
+        model = _fresh_binary_model(config, dtype=dtype).to(device)
+        model.load_state_dict(resume_state["model"])
+        use_gradual_unfreeze = bool(resume_state.get("use_gradual_unfreeze", use_gradual_unfreeze))
+    elif not config.from_scratch and existing_best.exists():
         try:
             model = load_checkpoint(
                 str(existing_best), device=str(device), dtype=dtype,
@@ -453,9 +512,9 @@ def run_training(
             model = _fresh_binary_model(config, dtype=dtype).to(device)
     else:
         model = _fresh_binary_model(config, dtype=dtype).to(device)
-    use_gradual_unfreeze = num_positives < 50
 
-    # Probe unfrozen = worst-case VRAM, then freeze for epoch 0
+    # Probe unfrozen = worst-case VRAM, then freeze for epoch 0. Resume reuses
+    # the backed-up batch size (skip the probe).
     from bittrainer.autobatch import determine_batch_size
 
     def _probe_progress(attempt: int, candidate: int, cap: int, status: str) -> None:
@@ -464,16 +523,20 @@ def run_training(
             "status_text": f"Probing batch size (try {attempt}: {candidate}/{cap} — {status})",
         })
 
-    cb({
-        "type": "training_progress", "stage": "preparing",
-        "status_text": "Probing optimal batch size",
-    })
-    auto_result = determine_batch_size(
-        model, bucket_counts, device, dtype=dtype,
-        use_ema=config.use_ema, progress_callback=_probe_progress,
-    )
-    eff_bs = auto_result["batch_size"]
-    cb({"type": "autobatch", **auto_result})
+    if resume_state is not None:
+        eff_bs = int(resume_state["eff_bs"])
+        cb({"type": "autobatch", "batch_size": eff_bs, "resumed": True})
+    else:
+        cb({
+            "type": "training_progress", "stage": "preparing",
+            "status_text": "Probing optimal batch size",
+        })
+        auto_result = determine_batch_size(
+            model, bucket_counts, device, dtype=dtype,
+            use_ema=config.use_ema, progress_callback=_probe_progress,
+        )
+        eff_bs = auto_result["batch_size"]
+        cb({"type": "autobatch", **auto_result})
     freeze_backbone(model)
 
     # Optimiser: Prodigy_adv with kourkoutas beta and cautious weight decay
@@ -494,6 +557,53 @@ def run_training(
     patience_counter = 0
     best_checkpoint_path = None
     best_metrics: dict = {}
+    global_step = 0
+    start_epoch = 0
+    scheduler_t_max = config.max_epochs
+
+    if resume_state is not None:
+        start_epoch = int(resume_state["epoch"])
+        global_step = int(resume_state.get("global_step", 0))
+        best = resume_state["best"]
+        best_val_f1 = best["best_val_f1"]
+        best_epoch = best["best_epoch"]
+        patience_counter = best["patience_counter"]
+        best_checkpoint_path = best["best_checkpoint_path"]
+        best_metrics = dict(best.get("best_metrics") or {})
+        # Replay the gradual-unfreeze reconstruction so the optimizer param_groups
+        # match the epoch we resume INTO, BEFORE loading optimizer/scheduler
+        # state. (trainer.py epoch-1 transition: full unfreeze + fresh
+        # optimizer/scheduler for the non-gradual path.)
+        skip_opt_load = False
+        if start_epoch >= 1:
+            if use_gradual_unfreeze:
+                unfreeze_stage(model, _NUM_STAGES - 1)  # epoch-1 transition
+                for e in range(2, start_epoch + 1):
+                    si = _NUM_STAGES - e
+                    if 0 <= si < _NUM_STAGES:
+                        unfreeze_stage(model, si)
+            else:
+                unfreeze_backbone(model)
+                optimizer = _make_optimizer(model, config)
+                scheduler_t_max = config.max_epochs - 1
+                scheduler = CosineAnnealingLR(optimizer, T_max=scheduler_t_max)
+                # Resuming INTO epoch 1: the optimizer/scheduler are freshly
+                # created here exactly as the uninterrupted run does — the backup
+                # (taken after epoch 0) holds the now-discarded frozen optimizer,
+                # so start these fresh rather than loading it.
+                skip_opt_load = start_epoch == 1
+        if not skip_opt_load:
+            optimizer.load_state_dict(resume_state["optimizer"])
+            prime_optimizer_after_resume(optimizer)
+            restore_optimizer_aux_state(optimizer, resume_state.get("optimizer_aux"), device)
+            scheduler.load_state_dict(resume_state["scheduler"])
+        if ema is not None and resume_state.get("ema") is not None:
+            ema.load_full_state_dict(resume_state["ema"])
+        cb({
+            "type": "training_resumed", "resumed_from": str(config.resume_from),
+            "epoch": start_epoch, "global_step": global_step,
+            "best_val_f1": best_val_f1, "best_epoch": best_epoch + 1,
+        })
 
     # Async disk reads + pinned H2D transfers overlap with GPU compute.
     # Workers respawn when train loader rebuilds between epochs (for negative
@@ -502,17 +612,20 @@ def run_training(
         "type": "training_progress", "stage": "preparing",
         "status_text": f"Batch size {eff_bs} — spawning data workers",
     })
+    _n_workers = max(0, int(config.dataloader_workers))
+    _loader_kwargs: dict = {"num_workers": _n_workers, "pin_memory": True}
+    if _n_workers > 0:
+        _loader_kwargs.update(persistent_workers=True, prefetch_factor=3)
+
     val_sampler = build_bucket_batch_sampler(val_ds, batch_size=eff_bs)
     val_loader = DataLoader(
-        val_ds, batch_sampler=val_sampler, collate_fn=_collate_bucket_batch,
-        num_workers=4, pin_memory=True, persistent_workers=True, prefetch_factor=3,
+        val_ds, batch_sampler=val_sampler, collate_fn=_collate_bucket_batch, **_loader_kwargs,
     )
 
     def _rebuild_train_loader() -> DataLoader:
         sampler = build_bucket_batch_sampler(train_ds, batch_size=eff_bs)
         return DataLoader(
-            train_ds, batch_sampler=sampler, collate_fn=_collate_bucket_batch,
-            num_workers=4, pin_memory=True, persistent_workers=True, prefetch_factor=3,
+            train_ds, batch_sampler=sampler, collate_fn=_collate_bucket_batch, **_loader_kwargs,
         )
 
     train_loader = _rebuild_train_loader()
@@ -521,142 +634,230 @@ def run_training(
 
     cb({
         "type": "training_progress", "stage": "training",
-        "status_text": f"Training (epoch 0/{config.max_epochs})",
-        "epoch": 0, "max_epochs": config.max_epochs,
+        "status_text": f"Training (epoch {start_epoch}/{config.max_epochs})",
+        "epoch": start_epoch, "max_epochs": config.max_epochs,
     })
 
-    for epoch in range(config.max_epochs):
-        if stop_now_event is not None and stop_now_event.is_set():
-            logger.info("Stop-now requested before epoch %d — running final comparison", epoch)
-            cb({"type": "stop_now", "epoch": epoch, "max_epochs": config.max_epochs})
-            break
-        if stop_event is not None and stop_event.is_set():
-            logger.info("Graceful stop requested after epoch %d — running final comparison", epoch)
-            cb({"type": "graceful_stop", "epoch": epoch, "max_epochs": config.max_epochs})
-            break
+    def _collect_binary_state(cur_epoch: int) -> dict:
+        return {
+            "fingerprint": fingerprint,
+            "trainer": "binary",
+            "epoch": cur_epoch,
+            "batch_in_epoch": 0,  # binary resume is epoch-restart
+            "global_step": global_step,
+            "eff_bs": eff_bs,
+            "use_gradual_unfreeze": use_gradual_unfreeze,
+            "scheduler_t_max": scheduler_t_max,
+            "model": {k: v.detach().cpu() for k, v in model.state_dict().items()},
+            "optimizer": optimizer.state_dict(),
+            "optimizer_aux": capture_optimizer_aux_state(optimizer),
+            "scheduler": scheduler.state_dict(),
+            "ema": ema.full_state_dict() if ema is not None else None,
+            "best": {
+                "best_val_f1": best_val_f1,
+                "best_epoch": best_epoch,
+                "patience_counter": patience_counter,
+                "best_checkpoint_path": best_checkpoint_path,
+                "best_metrics": sanitize_for_backup(best_metrics),
+            },
+        }
 
-        # Resample cross-concept negatives so the model sees different
-        # negatives each epoch (no-op for legacy per-concept negatives)
-        if epoch > 0:
-            train_ds.resample_negatives()
-            train_loader = _rebuild_train_loader()
-
-        # Unfreezing logic
-        if epoch == 1:
-            if use_gradual_unfreeze:
-                # Unfreeze last stage
-                unfreeze_stage(model, _NUM_STAGES - 1)
-            else:
-                unfreeze_backbone(model)
-                # Re-create optimizer with all params
-                optimizer = _make_optimizer(model, config)
-                remaining_epochs = config.max_epochs - 1  # 1 epoch already done
-                scheduler = CosineAnnealingLR(optimizer, T_max=remaining_epochs)
-        elif epoch > 1 and use_gradual_unfreeze:
-            stage_idx = _NUM_STAGES - epoch  # 3, 2, 1, 0
-            if 0 <= stage_idx < _NUM_STAGES:
-                unfreeze_stage(model, stage_idx)
-
-        # Train
-        epoch_start_mono = time.monotonic()
-
-        def _on_step(step: int, total_steps: int, avg_loss: float) -> None:
-            elapsed = time.monotonic() - epoch_start_mono
-            throughput = step / elapsed if elapsed > 0 else None
-            eta_seconds = (total_steps - step) / throughput if throughput and throughput > 0 else None
-            cb({
-                "type": "training_progress",
-                "stage": "training",
-                "status_text": f"Training (epoch {epoch + 1}/{config.max_epochs}, step {step}/{total_steps})",
-                "epoch": epoch + 1,
-                "max_epochs": config.max_epochs,
-                "step": step,
-                "total_steps": total_steps,
-                "eta_seconds": eta_seconds,
-                "throughput": throughput,
-                "throughput_unit": "batch/s",
-                "train_loss": round(avg_loss, 4),
-                "best_val_f1": best_val_f1 if best_val_f1 >= 0 else None,
-                "best_epoch": best_epoch + 1 if best_val_f1 >= 0 else None,
-            })
-
-        train_loss = train_one_epoch(
-            model, train_loader, optimizer, criterion, device, dtype,
-            step_callback=_on_step,
-            stop_now_event=stop_now_event,
-            ema=ema,
-            randaugment_n=config.randaugment_n,
-            randaugment_m=config.randaugment_m,
-            random_erasing_p=config.random_erasing_p,
-        )
-        if stop_now_event is not None and stop_now_event.is_set():
-            cb({
-                "type": "stop_now",
-                "epoch": epoch + 1,
-                "max_epochs": config.max_epochs,
-                "status_text": f"Stop-now triggered mid-epoch {epoch + 1} — finishing up",
-            })
-        scheduler.step()
-
-        # Validate (against EMA weights when enabled — they generalise better)
-        eval_model = ema.module if ema is not None else model
-        val_result = evaluate(eval_model, val_loader, criterion, device, dtype)
-        # Select on F1 at the tuned threshold (what inference ships), not @0.5.
-        metrics, _epoch_threshold = _tuned_val_metrics(val_result)
-        metrics["val_loss"] = val_result["val_loss"]
-        metrics["train_loss"] = train_loss
-
-        # Check improvement
-        val_f1 = metrics.get("f1", 0.0)
-        if val_f1 > best_val_f1:
-            best_val_f1 = val_f1
-            best_epoch = epoch
-            patience_counter = 0
-            best_metrics = metrics.copy()
-
-            ckpt_path = checkpoint_dir / "candidate.pt"
-            primary_state = ema.state_dict() if ema is not None else model.state_dict()
-            ckpt_meta = {
-                "state_dict": primary_state,
-                "num_classes": 2,
-                "model_size": config.model_size,
-            }
-            if ema is not None:
-                ckpt_meta["model_state_dict"] = model.state_dict()
-                ckpt_meta["ema_decay"] = config.ema_decay
-            torch.save(ckpt_meta, ckpt_path)
-            best_checkpoint_path = str(ckpt_path)
-        else:
-            patience_counter += 1
-
-        # Progress callback
-        cb({
-            "type": "epoch_complete",
-            "stage": "training",
-            "status_text": f"Epoch {epoch + 1}/{config.max_epochs} complete (val F1 {val_f1:.3f})",
-            "epoch": epoch + 1,
-            "max_epochs": config.max_epochs,
-            "train_loss": train_loss,
-            "val_loss": val_result["val_loss"],
-            "val_f1": val_f1,
-            "val_precision": metrics.get("precision", 0.0),
-            "val_recall": metrics.get("recall", 0.0),
-            "val_auprc": metrics.get("auprc", 0.0),
-            "best_val_f1": best_val_f1,
-            "best_epoch": best_epoch + 1,
-        })
-
-        # Early stopping
-        if patience_counter >= config.patience:
-            logger.info("Early stopping at epoch %d (patience=%d)", epoch + 1, config.patience)
-            break
-
-    # Compare candidate checkpoint against existing best.pt on the CURRENT val set.
-    # This ensures a fair apples-to-apples comparison even when the val set has
-    # changed between training runs.
+    epoch = start_epoch - 1  # so epochs_completed is defined if the loop is empty
+    _exc_epoch = start_epoch
     existing_best = checkpoint_dir / config.best_model_name
-    optimal_threshold = 0.5
 
+    with backup_on_exception(
+        lambda: _collect_binary_state(_exc_epoch), coordinator.manager, cb=cb,
+    ):
+        for epoch in range(start_epoch, config.max_epochs):
+            _exc_epoch = epoch
+            if stop_now_event is not None and stop_now_event.is_set():
+                logger.info("Stop-now requested before epoch %d — running final comparison", epoch)
+                cb({"type": "stop_now", "epoch": epoch, "max_epochs": config.max_epochs})
+                break
+            if stop_event is not None and stop_event.is_set():
+                logger.info("Graceful stop requested after epoch %d — running final comparison", epoch)
+                cb({"type": "graceful_stop", "epoch": epoch, "max_epochs": config.max_epochs})
+                break
+            if coordinator.paused:
+                path = coordinator.save(_collect_binary_state(epoch), reason="pause")
+                return _paused_result(epoch, global_step, path)
+
+            # Resample cross-concept negatives so the model sees different
+            # negatives each epoch (no-op for legacy per-concept negatives)
+            if epoch > 0:
+                train_ds.resample_negatives()
+                train_loader = _rebuild_train_loader()
+
+            # Unfreezing logic. Skipped for the epoch we resumed INTO — the
+            # reconstruction above already put the model/optimizer/scheduler into
+            # that epoch's state (re-running it would recreate the optimizer and
+            # discard the restored state).
+            if not (resume_state is not None and epoch == start_epoch):
+                if epoch == 1:
+                    if use_gradual_unfreeze:
+                        # Unfreeze last stage
+                        unfreeze_stage(model, _NUM_STAGES - 1)
+                    else:
+                        unfreeze_backbone(model)
+                        # Re-create optimizer with all params
+                        optimizer = _make_optimizer(model, config)
+                        scheduler_t_max = config.max_epochs - 1  # 1 epoch already done
+                        scheduler = CosineAnnealingLR(optimizer, T_max=scheduler_t_max)
+                elif epoch > 1 and use_gradual_unfreeze:
+                    stage_idx = _NUM_STAGES - epoch  # 3, 2, 1, 0
+                    if 0 <= stage_idx < _NUM_STAGES:
+                        unfreeze_stage(model, stage_idx)
+
+            # Train
+            epoch_start_mono = time.monotonic()
+
+            def _on_step(step: int, total_steps: int, avg_loss: float) -> None:
+                elapsed = time.monotonic() - epoch_start_mono
+                throughput = step / elapsed if elapsed > 0 else None
+                eta_seconds = (total_steps - step) / throughput if throughput and throughput > 0 else None
+                cb({
+                    "type": "training_progress",
+                    "stage": "training",
+                    "status_text": f"Training (epoch {epoch + 1}/{config.max_epochs}, step {step}/{total_steps})",
+                    "epoch": epoch + 1,
+                    "max_epochs": config.max_epochs,
+                    "step": step,
+                    "total_steps": total_steps,
+                    "eta_seconds": eta_seconds,
+                    "throughput": throughput,
+                    "throughput_unit": "batch/s",
+                    "train_loss": round(avg_loss, 4),
+                    "best_val_f1": best_val_f1 if best_val_f1 >= 0 else None,
+                    "best_epoch": best_epoch + 1 if best_val_f1 >= 0 else None,
+                })
+
+            def _boundary_hook(num_batches: int) -> str | None:
+                nonlocal global_step
+                global_step += 1
+                return coordinator.on_boundary(
+                    lambda: _collect_binary_state(epoch), global_step,
+                )
+
+            train_loss = train_one_epoch(
+                model, train_loader, optimizer, criterion, device, dtype,
+                step_callback=_on_step,
+                stop_now_event=stop_now_event,
+                ema=ema,
+                randaugment_n=config.randaugment_n,
+                randaugment_m=config.randaugment_m,
+                random_erasing_p=config.random_erasing_p,
+                boundary_hook=_boundary_hook,
+            )
+            if coordinator.paused:
+                # Pause fired mid-epoch — the boundary hook wrote the backup.
+                # Return without the fair-comparison / promotion block.
+                return _paused_result(epoch, global_step, coordinator.last_backup_path)
+            if stop_now_event is not None and stop_now_event.is_set():
+                cb({
+                    "type": "stop_now",
+                    "epoch": epoch + 1,
+                    "max_epochs": config.max_epochs,
+                    "status_text": f"Stop-now triggered mid-epoch {epoch + 1} — finishing up",
+                })
+            scheduler.step()
+
+            # Validate (against EMA weights when enabled — they generalise better)
+            eval_model = ema.module if ema is not None else model
+            val_result = evaluate(eval_model, val_loader, criterion, device, dtype)
+            # Select on F1 at the tuned threshold (what inference ships), not @0.5.
+            metrics, _epoch_threshold = _tuned_val_metrics(val_result)
+            metrics["val_loss"] = val_result["val_loss"]
+            metrics["train_loss"] = train_loss
+
+            # Check improvement
+            val_f1 = metrics.get("f1", 0.0)
+            if val_f1 > best_val_f1:
+                best_val_f1 = val_f1
+                best_epoch = epoch
+                patience_counter = 0
+                best_metrics = metrics.copy()
+
+                ckpt_path = checkpoint_dir / "candidate.pt"
+                primary_state = ema.state_dict() if ema is not None else model.state_dict()
+                ckpt_meta = {
+                    "state_dict": primary_state,
+                    "num_classes": 2,
+                    "model_size": config.model_size,
+                }
+                if ema is not None:
+                    ckpt_meta["model_state_dict"] = model.state_dict()
+                    ckpt_meta["ema_decay"] = config.ema_decay
+                torch.save(ckpt_meta, ckpt_path)
+                best_checkpoint_path = str(ckpt_path)
+            else:
+                patience_counter += 1
+
+            # Progress callback
+            cb({
+                "type": "epoch_complete",
+                "stage": "training",
+                "status_text": f"Epoch {epoch + 1}/{config.max_epochs} complete (val F1 {val_f1:.3f})",
+                "epoch": epoch + 1,
+                "max_epochs": config.max_epochs,
+                "train_loss": train_loss,
+                "val_loss": val_result["val_loss"],
+                "val_f1": val_f1,
+                "val_precision": metrics.get("precision", 0.0),
+                "val_recall": metrics.get("recall", 0.0),
+                "val_auprc": metrics.get("auprc", 0.0),
+                "best_val_f1": best_val_f1,
+                "best_epoch": best_epoch + 1,
+            })
+
+            # Epoch-boundary backup: resume at epoch+1 (batch_in_epoch=0). Coherent
+            # point — scheduler stepped, best updated.
+            if coordinator.enabled:
+                coordinator.save(_collect_binary_state(epoch + 1), reason="periodic")
+
+            # Early stopping
+            if patience_counter >= config.patience:
+                logger.info("Early stopping at epoch %d (patience=%d)", epoch + 1, config.patience)
+                break
+
+        # Compare candidate checkpoint against existing best.pt on the CURRENT val
+        # set. This ensures a fair apples-to-apples comparison even when the val
+        # set has changed between training runs.
+        result = _binary_compare_promote(
+            config, best_checkpoint_path=best_checkpoint_path, existing_best=existing_best,
+            model=model, val_loader=val_loader, criterion=criterion, device=device, dtype=dtype,
+            best_val_f1=best_val_f1, best_metrics=best_metrics, best_epoch=best_epoch,
+            epochs_completed=epoch + 1, num_positives=num_positives, train_ds=train_ds,
+        )
+
+    # Successful completion: the backups are obsolete.
+    if coordinator.manager is not None:
+        coordinator.manager.delete_all()
+    return result
+
+
+def _binary_compare_promote(
+    config,
+    *,
+    best_checkpoint_path,
+    existing_best,
+    model,
+    val_loader,
+    criterion,
+    device,
+    dtype,
+    best_val_f1,
+    best_metrics,
+    best_epoch,
+    epochs_completed,
+    num_positives,
+    train_ds,
+) -> dict:
+    """Promote-if-better vs the incumbent and build the binary result dict.
+
+    Extracted verbatim from ``run_training`` so the trainer's exception-wrapped
+    body ends in a single call (Bitcrush ISSUE-0405)."""
+    optimal_threshold = 0.5
     if best_checkpoint_path:
         if existing_best.exists():
             # Re-evaluate the old best.pt on the current validation set
@@ -744,7 +945,7 @@ def run_training(
             )
 
     return {
-        "epochs_completed": epoch + 1,
+        "epochs_completed": epochs_completed,
         "best_epoch": best_epoch + 1,
         "best_val_f1": best_val_f1,
         "final_val_f1": best_metrics.get("f1"),

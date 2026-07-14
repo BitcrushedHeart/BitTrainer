@@ -27,6 +27,8 @@ class Stage(str, Enum):
     comparing = "comparing"
     saving = "saving"
     promoting = "promoting"
+    backing_up = "backing_up"
+    resuming = "resuming"
 
 
 class ProgressEmitter:

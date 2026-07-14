@@ -71,6 +71,14 @@ class MultiHeadTrainConfig:
     channels_last: bool = True
     progress_callback: Callable[[dict], None] | None = None
     band_classes: list[str] = field(default_factory=list)
+    # --- Backup / Pause / Resume (Bitcrush ISSUE-0405) ---
+    # backup_dir=None => NO backups written and NO resume attempted (legacy).
+    # backup_every_steps=0 => epoch-boundary backups only. resume_from points at
+    # a backup dir/file. dataloader_workers replaces the hardcoded num_workers=6.
+    backup_dir: str | None = None
+    backup_every_steps: int = 500
+    resume_from: str | None = None
+    dataloader_workers: int = 6
 
 
 def _get_dtype(name: str) -> torch.dtype:
@@ -121,6 +129,7 @@ def _train_one_epoch(
     step_callback=None,
     stop_now_event=None,
     memory_format=None,
+    boundary_hook=None,
 ) -> float:
     model.train()
     size_loss_fn, band_loss_fn, consistency_fn = criteria
@@ -154,11 +163,14 @@ def _train_one_epoch(
 
         total_loss += loss.item()
         num_batches += 1
+        boundary_signal = boundary_hook(num_batches) if boundary_hook is not None else None
         if step_callback is not None:
             now = time.monotonic()
             if now - _last >= 0.25 or num_batches == total_steps:
                 _last = now
                 step_callback(num_batches, total_steps, total_loss / num_batches)
+        if boundary_signal == "stop":
+            break
 
     return total_loss / max(num_batches, 1)
 
@@ -221,8 +233,18 @@ def run_multihead_training(
     progress_callback: Callable[[dict], None] | None = None,
     stop_event: object | None = None,
     stop_now_event: object | None = None,
+    pause_event: object | None = None,
 ) -> dict:
     from bittrainer.runtime import configure_cuda_backend, maybe_compile, prewarm_compile
+    from bittrainer.training_state import (
+        BackupCoordinator,
+        backup_on_exception,
+        capture_optimizer_aux_state,
+        make_fingerprint,
+        prime_optimizer_after_resume,
+        restore_optimizer_aux_state,
+        sanitize_for_backup,
+    )
 
     cb = progress_callback or config.progress_callback or (lambda _: None)
     device = torch.device(config.device)
@@ -232,6 +254,25 @@ def run_multihead_training(
     group_folder = Path(config.group_folder)
     checkpoint_dir = Path(config.checkpoint_dir) if config.checkpoint_dir else group_folder / "checkpoints"
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
+
+    coordinator = BackupCoordinator(
+        backup_dir=config.backup_dir, pause_event=pause_event,
+        backup_every_steps=config.backup_every_steps, cb=cb,
+    )
+    fingerprint = make_fingerprint(
+        class_names=list(config.size_classes), num_classes=len(config.size_classes),
+        max_epochs=config.max_epochs, multi_label=False, ordinal=True,
+        best_model_name=config.best_model_name, model_size=config.backbone_variant,
+    )
+    resume_state = (
+        coordinator.load_resume(fingerprint, resume_from=config.resume_from)
+        if config.resume_from else None
+    )
+
+    def _paused_result(cur_epoch: int, gstep: int, backup_path) -> dict:
+        bp = str(backup_path) if backup_path else None
+        cb({"type": "training_paused", "epoch": cur_epoch, "global_step": gstep, "backup_path": bp})
+        return {"paused": True, "backup_path": bp, "epoch": cur_epoch, "global_step": gstep}
 
     size_classes = config.size_classes
     maps = _build_maps(size_classes)
@@ -259,7 +300,10 @@ def run_multihead_training(
         apply_backbone_init(model.backbone, config.backbone_init)
         return model.to(device)
 
-    if not config.from_scratch and existing_best.exists():
+    if resume_state is not None:
+        model = _fresh_model()
+        model.load_state_dict(resume_state["model"])
+    elif not config.from_scratch and existing_best.exists():
         try:
             model = MultiHeadConvNeXt.from_checkpoint(str(existing_best), device=device)
             logger.info("Warm-starting multi-head model from %s", existing_best)
@@ -279,7 +323,10 @@ def run_multihead_training(
             x = x.contiguous(memory_format=memory_format)
         return x
 
-    if config.batch_size is not None and config.batch_size > 0:
+    if resume_state is not None:
+        eff_bs = int(resume_state["eff_bs"])
+        cb({"type": "autobatch", "batch_size": eff_bs, "resumed": True})
+    elif config.batch_size is not None and config.batch_size > 0:
         eff_bs = int(config.batch_size)
         cb({"type": "autobatch", "batch_size": eff_bs, "manual_override": True})
     else:
@@ -318,13 +365,15 @@ def run_multihead_training(
     ):
         fwd_model = model
 
+    _n_workers = max(0, int(config.dataloader_workers))
+    _lk: dict = {"num_workers": _n_workers, "pin_memory": (device.type == "cuda")}
+    if _n_workers > 0:
+        _lk.update(persistent_workers=True, prefetch_factor=4)
     train_loader = DataLoader(
-        train_ds, batch_size=eff_bs, shuffle=True, collate_fn=_collate, num_workers=6,
-        pin_memory=(device.type == "cuda"), persistent_workers=True, prefetch_factor=4,
+        train_ds, batch_size=eff_bs, shuffle=True, collate_fn=_collate, **_lk,
     )
     val_loader = DataLoader(
-        val_ds, batch_size=eff_bs, shuffle=False, collate_fn=_collate, num_workers=6,
-        pin_memory=(device.type == "cuda"), persistent_workers=True, prefetch_factor=4,
+        val_ds, batch_size=eff_bs, shuffle=False, collate_fn=_collate, **_lk,
     )
 
     best_qwk = -1.0
@@ -332,89 +381,152 @@ def run_multihead_training(
     patience_counter = 0
     best_checkpoint_path: str | None = None
     best_metrics: dict = {}
-    epoch = 0
+    global_step = 0
+    start_epoch = 0
 
-    for epoch in range(config.max_epochs):
-        if stop_now_event is not None and stop_now_event.is_set():
-            cb({"type": "stop_now", "epoch": epoch, "max_epochs": config.max_epochs})
-            break
-        if stop_event is not None and stop_event.is_set():
-            cb({"type": "graceful_stop", "epoch": epoch, "max_epochs": config.max_epochs})
-            break
-
-        def _on_step(step, total_steps, avg_loss):
-            cb({
-                "type": "step", "epoch": epoch + 1, "max_epochs": config.max_epochs,
-                "step": step, "total_steps": total_steps, "train_loss": round(avg_loss, 4),
-                "best_val_qwk": best_qwk if best_qwk >= 0 else None,
-            })
-
-        train_loss = _train_one_epoch(
-            fwd_model, train_loader, optimizer, criteria, maps, device, dtype,
-            step_callback=_on_step, stop_now_event=stop_now_event, memory_format=memory_format,
-        )
-        scheduler.step()
-
-        val_metrics = _evaluate(
-            fwd_model, val_loader, criteria, maps, num_bands, device, dtype, memory_format=memory_format,
-        )
-        val_metrics["train_loss"] = train_loss
-        combined_qwk = val_metrics["multi_head"]["qwk"]
-
-        if combined_qwk > best_qwk:
-            best_qwk = combined_qwk
-            best_epoch = epoch
-            patience_counter = 0
-            best_metrics = val_metrics.copy()
-            ckpt_path = checkpoint_dir / "candidate.pt"
-            model.save_checkpoint(str(ckpt_path), metadata={
-                "epoch": epoch + 1,
-                "band_qwk": val_metrics["band"]["qwk"],
-                "size_qwk": val_metrics["size"]["qwk"],
-                "multi_head_qwk": combined_qwk,
-            })
-            best_checkpoint_path = str(ckpt_path)
-        else:
-            patience_counter += 1
-
+    if resume_state is not None:
+        optimizer.load_state_dict(resume_state["optimizer"])
+        prime_optimizer_after_resume(optimizer)
+        restore_optimizer_aux_state(optimizer, resume_state.get("optimizer_aux"), device)
+        scheduler.load_state_dict(resume_state["scheduler"])
+        start_epoch = int(resume_state["epoch"])
+        global_step = int(resume_state.get("global_step", 0))
+        best = resume_state["best"]
+        best_qwk = best["best_qwk"]
+        best_epoch = best["best_epoch"]
+        patience_counter = best["patience_counter"]
+        best_checkpoint_path = best["best_checkpoint_path"]
+        best_metrics = dict(best.get("best_metrics") or {})
         cb({
-            "type": "epoch_complete", "epoch": epoch + 1, "max_epochs": config.max_epochs,
-            "train_loss": train_loss, "val_loss": val_metrics["val_loss"],
-            "band": val_metrics["band"], "size": val_metrics["size"],
-            "multi_head": val_metrics["multi_head"], "best_val_qwk": best_qwk, "best_epoch": best_epoch + 1,
+            "type": "training_resumed", "resumed_from": str(config.resume_from),
+            "epoch": start_epoch, "global_step": global_step, "best_val_qwk": best_qwk,
         })
 
-        if patience_counter >= config.patience:
-            logger.info("Early stopping at epoch %d", epoch + 1)
-            break
+    def _collect_state(cur_epoch: int) -> dict:
+        return {
+            "fingerprint": fingerprint,
+            "trainer": "multihead",
+            "epoch": cur_epoch,
+            "batch_in_epoch": 0,  # epoch-restart resume
+            "global_step": global_step,
+            "eff_bs": eff_bs,
+            "scheduler_t_max": config.max_epochs,
+            "model": {k: v.detach().cpu() for k, v in model.state_dict().items()},
+            "optimizer": optimizer.state_dict(),
+            "optimizer_aux": capture_optimizer_aux_state(optimizer),
+            "scheduler": scheduler.state_dict(),
+            "best": {
+                "best_qwk": best_qwk,
+                "best_epoch": best_epoch,
+                "patience_counter": patience_counter,
+                "best_checkpoint_path": best_checkpoint_path,
+                "best_metrics": sanitize_for_backup(best_metrics),
+            },
+        }
 
-    if best_checkpoint_path:
-        Path(best_checkpoint_path).replace(existing_best)
-        best_checkpoint_path = str(existing_best)
+    epoch = start_epoch - 1
+    _exc_epoch = start_epoch
+    with backup_on_exception(lambda: _collect_state(_exc_epoch), coordinator.manager, cb=cb):
+        for epoch in range(start_epoch, config.max_epochs):
+            _exc_epoch = epoch
+            if coordinator.paused:
+                path = coordinator.save(_collect_state(epoch), reason="pause")
+                return _paused_result(epoch, global_step, path)
+            if stop_now_event is not None and stop_now_event.is_set():
+                cb({"type": "stop_now", "epoch": epoch, "max_epochs": config.max_epochs})
+                break
+            if stop_event is not None and stop_event.is_set():
+                cb({"type": "graceful_stop", "epoch": epoch, "max_epochs": config.max_epochs})
+                break
 
-    band = best_metrics.get("band", {})
-    size = best_metrics.get("size", {})
-    multi = best_metrics.get("multi_head", {})
-    return {
-        "epochs_completed": epoch + 1,
-        "best_epoch": best_epoch + 1,
-        "checkpoint_path": best_checkpoint_path,
-        "total_images": total_samples,
-        "final_val_loss": best_metrics.get("val_loss"),
-        "band_classes": maps.band_vocab,
-        # Per-head + combined metrics (the issue's required validation figures).
-        "final_val_f1_band": band.get("f1"),
-        "final_val_qwk_band": band.get("qwk"),
-        "final_val_f1_size": size.get("f1"),
-        "final_val_qwk_size": size.get("qwk"),
-        "final_val_f1_multihead": multi.get("f1"),
-        "final_val_qwk_multihead": multi.get("qwk"),
-        # Mirror single-head keys so existing persistence keeps working.
-        "qwk": multi.get("qwk"),
-        "best_val_qwk": multi.get("qwk"),
-        "macro_f1": multi.get("f1"),
-        "final_val_macro_f1": multi.get("f1"),
-    }
+            def _on_step(step, total_steps, avg_loss):
+                cb({
+                    "type": "step", "epoch": epoch + 1, "max_epochs": config.max_epochs,
+                    "step": step, "total_steps": total_steps, "train_loss": round(avg_loss, 4),
+                    "best_val_qwk": best_qwk if best_qwk >= 0 else None,
+                })
+
+            def _boundary_hook(num_batches: int) -> str | None:
+                nonlocal global_step
+                global_step += 1
+                return coordinator.on_boundary(lambda: _collect_state(epoch), global_step)
+
+            train_loss = _train_one_epoch(
+                fwd_model, train_loader, optimizer, criteria, maps, device, dtype,
+                step_callback=_on_step, stop_now_event=stop_now_event, memory_format=memory_format,
+                boundary_hook=_boundary_hook,
+            )
+            if coordinator.paused:
+                return _paused_result(epoch, global_step, coordinator.last_backup_path)
+            scheduler.step()
+
+            val_metrics = _evaluate(
+                fwd_model, val_loader, criteria, maps, num_bands, device, dtype, memory_format=memory_format,
+            )
+            val_metrics["train_loss"] = train_loss
+            combined_qwk = val_metrics["multi_head"]["qwk"]
+
+            if combined_qwk > best_qwk:
+                best_qwk = combined_qwk
+                best_epoch = epoch
+                patience_counter = 0
+                best_metrics = val_metrics.copy()
+                ckpt_path = checkpoint_dir / "candidate.pt"
+                model.save_checkpoint(str(ckpt_path), metadata={
+                    "epoch": epoch + 1,
+                    "band_qwk": val_metrics["band"]["qwk"],
+                    "size_qwk": val_metrics["size"]["qwk"],
+                    "multi_head_qwk": combined_qwk,
+                })
+                best_checkpoint_path = str(ckpt_path)
+            else:
+                patience_counter += 1
+
+            cb({
+                "type": "epoch_complete", "epoch": epoch + 1, "max_epochs": config.max_epochs,
+                "train_loss": train_loss, "val_loss": val_metrics["val_loss"],
+                "band": val_metrics["band"], "size": val_metrics["size"],
+                "multi_head": val_metrics["multi_head"], "best_val_qwk": best_qwk, "best_epoch": best_epoch + 1,
+            })
+
+            if coordinator.enabled:
+                coordinator.save(_collect_state(epoch + 1), reason="periodic")
+
+            if patience_counter >= config.patience:
+                logger.info("Early stopping at epoch %d", epoch + 1)
+                break
+
+        if best_checkpoint_path:
+            Path(best_checkpoint_path).replace(existing_best)
+            best_checkpoint_path = str(existing_best)
+
+        band = best_metrics.get("band", {})
+        size = best_metrics.get("size", {})
+        multi = best_metrics.get("multi_head", {})
+        result = {
+            "epochs_completed": epoch + 1,
+            "best_epoch": best_epoch + 1,
+            "checkpoint_path": best_checkpoint_path,
+            "total_images": total_samples,
+            "final_val_loss": best_metrics.get("val_loss"),
+            "band_classes": maps.band_vocab,
+            # Per-head + combined metrics (the issue's required validation figures).
+            "final_val_f1_band": band.get("f1"),
+            "final_val_qwk_band": band.get("qwk"),
+            "final_val_f1_size": size.get("f1"),
+            "final_val_qwk_size": size.get("qwk"),
+            "final_val_f1_multihead": multi.get("f1"),
+            "final_val_qwk_multihead": multi.get("qwk"),
+            # Mirror single-head keys so existing persistence keeps working.
+            "qwk": multi.get("qwk"),
+            "best_val_qwk": multi.get("qwk"),
+            "macro_f1": multi.get("f1"),
+            "final_val_macro_f1": multi.get("f1"),
+        }
+
+    if coordinator.manager is not None:
+        coordinator.manager.delete_all()
+    return result
 
 
 class _Scaled(torch.nn.Module):

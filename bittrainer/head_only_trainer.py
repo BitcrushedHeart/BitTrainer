@@ -57,8 +57,15 @@ def run_head_only_training(
     progress_callback: Callable[[dict], None] | None = None,
     stop_event: Any | None = None,
     stop_now_event: Any | None = None,
+    pause_event: Any | None = None,
 ) -> dict:
-    """Train a cached-feature head probe and report per-class scores. Terminal."""
+    """Train a cached-feature head probe and report per-class scores. Terminal.
+
+    ``pause_event`` (Bitcrush ISSUE-0405) is accepted for signature uniformity
+    with the full trainers; head-only training has no backup/resume (out of
+    scope), so a set pause_event simply behaves like ``stop_now`` — the probe
+    finishes early and returns its partial result.
+    """
     from bittrainer.progress import ProgressEmitter
     from bittrainer.runtime import configure_cuda_backend
     from bittrainer.smart_cache import _noop_callback
@@ -76,6 +83,7 @@ def run_head_only_training(
         return bool(
             (stop_event is not None and stop_event.is_set())
             or (stop_now_event is not None and stop_now_event.is_set())
+            or (pause_event is not None and pause_event.is_set())
         )
 
     train_ds, val_ds, smart_cache, _bucket_counts = _prepare_datasets_and_cache(

@@ -177,3 +177,58 @@ class DynamicClassWeightController:
     def multipliers(self) -> dict[str, float]:
         """Current per-class multiplier, keyed by ``str(class_index)`` (for epoch_msg)."""
         return {str(c): float(self.multiplier[c]) for c in range(self.num_classes)}
+
+    def to_dict(self) -> dict:
+        """Serialise the full mutable controller state (plain floats/ints/lists).
+
+        Everything the between-epoch ``update`` reads or writes — the running
+        multiplier, per-class EMAs/peaks, stale/cooldown counters, the
+        adjustment tally, and the constructor knobs — so a resumed run's next
+        ``update`` behaves as if training had never stopped. The immutable
+        ``base_weights`` vector is intentionally NOT serialised; it is rebuilt
+        from the config on resume and passed to :meth:`from_dict`.
+        """
+        return {
+            "num_classes": self.num_classes,
+            "metric": self.metric,
+            "patience": self.patience,
+            "ema_decay": self.ema_decay,
+            "decay": self.decay,
+            "floor": self.floor,
+            "ceiling": self.ceiling,
+            "cooldown": self.cooldown_period,
+            "min_delta": self.min_delta,
+            "multiplier": list(self.multiplier),
+            "f1_ema": list(self._f1_ema),
+            "loss_ema": list(self._loss_ema),
+            "peak": list(self._peak),
+            "loss_at_peak": list(self._loss_at_peak),
+            "stale": list(self._stale),
+            "cooldown_state": list(self._cooldown),
+            "adjustments": self.adjustments,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict, base_weights: torch.Tensor) -> "DynamicClassWeightController":
+        """Reconstruct a controller from :meth:`to_dict` + the rebuilt base vector."""
+        ctrl = cls(
+            int(data["num_classes"]),
+            base_weights,
+            metric=data.get("metric", "val_f1"),
+            patience=int(data.get("patience", 2)),
+            ema_decay=float(data.get("ema_decay", 0.5)),
+            decay=float(data.get("decay", 0.8)),
+            floor=float(data.get("floor", 0.25)),
+            ceiling=float(data.get("ceiling", 1.0)),
+            cooldown=int(data.get("cooldown", 1)),
+            min_delta=float(data.get("min_delta", 0.005)),
+        )
+        ctrl.multiplier = list(data["multiplier"])
+        ctrl._f1_ema = list(data["f1_ema"])
+        ctrl._loss_ema = list(data["loss_ema"])
+        ctrl._peak = list(data["peak"])
+        ctrl._loss_at_peak = list(data["loss_at_peak"])
+        ctrl._stale = list(data["stale"])
+        ctrl._cooldown = list(data["cooldown_state"])
+        ctrl.adjustments = int(data["adjustments"])
+        return ctrl

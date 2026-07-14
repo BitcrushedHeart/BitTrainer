@@ -47,3 +47,28 @@ class ModelEMA:
 
     def load_state_dict(self, state_dict: dict) -> None:
         self.module.load_state_dict(state_dict)
+
+    def full_state_dict(self) -> dict:
+        """EMA weights *plus* the adaptive-decay bookkeeping.
+
+        ``state_dict()`` alone loses ``n_updates``, which the warmup schedule in
+        ``_effective_decay`` depends on — restoring it would reset the effective
+        decay back to the early, fast-tracking regime and let a resumed EMA jump
+        toward the live weights. Used by the training-state backup so a resumed
+        run continues the EMA exactly where it left off.
+        """
+        return {
+            "state_dict": self.module.state_dict(),
+            "n_updates": self.n_updates,
+            "decay": self.decay,
+            "warmup": self.warmup,
+        }
+
+    def load_full_state_dict(self, data: dict) -> None:
+        """Restore weights and adaptive-decay bookkeeping from :meth:`full_state_dict`."""
+        self.module.load_state_dict(data["state_dict"])
+        self.n_updates = int(data.get("n_updates", self.n_updates))
+        if "decay" in data:
+            self.decay = float(data["decay"])
+        if "warmup" in data:
+            self.warmup = int(data["warmup"])
