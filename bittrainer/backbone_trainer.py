@@ -37,6 +37,7 @@ import inspect
 import json
 import logging
 import threading
+from functools import partial
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
@@ -44,14 +45,76 @@ from typing import Callable
 import torch
 import torch.nn as nn
 from PIL import Image
+from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader, Dataset
 
 from torchvision import transforms
 
 from bittrainer.backbone_init import apply_backbone_init, wants_timm_pretrained
+from bittrainer.ema import ModelEMA
 from bittrainer.model import create_model
+from bittrainer.training_state import (
+    BackupCoordinator,
+    capture_rng_states,
+    make_fingerprint,
+    paused_result,
+    restore_rng_states,
+    sanitize_for_backup,
+)
 
 logger = logging.getLogger(__name__)
+
+# AMP autocast dtype aliases (Bitcrush ISSUE-0476). float16 is accepted but,
+# like the binary trainer, no GradScaler is wired — bfloat16 is the tested
+# default and needs none; float16 on CUDA without a scaler can underflow.
+_AMP_DTYPES = {
+    "bfloat16": torch.bfloat16,
+    "bf16": torch.bfloat16,
+    "float16": torch.float16,
+    "fp16": torch.float16,
+    "half": torch.float16,
+    "float32": torch.float32,
+    "fp32": torch.float32,
+}
+
+
+def _amp_settings(config: dict) -> tuple[bool, torch.dtype]:
+    """Resolve (enabled, autocast dtype) from the training config.
+
+    AMP defaults ON with bfloat16 (matches the binary trainer). Disabled when
+    ``use_amp`` is false or the resolved dtype is float32.
+    """
+    name = str(config.get("amp_dtype") or "bfloat16").lower()
+    dtype = _AMP_DTYPES.get(name, torch.bfloat16)
+    enabled = bool(config.get("use_amp", True)) and dtype != torch.float32
+    return enabled, dtype
+
+
+def _build_scheduler(optimizer, config: dict, *, epochs: int):
+    """Cosine LR schedule (default ON), stepped once per epoch. ``None`` when
+    ``use_cosine`` is disabled (plain constant-LR AdamW, the legacy behaviour)."""
+    if not config.get("use_cosine", True):
+        return None
+    return CosineAnnealingLR(optimizer, T_max=max(1, int(epochs)))
+
+
+def _backbone_fingerprint(vocab: "_Vocab", model_size: str, epochs: int) -> dict:
+    """Resume-compatibility identity for a backbone run.
+
+    Folds the label space (concepts + multi-class groups) into the fingerprint
+    so a resume whose dataset changed head layout starts fresh rather than
+    crashing on a shape mismatch.
+    """
+    names = [f"binary/{c}" for c in vocab.concepts] + [f"group/{g}" for g in vocab.groups]
+    return make_fingerprint(
+        class_names=names,
+        num_classes=len(names),
+        max_epochs=int(epochs),
+        multi_label=True,
+        ordinal=False,
+        best_model_name="backbone_candidate",
+        model_size=str(model_size),
+    )
 
 _POSITIVE_LABELS = frozenset({"positive", "explicit_positive", "1", "true"})
 _NEGATIVE_LABELS = frozenset(
@@ -210,6 +273,21 @@ class _MultiTaskHeads(nn.Module):
         )
 
 
+class _BackboneWithHeads(nn.Module):
+    """Backbone + multi-task heads as one module.
+
+    Bundling them lets a single :class:`~bittrainer.ema.ModelEMA` track every
+    trainable parameter, and lets the backup envelope carry one ``state_dict``
+    (Bitcrush ISSUE-0476). The backbone alone is what the candidate checkpoint
+    finally serialises.
+    """
+
+    def __init__(self, backbone: nn.Module, heads: _MultiTaskHeads):
+        super().__init__()
+        self.backbone = backbone
+        self.heads = heads
+
+
 def _batch_loss(
     features: torch.Tensor,
     heads: _MultiTaskHeads,
@@ -248,13 +326,18 @@ def _evaluate(
     loader: DataLoader,
     vocab: _Vocab,
     device: torch.device,
+    *,
+    amp_enabled: bool = False,
+    amp_dtype: torch.dtype = torch.bfloat16,
 ) -> dict[str, float]:
     backbone.eval()
     heads.eval()
     correct: dict[str, int] = {}
     total: dict[str, int] = {}
     for images, binary_labels, group_labels in loader:
-        features = backbone(images.to(device))
+        with torch.amp.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_enabled):
+            features = backbone(images.to(device))
+        features = features.float()  # heads run in fp32; avoids autocast dtype mismatch
         for concept, head in heads.binary.items():
             rows = [i for i, labels in enumerate(binary_labels) if concept in labels]
             if not rows:
@@ -297,6 +380,7 @@ def _train_backbone(
     request: dict,
     emit: Callable[[dict], None],
     stop: threading.Event,
+    pause_event: object | None = None,
 ) -> dict:
     config = dict(request.get("training_config") or {})
     image_size = int(config.get("image_size") or 384)
@@ -373,53 +457,212 @@ def _train_backbone(
         **loader_kwargs,
     )
 
-    optimizer = torch.optim.AdamW(
-        list(backbone.parameters()) + list(heads.parameters()), lr=learning_rate
+    model = _BackboneWithHeads(backbone, heads).to(device)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
+    scheduler = _build_scheduler(optimizer, config, epochs=epochs)
+    amp_enabled, amp_dtype = _amp_settings(config)
+    ema = (
+        ModelEMA(model, decay=float(config.get("ema_decay") or 0.9999))
+        if config.get("use_ema", True)
+        else None
     )
-    backbone.train()
-    heads.train()
+    patience = int(config.get("patience") or config.get("early_stopping_patience") or 0)
+
+    # --- Backup / Pause / Resume (Bitcrush ISSUE-0405 machinery) ---
+    fingerprint = _backbone_fingerprint(
+        vocab, request.get("convnextv2_size") or "nano", epochs
+    )
+    coordinator = BackupCoordinator(
+        backup_dir=config.get("backup_dir"),
+        backup_every_steps=int(config.get("backup_every_steps") or 0),
+        pause_event=pause_event,
+        cb=emit,
+    )
+    resume_from = config.get("resume_from")
+    resume_state = (
+        coordinator.load_resume(fingerprint, resume_from=resume_from) if resume_from else None
+    )
 
     step = 0
+    start_epoch = 0
+    best_score = -1.0
+    best_epoch = 0
+    patience_counter = 0
+    best_metrics: dict = {}
+    best_backbone_state: dict | None = None
+
+    if resume_state is not None:
+        model.load_state_dict(resume_state["model"])
+        optimizer.load_state_dict(resume_state["optimizer"])
+        if scheduler is not None and resume_state.get("scheduler") is not None:
+            scheduler.load_state_dict(resume_state["scheduler"])
+        if ema is not None and resume_state.get("ema") is not None:
+            ema.load_full_state_dict(resume_state["ema"])
+        restore_rng_states(resume_state.get("rng"), device)
+        start_epoch = int(resume_state.get("epoch", 0))
+        step = int(resume_state.get("global_step", 0))
+        b = resume_state.get("best") or {}
+        best_score = float(b.get("score", -1.0))
+        best_epoch = int(b.get("epoch", 0))
+        patience_counter = int(b.get("patience", 0))
+        best_metrics = dict(b.get("metrics") or {})
+        best_backbone_state = b.get("backbone_state")
+        emit({
+            "type": "training_resumed",
+            "run_id": request.get("run_id"),
+            "resumed_from": str(resume_from),
+            "epoch": start_epoch,
+            "global_step": step,
+            "best_score": best_score,
+        })
+
+    model.train()
+
+    def _eval_modules():
+        src = ema.module if ema is not None else model
+        return src.backbone, src.heads
+
+    def _collect(cur_epoch: int) -> dict:
+        return {
+            "fingerprint": fingerprint,
+            "trainer": "backbone",
+            "epoch": cur_epoch,
+            "batch_in_epoch": 0,
+            "global_step": step,
+            "eff_bs": batch_size,
+            "model": {k: v.detach().cpu() for k, v in model.state_dict().items()},
+            "optimizer": optimizer.state_dict(),
+            "scheduler": scheduler.state_dict() if scheduler is not None else None,
+            "ema": ema.full_state_dict() if ema is not None else None,
+            "rng": capture_rng_states(device),
+            "best": {
+                "score": best_score,
+                "epoch": best_epoch,
+                "patience": patience_counter,
+                "metrics": sanitize_for_backup(best_metrics),
+                "backbone_state": best_backbone_state,
+            },
+        }
+
+    _paused_result = partial(paused_result, emit)
+
+    validation_metrics: dict = dict(best_metrics)
+    validation_score = best_score if best_score >= 0 else 0.0
+    epochs_completed = start_epoch
     steps_exhausted = max_steps is not None and int(max_steps) <= 0
-    for epoch in range(epochs):
-        if steps_exhausted:
-            break
-        epoch_loss = 0.0
-        epoch_batches = 0
-        for images, binary_labels, group_labels in train_loader:
-            if stop.is_set():
-                raise BackboneTrainingCancelled
-            if max_steps is not None and step >= int(max_steps):
-                steps_exhausted = True
+
+    with coordinator.backup_on_exception(lambda: _collect(epochs_completed)):
+        for epoch in range(start_epoch, epochs):
+            if steps_exhausted:
                 break
-            optimizer.zero_grad(set_to_none=True)
-            features = backbone(images.to(device))
-            loss = _batch_loss(features, heads, binary_labels, group_labels, device)
-            if loss is None:
-                continue
-            loss.backward()
-            optimizer.step()
-            step += 1
-            epoch_loss += float(loss.detach())
-            epoch_batches += 1
-        progress(
-            "training",
-            f"Epoch {epoch + 1}/{epochs}",
-            epoch=epoch + 1,
-            epochs=epochs,
-            steps=step,
-            loss=epoch_loss / max(epoch_batches, 1),
-        )
+            if coordinator.paused:
+                path = coordinator.save(_collect(epoch), reason="pause")
+                return _paused_result(
+                    epoch, step, path, run_id=request.get("run_id")
+                )
+            model.train()
+            epoch_loss = 0.0
+            epoch_batches = 0
+            paused_mid = False
+            for images, binary_labels, group_labels in train_loader:
+                if stop.is_set():
+                    raise BackboneTrainingCancelled
+                if max_steps is not None and step >= int(max_steps):
+                    steps_exhausted = True
+                    break
+                optimizer.zero_grad(set_to_none=True)
+                with torch.amp.autocast(
+                    device_type=device.type, dtype=amp_dtype, enabled=amp_enabled
+                ):
+                    features = model.backbone(images.to(device))
+                    loss = _batch_loss(
+                        features.float(), model.heads, binary_labels, group_labels, device
+                    )
+                if loss is None:
+                    continue
+                loss.backward()
+                optimizer.step()
+                if ema is not None:
+                    ema.update(model)
+                step += 1
+                epoch_loss += float(loss.detach())
+                epoch_batches += 1
+                if coordinator.on_boundary(lambda: _collect(epoch), step) == "stop":
+                    paused_mid = True
+                    break
+            if paused_mid:
+                return _paused_result(
+                    epoch, step, coordinator.last_backup_path, run_id=request.get("run_id")
+                )
+            if scheduler is not None:
+                scheduler.step()
+
+            # Validate on EMA weights (they generalise better on small datasets).
+            eval_backbone, eval_heads = _eval_modules()
+            validation_metrics = (
+                _evaluate(
+                    eval_backbone, eval_heads, val_loader, vocab, device,
+                    amp_enabled=amp_enabled, amp_dtype=amp_dtype,
+                )
+                if val_samples
+                else {}
+            )
+            validation_score = (
+                sum(validation_metrics.values()) / len(validation_metrics)
+                if validation_metrics
+                else 0.0
+            )
+            epochs_completed = epoch + 1
+
+            if val_samples:
+                if validation_score > best_score:
+                    best_score = validation_score
+                    best_epoch = epoch
+                    best_metrics = dict(validation_metrics)
+                    best_backbone_state = {
+                        k: v.detach().to("cpu") for k, v in eval_backbone.state_dict().items()
+                    }
+                    patience_counter = 0
+                else:
+                    patience_counter += 1
+
+            progress(
+                "training",
+                f"Epoch {epoch + 1}/{epochs}",
+                epoch=epoch + 1,
+                epochs=epochs,
+                steps=step,
+                loss=epoch_loss / max(epoch_batches, 1),
+                validation_score=validation_score,
+                best_score=best_score if best_score >= 0 else None,
+                best_epoch=best_epoch + 1 if best_score >= 0 else None,
+            )
+
+            if coordinator.enabled:
+                coordinator.save(_collect(epoch + 1), reason="periodic")
+
+            if patience > 0 and val_samples and patience_counter >= patience:
+                progress(
+                    "training",
+                    f"Early stopping at epoch {epoch + 1} (patience {patience})",
+                    early_stop=True,
+                    epoch=epoch + 1,
+                )
+                break
+
+    # Successful completion: backups are obsolete.
+    coordinator.delete_backups()
 
     progress("validating", "Validating backbone candidate")
-    validation_metrics = (
-        _evaluate(backbone, heads, val_loader, vocab, device) if val_samples else {}
-    )
-    validation_score = (
-        sum(validation_metrics.values()) / len(validation_metrics)
-        if validation_metrics
-        else 0.0
-    )
+    if val_samples and best_backbone_state is not None:
+        validation_metrics = best_metrics
+        validation_score = best_score
+    else:
+        # No validation signal: serialise the final (EMA) backbone weights.
+        eval_backbone, _ = _eval_modules()
+        best_backbone_state = {
+            k: v.detach().to("cpu") for k, v in eval_backbone.state_dict().items()
+        }
 
     candidate_path = Path(request["candidate_checkpoint_path"])
     candidate_path.parent.mkdir(parents=True, exist_ok=True)
@@ -449,7 +692,7 @@ def _train_backbone(
     }
     from safetensors.torch import save_file
 
-    state = {key: value.detach().to("cpu") for key, value in backbone.state_dict().items()}
+    state = {key: value.detach().to("cpu") for key, value in best_backbone_state.items()}
     save_file(
         state,
         str(candidate_path),
@@ -468,6 +711,8 @@ def _train_backbone(
         "validation_metrics": validation_metrics,
         "heads": request.get("heads") or {},
         "release_blocking": bool(request.get("release_blocking")),
+        "epochs_completed": int(epochs_completed),
+        "best_epoch": int(best_epoch + 1) if val_samples else int(epochs_completed),
     }
 
 
@@ -478,8 +723,15 @@ def _train_backbone(
 _DONE = object()
 
 
-async def run_backbone_training(request: dict, progress_callback=None) -> dict:
-    """Train a backbone candidate; see module docstring for the contract."""
+async def run_backbone_training(request: dict, progress_callback=None, *, pause_event=None) -> dict:
+    """Train a backbone candidate; see module docstring for the contract.
+
+    ``pause_event`` (Bitcrush ISSUE-0405/0476) is an optional threading/mp event.
+    When set, the training loop backs up its state and returns
+    ``{"paused": True, ...}``. Combined with ``training_config``'s ``backup_dir``
+    / ``resume_from`` a later call rebuilds and resumes the run. All new config
+    lives on ``training_config``, so the Engine wire contract stays additive.
+    """
     loop = asyncio.get_running_loop()
     queue: asyncio.Queue = asyncio.Queue()
     stop = threading.Event()
@@ -500,7 +752,7 @@ async def run_backbone_training(request: dict, progress_callback=None) -> dict:
 
     forwarder = asyncio.create_task(forward())
     try:
-        return await asyncio.to_thread(_train_backbone, request, emit, stop)
+        return await asyncio.to_thread(_train_backbone, request, emit, stop, pause_event)
     except asyncio.CancelledError:
         stop.set()
         raise
