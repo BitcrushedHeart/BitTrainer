@@ -196,8 +196,14 @@ class EmbeddingCache:
         batch_size: int = 64,
         progress_cb: Callable[[int, int], None] | None = None,
         stop_check: Callable[[], bool] | None = None,
+        prune: bool = True,
     ) -> dict:
         """Build any missing pooled vectors for *samples* under this backbone era.
+
+        ``prune=False`` skips the sibling-era reclaim — REQUIRED when several
+        eras must coexist deliberately (the resolution probe builds one small
+        era per candidate resolution and must not delete the production era or
+        its own previous candidates; the next real training run prunes losers).
 
         Returns ``{"built": n, "reused": n, "total": n}``.
         """
@@ -205,7 +211,8 @@ class EmbeddingCache:
         # Establishing this era invalidates any other backbone-hash era under the
         # same cache root — reclaim them now so the cache can't accumulate dead
         # vectors for hashes that will never recur.
-        self.prune_other_eras()
+        if prune:
+            self.prune_other_eras()
         backbone.eval()
 
         by_hash: dict[str, dict] = {}
