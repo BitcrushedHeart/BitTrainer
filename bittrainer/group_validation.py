@@ -182,6 +182,7 @@ def ordinal_decode(
     *,
     none_index: int = -1,
     cut_points: list[float] | np.ndarray | None = None,
+    confidence_gate: float = 0.5,
 ) -> list[int]:
     """Decode softmax probabilities to class labels under the QWK-optimal rule.
 
@@ -192,16 +193,23 @@ def ordinal_decode(
         argmin_k  sum_j p_j (k - j)**2  =  round(sum_j j * p_j)  =  round(E[j])
 
     i.e. the **rounded expected ordinal index**, not ``argmax``. When the
-    posterior is even slightly diffuse (always, at real dataset sizes) the mean
-    and the mode diverge and rounding the mean scores strictly higher QWK.
+    posterior is even slightly diffuse the mean and the mode diverge and
+    rounding the mean scores higher QWK — but only ambiguity justifies that
+    (ISSUE-0540): when one real class holds ``confidence_gate`` or more of the
+    renormalised ordinal mass, argmax is authoritative and no fitted boundary
+    may override it. The EV + cut-point decode only decides the sub-gate rows.
+    Because :func:`find_ordinal_cut_points` scores candidates through this
+    function, boundaries are fitted under the same gate.
 
     ``__none__`` is off the ordinal scale: samples whose overall ``argmax`` is
     ``none_index`` are decoded as ``__none__`` (preserving the tuned none-bias
-    gate), everything else is decoded by expected value over the real classes.
+    gate), everything else is decoded over the real classes.
 
     ``cut_points`` are the ``len(real) - 1`` ascending boundaries on ``E[j]``
-    (see :func:`find_ordinal_cut_points`). When ``None`` (or malformed) the
-    midpoints between consecutive real indices are used — plain round-to-nearest.
+    (see :func:`find_ordinal_cut_points`). ``None`` (or malformed) means the
+    checkpoint shipped no fitted decode — plain argmax, matching what selection
+    scored (`_finalise_ordinal_decode` only persists cut-points that beat
+    argmax, so callers need no branch of their own).
 
     Returns predictions in the original full class-index space, so every
     downstream consumer is unchanged.
@@ -218,10 +226,6 @@ def ordinal_decode(
         return argmax_all.astype(int).tolist()
 
     real_arr = np.asarray(real_indices, dtype=np.float64)
-    real_probs = arr[:, real_indices]
-    real_sum = real_probs.sum(axis=1, keepdims=True)
-    norm = real_probs / np.clip(real_sum, 1e-12, None)
-    ev = (norm * real_arr[None, :]).sum(axis=1)  # E[j] over real classes
 
     boundaries = None
     if cut_points is not None:
@@ -229,13 +233,25 @@ def ordinal_decode(
         if cand.ndim == 1 and cand.shape[0] == len(real_indices) - 1:
             boundaries = cand
     if boundaries is None:
-        boundaries = (real_arr[:-1] + real_arr[1:]) / 2.0
+        # No shipped decode => argmax (the contract every caller assumes).
+        decoded = argmax_all.astype(np.int64)
+    else:
+        real_probs = arr[:, real_indices]
+        real_sum = real_probs.sum(axis=1, keepdims=True)
+        norm = real_probs / np.clip(real_sum, 1e-12, None)
+        ev = (norm * real_arr[None, :]).sum(axis=1)  # E[j] over real classes
 
-    # Number of boundaries each E[j] exceeds => position within real_indices.
-    # side="right" rounds the half-integer boundary up, matching round-half-up.
-    pos = np.searchsorted(boundaries, ev, side="right")
-    pos = np.clip(pos, 0, len(real_indices) - 1)
-    decoded = real_arr[pos].astype(np.int64)
+        # Number of boundaries each E[j] exceeds => position within real_indices.
+        # side="right" rounds the half-integer boundary up, matching round-half-up.
+        pos = np.searchsorted(boundaries, ev, side="right")
+        pos = np.clip(pos, 0, len(real_indices) - 1)
+        decoded = real_arr[pos].astype(np.int64)
+
+        # Confidence gate: a majority-of-ordinal-mass class is decoded as
+        # itself, whatever the boundaries say.
+        real_argmax = real_arr[norm.argmax(axis=1)].astype(np.int64)
+        confident = norm.max(axis=1) >= confidence_gate
+        decoded = np.where(confident, real_argmax, decoded)
 
     if 0 <= none_index < num_classes:
         decoded = np.where(argmax_all == none_index, none_index, decoded)

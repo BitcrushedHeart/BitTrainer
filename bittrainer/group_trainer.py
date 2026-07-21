@@ -1264,10 +1264,9 @@ def _metrics_from_logits(
     cut_points: list[float] | None = None,
 ) -> dict:
     probs = torch.softmax(logits.float(), dim=1)
-    if config.ordinal and cut_points is not None:
-        # Shipped ordinal decode: round E[j] at the fitted cut-points. Without
-        # cut-points we stay on argmax (the unbiased mode), matching per-epoch
-        # selection — raw round-to-nearest E[j] is biased inward at the edges.
+    if config.ordinal:
+        # Shipped ordinal decode: confidence-gated E[j] at the fitted
+        # cut-points; cut_points=None decodes as argmax inside (ISSUE-0540).
         preds = ordinal_decode(
             probs.cpu().numpy(), none_index=none_index, cut_points=cut_points,
         )

@@ -18,19 +18,23 @@ from bittrainer.group_validation import (
 
 
 def test_ev_decode_beats_argmax_on_diffuse_posterior():
-    """A skewed-but-diffuse posterior: argmax misses, E[j] lands on the truth."""
+    """A skewed-but-diffuse posterior: argmax misses, E[j] lands on the truth.
+
+    Since ISSUE-0540 the EV decode only runs with shipped cut-points (None
+    means argmax), so the round-to-nearest midpoints are passed explicitly.
+    """
     # True class is 2 (middle). Mode is 1, but mass leans high -> E[j] ~ 1.7.
     probs = np.array([[0.10, 0.35, 0.30, 0.25]])
     assert int(np.argmax(probs)) == 1
-    assert ordinal_decode(probs, none_index=-1) == [2]
+    assert ordinal_decode(probs, none_index=-1, cut_points=[0.5, 1.5, 2.5]) == [2]
 
 
 def test_ev_decode_matches_argmax_when_confident():
-    """Sharp posteriors: E[j] rounds to the mode, decode == argmax."""
+    """Sharp posteriors: gated to the mode, decode == argmax."""
     probs = np.array(
         [[0.90, 0.05, 0.03, 0.02], [0.02, 0.03, 0.05, 0.90]]
     )
-    assert ordinal_decode(probs, none_index=-1) == [0, 3]
+    assert ordinal_decode(probs, none_index=-1, cut_points=[0.5, 1.5, 2.5]) == [0, 3]
 
 
 def test_tuned_decode_never_worse_than_argmax_on_a_batch():
@@ -68,9 +72,9 @@ def test_none_gate_preserved():
 
 
 def test_malformed_cut_points_fall_back():
-    """Wrong-length cut-points are ignored (round-to-nearest), never crash."""
+    """Wrong-length cut-points are ignored (argmax, ISSUE-0540), never crash."""
     probs = np.array([[0.10, 0.35, 0.30, 0.25]])
-    assert ordinal_decode(probs, none_index=-1, cut_points=[1.0]) == [2]
+    assert ordinal_decode(probs, none_index=-1, cut_points=[1.0]) == [1]
 
 
 def test_fewer_than_two_real_classes_is_argmax():
