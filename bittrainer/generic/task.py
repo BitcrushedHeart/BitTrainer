@@ -6,11 +6,51 @@ resume / best / patience mechanics, and finalisation. Everything trainer-specifi
 (the group loss zoo, SWA / greedy-soup / DCW, skin-tone dual-view scoring,
 promotion) lives behind the :class:`TrainingTask` hooks the core calls.
 
-This step migrates only the group trainer; the binary / head-only / multihead /
-dual-branch trainers keep their own loops for now and move onto ``TrainingTask``
-later. The hook surface is therefore sized for those future tasks: the core never
-branches on a task type, and every group-specific richness rides in a hook
-(``on_epoch_end``, ``finalize``, ``collect_extra_state``).
+All five trainers now ride this seam — group, head-only, binary, backbone,
+multihead and dual-branch — each a thin ``run_*`` wrapper over
+``GenericTrainer().run(SomeTask(cfg))``. The core never branches on a task type;
+every trainer-specific richness rides in a hook (``on_epoch_end``, ``finalize``,
+``collect_extra_state``, ``on_epoch_start``).
+
+Adding a new task
+-----------------
+Subclass :class:`TrainingTask`, set ``trainer_name`` (this becomes the backup
+envelope's ``trainer`` tag and must stay stable across versions), and implement
+the hooks. :meth:`GenericTrainer.run` calls them in this order (see its docstring
+for the authoritative list):
+
+1. :meth:`make_context` — build the :class:`TaskContext` (emitter, device/dtype,
+   checkpoint dir, events). Use a no-op ``.stage`` emitter if the trainer only
+   emits raw progress frames.
+2. :meth:`fingerprint_init` — populate ``ctx.coordinator`` / ``ctx.fingerprint`` /
+   ``ctx.resume_state`` via ``training_state.init_backup`` (or an inert
+   ``BackupCoordinator(backup_dir=None)`` for a task with no backup/resume).
+3. :meth:`loop_spec` — max_epochs / patience / selection min-delta.
+4. :meth:`prepare_data` — datasets + cache, stored on the task.
+5. :meth:`create_model` — warm-start (fresh) or rebuild-and-load (resume).
+6. :meth:`pre_loop` — fresh-run-only warmup / sweeps (default no-op).
+7. :meth:`resolve_batch_size` — manual / resumed / autobatch probe.
+8. :meth:`setup_training` — class-balance / losses / EMA-SWA setup (default no-op).
+9. :meth:`create_optimizer` — return ``(optimizer, scheduler, scheduler_t_max)``;
+   also build any compiled-forward wrapper and restore optimizer state on resume.
+10. On resume only: :meth:`restore_resume_extra` then :meth:`resumed_message`.
+
+Then, per epoch: :meth:`reshuffle` → :meth:`build_loaders` →
+:meth:`on_epoch_start` (top-of-epoch reshape, e.g. binary's unfreeze; return a
+rebuilt optimizer tuple or None) → :meth:`make_step_callback` →
+:meth:`train_epoch` → :meth:`on_after_train` → :meth:`validate` →
+:meth:`selection_score` → (on improvement) :meth:`save_candidate` →
+:meth:`on_epoch_end` → :meth:`epoch_message` → :meth:`collect_extra_state`
+(folded into the epoch-boundary backup). Finally :meth:`finalize` builds the
+result dict (promotion, SWA/soup, bespoke result assembly).
+
+Only ``make_context`` / ``fingerprint_init`` / ``loop_spec`` / ``prepare_data`` /
+``create_model`` / ``resolve_batch_size`` / ``create_optimizer`` /
+``build_loaders`` / ``train_epoch`` / ``validate`` / ``selection_score`` /
+``save_candidate`` / ``finalize`` are abstract; the rest have no-op defaults so a
+simple task stays short. Keep trainer-specific run-loop helpers in the legacy
+trainer module and reach them through a module alias so existing monkeypatch
+seams keep firing.
 """
 
 from __future__ import annotations
