@@ -84,6 +84,18 @@ class BackboneTask(TrainingTask):
         self.use_cosine = bool(c.get("use_cosine", True))
         self.amp_enabled, self.amp_dtype = bb._amp_settings(c)
 
+        # Sampling layer (Bitcrush ISSUE-0545/0546) — see bb._plan_epoch_samples.
+        self.neg_pos_ratio = float(c.get("neg_pos_ratio", 5.0))
+        self.label_policy = dict(c.get("label_policy") or {})
+        self.use_pos_weight = bool(c.get("use_pos_weight", True))
+        raw_positive_cap = c.get("max_positives_per_class")
+        self.positive_cap = 1000 if raw_positive_cap is None else int(raw_positive_cap)
+        self.oversample_positives = bool(c.get("oversample_positives", True))
+        self.min_positive_threshold = int(c.get("min_positive_threshold") or 30)
+        self.max_oversample_factor = float(c.get("max_oversample_factor") or 4.0)
+        self.sampling_seed = int(c.get("sampling_seed") or 0)
+        self._pos_weight: dict[str, float] | None = None
+
         # Populated across the lifecycle hooks.
         self.vocab: bb._Vocab | None = None
         self.train_samples: list = []
@@ -197,7 +209,23 @@ class BackboneTask(TrainingTask):
         )
         return LoopSpec(max_epochs=self.epochs, patience=eff_patience, selection_min_delta=0.0)
 
+    def _plan_epoch(self, epoch: int):
+        return bb._plan_epoch_samples(
+            self.train_samples,
+            self.vocab,
+            epoch,
+            seed=self.sampling_seed,
+            neg_pos_ratio=self.neg_pos_ratio,
+            label_policy=self.label_policy,
+            positive_cap=self.positive_cap,
+            min_positive_threshold=self.min_positive_threshold if self.oversample_positives else 0,
+            max_oversample_factor=self.max_oversample_factor,
+        )
+
     def prepare_data(self, ctx: TaskContext) -> None:
+        # Epoch-0 plan preview: the planner is deterministic, so these stats are
+        # exactly what the first epoch will train on.
+        _preview, plan_stats = self._plan_epoch(0)
         self._emit(
             "preparing",
             f"Preparing backbone training on {self._unique_images} unique images "
@@ -207,6 +235,7 @@ class BackboneTask(TrainingTask):
             unique_images=self._unique_images,
             concepts=len(self.vocab.concepts),
             groups=len(self.vocab.groups),
+            sampling=plan_stats,
         )
 
     def create_model(self, ctx: TaskContext, resume_state: dict | None):
@@ -275,8 +304,13 @@ class BackboneTask(TrainingTask):
                 bb._BackboneDataset(self.val_samples, bb._val_transform(self.image_size)),
                 shuffle=False, **loader_kwargs,
             )
+        # Per-epoch label plan (ISSUE-0545/0546): fresh negative draw each epoch
+        # sweeps the full negative pool over training without ever concentrating
+        # it; validation samples stay uncapped and masked-unknown.
+        epoch_samples, plan_stats = self._plan_epoch(epoch)
+        self._pos_weight = bb._head_pos_weights(plan_stats) if self.use_pos_weight else None
         train_loader = DataLoader(
-            bb._BackboneDataset(self.train_samples, bb._train_transform(self.image_size)),
+            bb._BackboneDataset(epoch_samples, bb._train_transform(self.image_size)),
             shuffle=True, **loader_kwargs,
         )
         # Backbone resume is epoch-restart: no schedule replay, no partial start.
@@ -300,7 +334,8 @@ class BackboneTask(TrainingTask):
             ):
                 features = model.backbone(images.to(device))
                 loss = bb._batch_loss(
-                    features.float(), model.heads, binary_labels, group_labels, device
+                    features.float(), model.heads, binary_labels, group_labels, device,
+                    pos_weight=self._pos_weight,
                 )
             if loss is None:
                 continue

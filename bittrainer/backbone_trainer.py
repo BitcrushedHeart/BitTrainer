@@ -13,7 +13,30 @@ progress_callback=...)`` with a request assembled from the suite DB:
         "dataset_snapshot_id" / "content_hash_index_id": str,
         "heads": {...},                     # head status block (echoed back)
         "training_config": {image_size, batch_size, epochs, max_steps,
-                            learning_rate, validation_split, device?, ...},
+                            learning_rate, validation_split, device?,
+                            # Sampling layer (Bitcrush ISSUE-0545/0546):
+                            neg_pos_ratio,           # per-head explicit-negative cap,
+                                                     # default 5.0; <=0 = uncapped;
+                                                     # auto-tightens toward 1:1 for
+                                                     # tiny heads (see _effective_neg_ratio)
+                            label_policy,            # {"mode": "masked_unknown" |
+                                                     #  "soft_implicit_negative",
+                                                     #  "implicit_negative_value": 0.1}
+                                                     # soft mode: unlabelled (image, head)
+                                                     # pairs fill the cap's headroom AFTER
+                                                     # explicit negatives, as soft targets.
+                                                     # Training only — validation always
+                                                     # stays masked-unknown.
+                            use_pos_weight,          # BCE pos_weight from the residual
+                                                     # post-cap ratio, clamped to [1, 10]
+                            max_positives_per_class, # per-head positive cap, default 1000;
+                                                     # 0 = uncapped; label-dense images
+                                                     # survive the cut first
+                            oversample_positives,    # replicate tiny heads' positives
+                                                     # (bounded 4x); default true
+                            min_positive_threshold,  # oversample + ratio-tightening
+                                                     # trigger, default 30
+                            sampling_seed, ...},
         "backbone_init": {...},             # see bittrainer.backbone_init
         "license_provenance" / "external_pretrained_used"
             / "temporary_timm_fallback_used" / "release_blocking": provenance,
@@ -36,6 +59,8 @@ import asyncio
 import inspect
 import json
 import logging
+import math
+import random
 import threading
 from pathlib import Path
 from typing import Callable
@@ -222,6 +247,132 @@ def _split_samples(
     return train, val
 
 
+def _effective_neg_ratio(num_pos: int, base_ratio: float) -> float:
+    """Per-head neg:pos cap, auto-tightened for tiny heads (ISSUE-0545/0546).
+
+    ``<=0`` means uncapped. A head with ~10 positives cannot afford 5:1 —
+    most batches would carry zero positives and the head collapses to
+    always-negative — so the ratio scales with the positive count:
+    10 pos -> 1:1, 20 -> 2:1, 30 -> 3:1, plateauing at ``base_ratio``.
+    """
+    if base_ratio <= 0:
+        return 0.0
+    return min(float(base_ratio), max(1.0, num_pos / 10.0))
+
+
+def _plan_epoch_samples(
+    samples: list["_Sample"],
+    vocab: "_Vocab",
+    epoch: int,
+    *,
+    seed: int = 0,
+    neg_pos_ratio: float = 5.0,
+    label_policy: dict | None = None,
+    positive_cap: int = 1000,
+    min_positive_threshold: int = 30,
+    max_oversample_factor: float = 4.0,
+) -> tuple[list["_Sample"], dict[str, dict]]:
+    """Build one epoch's training view of ``samples`` (ISSUE-0545/0546).
+
+    The cap operates at the (head, image) LABEL level: an image whose negative
+    label for head A misses this epoch's draw still trains its other heads and
+    groups. Per head: capped positives (label-dense images survive first) +
+    all-or-sampled explicit negatives up to the effective ratio + — under the
+    ``soft_implicit_negative`` policy — unlabelled images filling whatever
+    headroom the explicit negatives leave, as soft targets. Tiny heads'
+    positives are replicated (bounded), each replica carrying ONLY that head's
+    positive label so oversampling never skews another head or group.
+
+    Pure function of ``(samples, epoch, seed, config)``; an epoch-restart
+    resume rebuilds the identical plan. Group labels are never capped.
+    """
+    policy = label_policy or {}
+    soft = str(policy.get("mode") or "masked_unknown") == "soft_implicit_negative"
+    implicit_value = float(policy.get("implicit_negative_value", 0.1))
+
+    eff_binary: list[dict[str, float]] = [{} for _ in samples]
+    replicas: list[_Sample] = []
+    stats: dict[str, dict] = {}
+
+    for concept in vocab.concepts:
+        rng = random.Random(f"{seed}|{epoch}|{concept}")
+        pos = [i for i, s in enumerate(samples) if s.binary.get(concept) == 1.0]
+        neg = [i for i, s in enumerate(samples) if s.binary.get(concept) == 0.0]
+        pos_total = len(pos)
+        if 0 < positive_cap < len(pos):
+            order = list(pos)
+            rng.shuffle(order)  # epoch-varying tiebreak among equal densities
+            order.sort(key=lambda i: -(len(samples[i].binary) + len(samples[i].groups)))
+            pos = order[:positive_cap]
+
+        ratio = _effective_neg_ratio(len(pos), neg_pos_ratio)
+        unlabelled = (
+            [i for i, s in enumerate(samples) if concept not in s.binary] if soft else []
+        )
+        cap = (
+            len(neg) + len(unlabelled)
+            if ratio <= 0
+            else math.ceil(ratio * max(len(pos), 1))
+        )
+        neg_selected = neg if len(neg) <= cap else rng.sample(neg, cap)
+        implicit_selected: list[int] = []
+        if soft:
+            headroom = cap - len(neg_selected)
+            if headroom > 0 and unlabelled:
+                implicit_selected = rng.sample(unlabelled, min(headroom, len(unlabelled)))
+
+        for i in pos:
+            eff_binary[i][concept] = 1.0
+        for i in neg_selected:
+            eff_binary[i][concept] = 0.0
+        for i in implicit_selected:
+            eff_binary[i][concept] = implicit_value
+
+        factor = 1
+        if 0 < len(pos) < min_positive_threshold:
+            factor = max(
+                1,
+                min(int(max_oversample_factor), math.ceil(min_positive_threshold / len(pos))),
+            )
+        for _ in range(factor - 1):
+            replicas.extend(_Sample(samples[i].path, {concept: 1.0}, {}) for i in pos)
+
+        stats[concept] = {
+            "pos": len(pos),
+            "pos_total": pos_total,
+            "neg_explicit": len(neg_selected),
+            "neg_implicit": len(implicit_selected),
+            "effective_ratio": ratio,
+            "oversample_factor": factor,
+        }
+
+    planned = [
+        _Sample(sample.path, eff_binary[i], dict(sample.groups))
+        for i, sample in enumerate(samples)
+        if eff_binary[i] or sample.groups
+    ]
+    planned.extend(replicas)
+    return planned, stats
+
+
+def _head_pos_weights(stats: dict[str, dict], *, clamp: float = 10.0) -> dict[str, float]:
+    """Residual BCE ``pos_weight`` per head from the post-cap epoch plan.
+
+    ``neg_selected / positive_occurrences`` (occurrences count oversample
+    replicas), clamped to ``[1, clamp]`` — a complement to the sampling cap,
+    never a substitute. Heads with no positives or no negatives get 1.0.
+    """
+    weights: dict[str, float] = {}
+    for concept, head_stats in stats.items():
+        occurrences = head_stats.get("pos", 0) * max(head_stats.get("oversample_factor", 1), 1)
+        negatives = head_stats.get("neg_explicit", 0) + head_stats.get("neg_implicit", 0)
+        if occurrences <= 0 or negatives <= 0:
+            weights[concept] = 1.0
+        else:
+            weights[concept] = min(clamp, max(1.0, negatives / occurrences))
+    return weights
+
+
 class _BackboneDataset(Dataset):
     def __init__(self, samples: list[_Sample], transform):
         self.samples = samples
@@ -300,6 +451,8 @@ def _batch_loss(
     binary_labels: list[dict[str, float]],
     group_labels: list[dict[str, int]],
     device: torch.device,
+    *,
+    pos_weight: dict[str, float] | None = None,
 ) -> torch.Tensor | None:
     losses: list[torch.Tensor] = []
     bce = nn.functional.binary_cross_entropy_with_logits
@@ -312,7 +465,13 @@ def _batch_loss(
         targets = torch.tensor(
             [binary_labels[i][concept] for i in rows], device=device, dtype=logits.dtype
         )
-        losses.append(bce(logits, targets))
+        weight = (pos_weight or {}).get(concept)
+        if weight is not None and weight != 1.0:
+            losses.append(
+                bce(logits, targets, pos_weight=torch.tensor(weight, device=device, dtype=logits.dtype))
+            )
+        else:
+            losses.append(bce(logits, targets))
     for group, head in heads.groups.items():
         rows = [i for i, labels in enumerate(group_labels) if group in labels]
         if not rows:
