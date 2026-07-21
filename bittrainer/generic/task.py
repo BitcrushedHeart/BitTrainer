@@ -172,6 +172,29 @@ class TrainingTask(ABC):
         return None
 
     # -- per-epoch ---------------------------------------------------------
+    def on_epoch_start(
+        self,
+        ctx: TaskContext,
+        model,
+        epoch: int,
+        *,
+        optimizer,
+        scheduler,
+        scheduler_t_max: int,
+        start_epoch: int,
+    ):
+        """Top-of-epoch hook (after ``build_loaders``, before ``train_epoch``).
+
+        Lets a task mutate the model's frozen/unfrozen state for this epoch and,
+        when that changes which parameters train, hand the core a rebuilt
+        ``(optimizer, scheduler, scheduler_t_max)`` tuple to swap in. Return
+        ``None`` to keep the current three (the common case). This is how the
+        binary trainer performs its epoch-1 backbone unfreeze + scheduler
+        rebuild without the core branching on trainer type; the resumed epoch is
+        skipped by the task (its reconstruction already ran in ``create_optimizer``).
+        """
+        return None
+
     def reshuffle(self) -> None:
         """Reshuffle the train dataset for a new epoch (post RNG capture)."""
 

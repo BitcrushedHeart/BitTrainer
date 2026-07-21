@@ -180,6 +180,18 @@ class GenericTrainer:
                 # One-shot: subsequent epochs are ordinary.
                 resume_schedule = None
 
+                # Top-of-epoch model/optimizer reshape (binary's epoch-1 unfreeze
+                # + scheduler rebuild). A returned tuple replaces the core's three;
+                # None keeps them. The nested backup collectors close over these
+                # run-locals, so the reassignment is picked up by later backups.
+                rebuilt = task.on_epoch_start(
+                    ctx, model, epoch,
+                    optimizer=optimizer, scheduler=scheduler,
+                    scheduler_t_max=scheduler_t_max, start_epoch=start_epoch,
+                )
+                if rebuilt is not None:
+                    optimizer, scheduler, scheduler_t_max = rebuilt
+
                 epoch_start_mono = time.monotonic()
                 step_callback = task.make_step_callback(ctx, epoch, eff_bs, best, epoch_start_mono)
 

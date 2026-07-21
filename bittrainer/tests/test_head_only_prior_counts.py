@@ -12,12 +12,14 @@ from __future__ import annotations
 import inspect
 
 import bittrainer.group_trainer as gt
-import bittrainer.head_only_trainer as hot
+from bittrainer.generic.tasks.head_only_task import HeadOnlyTask
 
 
 def test_head_only_forwards_effective_class_counts():
-    src = inspect.getsource(hot.run_head_only_training)
-    assert "effective_class_counts=train_ds.get_effective_class_counts()" in src
+    # ISSUE-0542: the head-only body moved onto HeadOnlyTask (run_head_only_training
+    # is now a thin wrapper). The effective-count forwarding lives in finalize().
+    src = inspect.getsource(HeadOnlyTask.finalize)
+    assert "effective_class_counts=self.train_ds.get_effective_class_counts()" in src
 
 
 def test_finalize_accepts_effective_class_counts_kwarg():
