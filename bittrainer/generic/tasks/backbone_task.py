@@ -482,7 +482,37 @@ class BackboneTask(TrainingTask):
 
         candidate_path = Path(self.request["candidate_checkpoint_path"])
         candidate_path.parent.mkdir(parents=True, exist_ok=True)
-        metadata = {
+        metadata = self._candidate_metadata(validation_score, validation_metrics)
+        from safetensors.torch import save_file
+
+        # BARE backbone keys (apply_backbone_init's unprefix branch requires the
+        # backbone keys NOT be prefixed) plus heads.<key> for the multi-task heads.
+        state = {key: value.detach().to("cpu") for key, value in backbone_state.items()}
+        for key, value in (heads_state or {}).items():
+            state[f"heads.{key}"] = value.detach().to("cpu")
+        save_file(
+            state,
+            str(candidate_path),
+            metadata={key: bb._stringify(value) for key, value in metadata.items() if value is not None},
+        )
+        self._emit(
+            "saving", "Backbone candidate checkpoint written",
+            candidate_checkpoint_path=str(candidate_path), validation_score=validation_score,
+        )
+
+        return {
+            "candidate_checkpoint_path": str(candidate_path),
+            "validation_score": float(validation_score),
+            "validation_metrics": validation_metrics,
+            "heads": self.request.get("heads") or {},
+            "release_blocking": bool(self.request.get("release_blocking")),
+            "epochs_completed": int(epochs_completed),
+            "best_epoch": int(best.best_epoch + 1) if self.val_samples else int(epochs_completed),
+        }
+
+    def _candidate_metadata(self, validation_score, validation_metrics) -> dict:
+        """Engine-readable candidate metadata, shared with BackboneHeadsTask."""
+        return {
             "family_name": self.request.get("family_name"),
             "architecture": self.request.get("architecture"),
             "size_alias": self.request.get("size_alias"),
@@ -511,30 +541,4 @@ class BackboneTask(TrainingTask):
             "backbone_feature_dim": self.feature_dim,
             "heads_concepts_json": list(self.vocab.concepts),
             "heads_groups_json": {g: list(cs) for g, cs in self.vocab.groups.items()},
-        }
-        from safetensors.torch import save_file
-
-        # BARE backbone keys (apply_backbone_init's unprefix branch requires the
-        # backbone keys NOT be prefixed) plus heads.<key> for the multi-task heads.
-        state = {key: value.detach().to("cpu") for key, value in backbone_state.items()}
-        for key, value in (heads_state or {}).items():
-            state[f"heads.{key}"] = value.detach().to("cpu")
-        save_file(
-            state,
-            str(candidate_path),
-            metadata={key: bb._stringify(value) for key, value in metadata.items() if value is not None},
-        )
-        self._emit(
-            "saving", "Backbone candidate checkpoint written",
-            candidate_checkpoint_path=str(candidate_path), validation_score=validation_score,
-        )
-
-        return {
-            "candidate_checkpoint_path": str(candidate_path),
-            "validation_score": float(validation_score),
-            "validation_metrics": validation_metrics,
-            "heads": self.request.get("heads") or {},
-            "release_blocking": bool(self.request.get("release_blocking")),
-            "epochs_completed": int(epochs_completed),
-            "best_epoch": int(best.best_epoch + 1) if self.val_samples else int(epochs_completed),
         }

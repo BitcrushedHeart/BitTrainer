@@ -587,6 +587,26 @@ def _train_backbone(
     )
 
 
+def _train_backbone_heads(
+    request: dict,
+    emit: Callable[[dict], None],
+    stop: threading.Event,
+    pause_event: object | None = None,
+) -> dict:
+    """Worker-thread target for head-only retraining (frozen trunk, cached
+    features); same shape as :func:`_train_backbone`."""
+    from bittrainer.generic.generic_trainer import GenericTrainer
+    from bittrainer.generic.tasks.backbone_heads_task import BackboneHeadsTask
+
+    task = BackboneHeadsTask(request, cancel_event=stop)
+    return GenericTrainer().run(
+        task,
+        progress_callback=emit,
+        pause_event=pause_event,
+        stop_event=task.steps_stop_event,
+    )
+
+
 # --------------------------------------------------------------------------- #
 # Async entry point                                                           #
 # --------------------------------------------------------------------------- #
@@ -603,6 +623,29 @@ async def run_backbone_training(request: dict, progress_callback=None, *, pause_
     / ``resume_from`` a later call rebuilds and resumes the run. All new config
     lives on ``training_config``, so the Engine wire contract stays additive.
     """
+    return await _run_worker_async(_train_backbone, request, progress_callback, pause_event)
+
+
+async def run_backbone_head_training(
+    request: dict, progress_callback=None, *, pause_event=None
+) -> dict:
+    """Retrain the multi-task heads against a FROZEN existing backbone.
+
+    Same request contract as :func:`run_backbone_training`, except
+    ``backbone_init.checkpoint_path`` is REQUIRED (the trunk to freeze) and
+    ``training_config`` may carry ``embedding_cache_dir`` (default: an
+    ``.embedding_cache`` dir next to the candidate) and ``head_batch_size``
+    (default 256). One embedding pass per backbone era is memoised in the
+    :class:`~bittrainer.embedding_cache.EmbeddingCache`; head epochs then run
+    over cached pooled vectors, so retraining every head after a labelling
+    round takes minutes. The exported candidate carries the source trunk
+    byte-for-byte plus fresh ``heads.*`` tensors (``head_only_retrain`` = "1"
+    in the metadata).
+    """
+    return await _run_worker_async(_train_backbone_heads, request, progress_callback, pause_event)
+
+
+async def _run_worker_async(worker, request: dict, progress_callback, pause_event) -> dict:
     loop = asyncio.get_running_loop()
     queue: asyncio.Queue = asyncio.Queue()
     stop = threading.Event()
@@ -623,7 +666,7 @@ async def run_backbone_training(request: dict, progress_callback=None, *, pause_
 
     forwarder = asyncio.create_task(forward())
     try:
-        return await asyncio.to_thread(_train_backbone, request, emit, stop, pause_event)
+        return await asyncio.to_thread(worker, request, emit, stop, pause_event)
     except asyncio.CancelledError:
         stop.set()
         raise
