@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import torch
 
-import bittrainer.group_trainer as gt
+import bittrainer.finalize as finalize  # ISSUE-0542: seams read here now
 from bittrainer.group_trainer import GroupTrainConfig, _compare_promote_finalize
 
 _CLASSES = ["0", "1", "2", "__none__"]
@@ -36,7 +36,7 @@ def test_ordinal_keep_syncs_all_summary_metrics(tmp_path, monkeypatch):
     # Single-label incumbents are scored via _collect_val_logits +
     # _incumbent_decode_metrics (the shipped-decode fair comparison); mock that
     # seam — this test pins summary-metric syncing, not the decode itself.
-    monkeypatch.setattr(gt, "load_checkpoint", lambda *a, **k: torch.nn.Identity())
+    monkeypatch.setattr(finalize, "load_checkpoint", lambda *a, **k: torch.nn.Identity())
 
     calls = {"n": 0}
 
@@ -49,8 +49,8 @@ def test_ordinal_keep_syncs_all_summary_metrics(tmp_path, monkeypatch):
             raise RuntimeError("No validation logits available for calibration")
         return torch.zeros(1, 4), torch.zeros(1, dtype=torch.long)
 
-    monkeypatch.setattr(gt, "_collect_val_logits", _fake_collect)
-    monkeypatch.setattr(gt, "_incumbent_decode_metrics", lambda *a, **k: dict(_INCUMBENT))
+    monkeypatch.setattr(finalize, "_collect_val_logits", _fake_collect)
+    monkeypatch.setattr(finalize, "_incumbent_decode_metrics", lambda *a, **k: dict(_INCUMBENT))
 
     cfg = GroupTrainConfig(
         group_folder=str(tmp_path), num_classes=4, class_names=_CLASSES,

@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import torch
 
-import bittrainer.group_trainer as gt
+import bittrainer.finalize as finalize  # ISSUE-0542: seams read here now
 from bittrainer.group_trainer import GroupTrainConfig, _compare_promote_finalize
 
 _CLASSES = ["0", "1", "2", "__none__"]
@@ -30,11 +30,11 @@ def test_auto_promote_skips_incumbent_load_and_promotes(tmp_path, monkeypatch):
         raise AssertionError("incumbent must NOT be loaded when auto_promote is on")
 
     # If the short-circuit works, neither the incumbent load nor its scoring runs.
-    monkeypatch.setattr(gt, "load_checkpoint", _boom_load)
+    monkeypatch.setattr(finalize, "load_checkpoint", _boom_load)
     # The later finalisation-calibration pass has no real val_loader; let it fail
     # exactly like val_loader=None would, so the promoted candidate survives.
     monkeypatch.setattr(
-        gt,
+        finalize,
         "_collect_val_logits",
         lambda *_a, **_k: (_ for _ in ()).throw(
             RuntimeError("No validation logits available for calibration")

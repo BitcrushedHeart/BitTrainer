@@ -3,6 +3,7 @@ from __future__ import annotations
 import torch
 
 import bittrainer.group_trainer as gt
+import bittrainer.probes as probes  # ISSUE-0542: sweep helpers live here now
 
 
 class TinyHeadModel(torch.nn.Module):
@@ -13,7 +14,7 @@ class TinyHeadModel(torch.nn.Module):
 
 def _patch_probe(monkeypatch, original_weight, scores):
     monkeypatch.setattr(
-        gt,
+        probes,
         "prepare_head_probe_tensors",
         lambda *a, **k: (
             torch.zeros(2, 2),
@@ -38,12 +39,12 @@ def _patch_probe(monkeypatch, original_weight, scores):
             "epochs_completed": 1,
         }
 
-    monkeypatch.setattr(gt, "train_head_probe_from_tensors", fake_probe)
+    monkeypatch.setattr(probes, "train_head_probe_from_tensors", fake_probe)
     return starts_clean
 
 
 def test_ordinal_softness_sweep_resets_head_and_selects_macro_f1(monkeypatch):
-    monkeypatch.setattr(gt, "_ORDINAL_SIGMA_CANDIDATES", [0.0, 0.2, 0.5])
+    monkeypatch.setattr(probes, "_ORDINAL_SIGMA_CANDIDATES", [0.0, 0.2, 0.5])
     model = TinyHeadModel()
     original_weight = model.head.weight.detach().clone()
     starts_clean = _patch_probe(
@@ -74,7 +75,7 @@ def test_ordinal_softness_sweep_resets_head_and_selects_macro_f1(monkeypatch):
 
 
 def test_label_smoothing_sweep_tiebreaks_to_lower_value(monkeypatch):
-    monkeypatch.setattr(gt, "_LABEL_SMOOTHING_CANDIDATES", [0.0, 0.05, 0.1])
+    monkeypatch.setattr(probes, "_LABEL_SMOOTHING_CANDIDATES", [0.0, 0.05, 0.1])
     model = TinyHeadModel()
     original_weight = model.head.weight.detach().clone()
     _patch_probe(
@@ -112,8 +113,8 @@ def test_multi_label_uses_plain_probe_without_sweep(monkeypatch):
         called["sweep"] += 1
         raise AssertionError("multi-label groups must not use the softmax sweep")
 
-    monkeypatch.setattr(gt, "train_head_probe", fake_plain)
-    monkeypatch.setattr(gt, "train_head_probe_from_tensors", fake_sweep)
+    monkeypatch.setattr(probes, "train_head_probe", fake_plain)
+    monkeypatch.setattr(probes, "train_head_probe_from_tensors", fake_sweep)
     config = gt.GroupTrainConfig(
         group_folder="/tmp/group",
         num_classes=3,

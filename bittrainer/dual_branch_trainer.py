@@ -8,12 +8,12 @@ from typing import Callable
 
 import torch
 import torch.nn as nn
-from adv_optm import Prodigy_adv
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader
 
 from bittrainer.backbone_init import apply_backbone_init, wants_timm_pretrained
 from bittrainer.dual_branch_model import DualBranchConvNeXt
+from bittrainer.generic.optimizer import make_optimizer
 from bittrainer.dual_crop_dataset import DualCropDataset
 from bittrainer.group_dataset import get_train_transform, get_val_transform
 from bittrainer.group_validation import compute_multiclass_metrics
@@ -279,12 +279,7 @@ def run_dual_branch_training(
         eff_bs = auto_result["batch_size"]
         cb({"type": "autobatch", **auto_result})
 
-    optimizer = Prodigy_adv(
-        model.parameters(), lr=1.0, d_coef=0.9,
-        weight_decay=0.01, betas=(0.9, 0.999),
-        kourkoutas_beta=True, k_warmup_steps=50,
-        cautious_wd=True,
-    )
+    optimizer = make_optimizer(model)
     scheduler = CosineAnnealingLR(optimizer, T_max=config.max_epochs)
 
     # fwd_model shares parameters with the eager model — optimizer and

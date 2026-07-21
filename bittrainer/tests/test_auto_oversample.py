@@ -3,6 +3,7 @@ from __future__ import annotations
 import torch
 
 import bittrainer.group_trainer as gt
+import bittrainer.probes as probes  # ISSUE-0542: oversample sweep helpers live here now
 
 _NONE_INDEX = 2
 # 2 each of classes 0/1/__none__ → max_count 2, target ceil(1.5 * 2*2) = 6,
@@ -21,7 +22,7 @@ def _patch_probe(monkeypatch, original_weight, scores):
     """scores maps oversampled-bool -> (macro_f1, val_loss)."""
     x_train = torch.arange(_BASE_N * 4, dtype=torch.float32).reshape(_BASE_N, 4)
     monkeypatch.setattr(
-        gt,
+        probes,
         "prepare_head_probe_tensors",
         lambda *a, **k: (x_train, _BASE_Y.clone(), x_train[:2], _BASE_Y[:2].clone()),
     )
@@ -44,7 +45,7 @@ def _patch_probe(monkeypatch, original_weight, scores):
             "epochs_completed": 1,
         }
 
-    monkeypatch.setattr(gt, "train_head_probe_from_tensors", fake_probe)
+    monkeypatch.setattr(probes, "train_head_probe_from_tensors", fake_probe)
     return starts_clean, seen_sizes
 
 
@@ -104,7 +105,7 @@ def test_oversample_sweep_skips_when_disabled(monkeypatch):
     model = TinyHeadModel()
     called = {"prep": 0}
     monkeypatch.setattr(
-        gt, "prepare_head_probe_tensors",
+        probes, "prepare_head_probe_tensors",
         lambda *a, **k: called.__setitem__("prep", called["prep"] + 1) or (None,) * 4,
     )
     config = _config(auto_oversample_none=False)

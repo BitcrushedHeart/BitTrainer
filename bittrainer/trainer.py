@@ -22,8 +22,8 @@ from bittrainer.dataset import (
 )
 from bittrainer.backbone_init import apply_backbone_init, wants_timm_pretrained
 from bittrainer.ema import ModelEMA
+from bittrainer.generic.optimizer import make_optimizer
 from bittrainer.model import (
-    build_llrd_param_groups,
     create_model,
     freeze_backbone,
     load_checkpoint,
@@ -106,16 +106,9 @@ def _fresh_binary_model(config: "TrainConfig", *, dtype: torch.dtype) -> nn.Modu
 
 
 def _make_optimizer(model: nn.Module, config: "TrainConfig") -> Prodigy_adv:
-    if config.llrd:
-        params = build_llrd_param_groups(model, config.llrd_decay)
-    else:
-        params = model.parameters()
-    return Prodigy_adv(
-        params, lr=1.0, d_coef=0.9,
-        weight_decay=0.01, betas=(0.9, 0.999),
-        kourkoutas_beta=True, k_warmup_steps=50,
-        cautious_wd=True,
-    )
+    """Delegate to the shared factory (Bitcrush ISSUE-0542); signature kept so
+    the binary loop's call sites are unchanged."""
+    return make_optimizer(model, llrd=config.llrd, llrd_decay=config.llrd_decay)
 
 
 def _get_dtype(name: str) -> torch.dtype:

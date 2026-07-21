@@ -20,12 +20,12 @@ from pathlib import Path
 from typing import Callable
 
 import torch
-from adv_optm import Prodigy_adv
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader
 
 from bittrainer.backbone_init import apply_backbone_init, wants_timm_pretrained
 from bittrainer.dataset import get_train_transform, get_val_transform
+from bittrainer.generic.optimizer import make_optimizer
 from bittrainer.group_dataset import GroupDataset
 from bittrainer.group_validation import compute_multihead_metrics
 from bittrainer.multihead_losses import (
@@ -341,10 +341,7 @@ def run_multihead_training(
     band_loss_fn = _Scaled(band_loss_fn, config.band_loss_weight)
     criteria = (size_loss_fn, band_loss_fn, consistency_fn)
 
-    optimizer = Prodigy_adv(
-        model.parameters(), lr=1.0, d_coef=0.9, weight_decay=0.01, betas=(0.9, 0.999),
-        kourkoutas_beta=True, k_warmup_steps=50, cautious_wd=True,
-    )
+    optimizer = make_optimizer(model)
     scheduler = CosineAnnealingLR(optimizer, T_max=config.max_epochs)
 
     fwd_model, compiled = maybe_compile(model, enabled=config.use_compile, cb=cb)
