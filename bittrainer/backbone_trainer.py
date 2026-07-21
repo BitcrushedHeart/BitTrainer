@@ -36,7 +36,18 @@ progress_callback=...)`` with a request assembled from the suite DB:
                                                      # (bounded 4x); default true
                             min_positive_threshold,  # oversample + ratio-tightening
                                                      # trigger, default 30
-                            sampling_seed, ...},
+                            sampling_seed,
+                            # Resolution tail (train cheap, finish sharp):
+                            finetune_image_size,     # optional high-res tail size;
+                                                     # 0/absent = single-resolution run
+                            finetune_epochs,         # last N epochs run (train + val)
+                                                     # at finetune_image_size; the best
+                                                     # tracker resets at the switch so
+                                                     # the exported candidate is always
+                                                     # selected at the tail resolution.
+                                                     # Note: early stopping can still
+                                                     # end a run before the tail.
+                            ...},
         "backbone_init": {...},             # see bittrainer.backbone_init
         "license_provenance" / "external_pretrained_used"
             / "temporary_timm_fallback_used" / "release_blocking": provenance,
@@ -102,7 +113,9 @@ def _amp_settings(config: dict) -> tuple[bool, torch.dtype]:
     return enabled, dtype
 
 
-def _backbone_fingerprint(vocab: "_Vocab", model_size: str, epochs: int) -> dict:
+def _backbone_fingerprint(
+    vocab: "_Vocab", model_size: str, epochs: int, *, resolution: str | None = None
+) -> dict:
     """Resume-compatibility identity for a backbone run.
 
     Folds the label space (concepts + multi-class groups) into the fingerprint
@@ -123,6 +136,11 @@ def _backbone_fingerprint(vocab: "_Vocab", model_size: str, epochs: int) -> dict
     # an older AdamW run (which lacks this key) cleanly mismatches and starts fresh
     # (resume_skipped) rather than trying to load AdamW state into Prodigy_adv.
     fingerprint["optimizer"] = "Prodigy_adv"
+    # Resolution schedule identity ("384" or "256->384@2"): a backup from a run
+    # with a different image size / finetune tail cleanly mismatches and starts
+    # fresh (same accepted precedent as the optimizer key above).
+    if resolution is not None:
+        fingerprint["resolution"] = resolution
     return fingerprint
 
 _POSITIVE_LABELS = frozenset({"positive", "explicit_positive", "1", "true"})

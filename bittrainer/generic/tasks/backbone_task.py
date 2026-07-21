@@ -96,6 +96,11 @@ class BackboneTask(TrainingTask):
         self.sampling_seed = int(c.get("sampling_seed") or 0)
         self._pos_weight: dict[str, float] | None = None
 
+        # Resolution tail: last N epochs (train + val) at a higher size.
+        self.finetune_image_size = int(c.get("finetune_image_size") or 0)
+        self.finetune_epochs = int(c.get("finetune_epochs") or 0)
+        self._val_loader_size: int | None = None
+
         # Populated across the lifecycle hooks.
         self.vocab: bb._Vocab | None = None
         self.train_samples: list = []
@@ -191,7 +196,9 @@ class BackboneTask(TrainingTask):
             backup_every_steps=int(c.get("backup_every_steps") or 0),
             pause_event=ctx.pause_event, cb=ctx.cb,
         )
-        fingerprint = bb._backbone_fingerprint(self.vocab, self.model_size, self.epochs)
+        fingerprint = bb._backbone_fingerprint(
+            self.vocab, self.model_size, self.epochs, resolution=self._resolution_signature()
+        )
         resume_from = c.get("resume_from")
         resume_state = (
             coordinator.load_resume(fingerprint, resume_from=resume_from) if resume_from else None
@@ -208,6 +215,20 @@ class BackboneTask(TrainingTask):
             self.patience if (self.patience > 0 and self.val_samples) else (self.epochs + 1)
         )
         return LoopSpec(max_epochs=self.epochs, patience=eff_patience, selection_min_delta=0.0)
+
+    @property
+    def _has_tail(self) -> bool:
+        return self.finetune_image_size > 0 and 0 < self.finetune_epochs < self.epochs
+
+    def _epoch_image_size(self, epoch: int) -> int:
+        if self._has_tail and epoch >= self.epochs - self.finetune_epochs:
+            return self.finetune_image_size
+        return self.image_size
+
+    def _resolution_signature(self) -> str:
+        if self._has_tail:
+            return f"{self.image_size}->{self.finetune_image_size}@{self.finetune_epochs}"
+        return str(self.image_size)
 
     def _plan_epoch(self, epoch: int):
         return bb._plan_epoch_samples(
@@ -299,18 +320,23 @@ class BackboneTask(TrainingTask):
     # -- per-epoch ---------------------------------------------------------
     def build_loaders(self, ctx: TaskContext, epoch: int, eff_bs: int, resume_info: ResumeInfo):
         loader_kwargs = {"batch_size": self.batch_size, "collate_fn": bb._collate, "num_workers": 0}
-        if self._val_loader is None:
+        image_size = self._epoch_image_size(epoch)
+        # The finetune tail switches the VAL resolution too — the tail's scores
+        # (and the exported candidate's selection) must be measured at the
+        # resolution the model ships at.
+        if self._val_loader is None or self._val_loader_size != image_size:
             self._val_loader = DataLoader(
-                bb._BackboneDataset(self.val_samples, bb._val_transform(self.image_size)),
+                bb._BackboneDataset(self.val_samples, bb._val_transform(image_size)),
                 shuffle=False, **loader_kwargs,
             )
+            self._val_loader_size = image_size
         # Per-epoch label plan (ISSUE-0545/0546): fresh negative draw each epoch
         # sweeps the full negative pool over training without ever concentrating
         # it; validation samples stay uncapped and masked-unknown.
         epoch_samples, plan_stats = self._plan_epoch(epoch)
         self._pos_weight = bb._head_pos_weights(plan_stats) if self.use_pos_weight else None
         train_loader = DataLoader(
-            bb._BackboneDataset(epoch_samples, bb._train_transform(self.image_size)),
+            bb._BackboneDataset(epoch_samples, bb._train_transform(image_size)),
             shuffle=True, **loader_kwargs,
         )
         # Backbone resume is epoch-restart: no schedule replay, no partial start.
@@ -388,6 +414,24 @@ class BackboneTask(TrainingTask):
         best.best_metrics = dict(metrics)
 
     def on_epoch_end(self, ctx: TaskContext, model, epoch: int, metrics: dict, selected_score: float, best: BestTracker) -> None:
+        # Resolution-tail switch: low-res and high-res validation scores are not
+        # comparable, so reset the best tracker on the LAST pre-tail epoch. The
+        # first tail epoch then always re-wins (score > -1), the exported
+        # candidate is selected at the deployment resolution, and patience
+        # accumulated at low res can't early-stop the tail. Prodigy re-adapts
+        # its step within a few batches; EMA and the cosine schedule continue
+        # uninterrupted (ConvNeXt weights are resolution-agnostic).
+        if self._has_tail and epoch == self.epochs - self.finetune_epochs - 1:
+            best.best_validation_score = -1.0
+            best.patience_counter = 0
+            self._emit(
+                "training",
+                f"Switching to finetune resolution {self.finetune_image_size}px for the "
+                f"last {self.finetune_epochs} epoch(s)",
+                finetune_image_size=self.finetune_image_size,
+                finetune_epochs=self.finetune_epochs,
+            )
+            return
         # Surface the early-stop notice the legacy loop emitted (the core breaks on
         # the same condition immediately after this hook).
         if self.val_samples and self.patience > 0 and best.patience_counter >= self.patience:
