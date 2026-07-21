@@ -16,6 +16,7 @@ from torch.utils.data import Dataset, Sampler
 from torchvision.transforms import functional as TF
 
 from bittrainer.dataset import (
+    DEFAULT_TRAIN_RESOLUTION,
     find_nearest_bucket,
     get_skin_normalised_train_transform,
     get_skin_normalised_val_transform,
@@ -96,6 +97,7 @@ class GroupDataset(Dataset):
         oversample_none: bool = False,
         extra_paths: dict[str, list[str]] | None = None,
         natural_sampling: bool = False,
+        train_resolution: int = DEFAULT_TRAIN_RESOLUTION,
     ):
         self.group_folder = Path(group_folder)
         self.class_names = class_names
@@ -108,6 +110,16 @@ class GroupDataset(Dataset):
         self._sourceless = sourceless
         self._group_name = group_name or self.group_folder.name
         self._oversample_none = oversample_none
+        # Per-group training resolution (default 512 = the canonical bucket
+        # table). Sourceless mode ignores it: samples come from the cache
+        # index at whatever resolution they were cached, and there is no
+        # source image to rebuild from.
+        self._train_resolution = int(train_resolution or DEFAULT_TRAIN_RESOLUTION)
+        if sourceless and self._train_resolution != DEFAULT_TRAIN_RESOLUTION:
+            logger.warning(
+                "GroupDataset(sourceless): train_resolution=%d ignored — cached buckets rule",
+                self._train_resolution,
+            )
         # When True, train samples are taken at their natural class distribution
         # (each image once) instead of replication-equalised to the largest
         # class — used by the "reweight" class-balance mode, where imbalance is
@@ -258,7 +270,7 @@ class GroupDataset(Dataset):
                     sp = str(p)
                     if sp in bad_paths:
                         continue
-                    bucket = find_nearest_bucket(*size_cache[sp])
+                    bucket = find_nearest_bucket(*size_cache[sp], self._train_resolution)
                     self.samples.append(self._make_sample(sp, class_idx, bucket))
         else:
             clean_class_paths = [
@@ -289,7 +301,7 @@ class GroupDataset(Dataset):
 
                 for p in expanded:
                     sp = str(p)
-                    bucket = find_nearest_bucket(*size_cache[sp])
+                    bucket = find_nearest_bucket(*size_cache[sp], self._train_resolution)
                     self.samples.append(self._make_sample(sp, class_idx, bucket))
 
             if self._oversample_none:
@@ -337,7 +349,7 @@ class GroupDataset(Dataset):
         extra = extra[:extra_needed]
         for p in extra:
             sp = str(p)
-            bucket = find_nearest_bucket(*size_cache[sp])
+            bucket = find_nearest_bucket(*size_cache[sp], self._train_resolution)
             self.samples.append(self._make_sample(sp, none_idx, bucket))
         logger.info(
             "Rare-group oversample: __none__ %d → %d (non-none total %d)",
@@ -390,7 +402,7 @@ class GroupDataset(Dataset):
             for ci in class_indices:
                 label[ci] = 1.0
 
-            bucket = find_nearest_bucket(*size)
+            bucket = find_nearest_bucket(*size, self._train_resolution)
             self.samples.append(self._make_sample(str(p), label, bucket))
 
     def reshuffle(self) -> None:

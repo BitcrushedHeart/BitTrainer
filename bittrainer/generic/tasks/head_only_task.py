@@ -138,7 +138,10 @@ class HeadOnlyTask(TrainingTask):
         self.backbone_hash = backbone_feature_hash(model)
         pooled_dim = int(getattr(model, "num_features", 0))
         embed_root = config.embedding_cache_dir or str(group_folder / ".embedding_cache")
-        embed_cache = EmbeddingCache(embed_root, self.backbone_hash, pooled_dim)
+        embed_cache = EmbeddingCache(
+            embed_root, self.backbone_hash, pooled_dim,
+            preproc_sig=gt._embedding_preproc_sig(config.train_resolution),
+        )
 
         all_samples = self.train_ds.samples + self.val_ds.samples
 

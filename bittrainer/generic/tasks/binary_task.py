@@ -172,6 +172,7 @@ class BinaryTask(TrainingTask):
                 dim_cache=dim_cache,
                 skin_normalise=config.skin_normalise,
                 concept_name=self.concept_name,
+                train_resolution=config.train_resolution,
             )
             val_ds = ConceptDataset(
                 concept_folder, split="val",
@@ -182,6 +183,7 @@ class BinaryTask(TrainingTask):
                 dim_cache=dim_cache,
                 skin_normalise=config.skin_normalise,
                 concept_name=self.concept_name,
+                train_resolution=config.train_resolution,
             )
 
             bt._rebalance_val_negatives(train_ds, val_ds)

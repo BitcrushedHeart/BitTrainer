@@ -37,6 +37,10 @@ class TrainConfig:
     max_epochs: int = 50
     patience: int = 3
     neg_pos_ratio: float = 1.0
+    # Per-concept training resolution: scales the aspect-bucket table
+    # (512 = the canonical ~512px buckets; see bittrainer.dataset.scaled_buckets).
+    # SmartCache keys embed bucket dims, so a change simply builds fresh entries.
+    train_resolution: int = 512
     model_size: str = "nano"
     device: str = "cuda"
     dtype: str = "bfloat16"

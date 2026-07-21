@@ -44,8 +44,35 @@ ASPECT_RATIO_BUCKETS: list[tuple[int, int]] = [
 
 _BUCKET_RATIOS: list[float] = [w / h for w, h in ASPECT_RATIO_BUCKETS]
 
+DEFAULT_TRAIN_RESOLUTION = 512
 
-def find_nearest_bucket(orig_w: int, orig_h: int) -> tuple[int, int]:
+
+def scaled_buckets(train_resolution: int = DEFAULT_TRAIN_RESOLUTION) -> list[tuple[int, int]]:
+    """The aspect-bucket table scaled to a per-group training resolution.
+
+    ``train_resolution`` is the square-bucket side; every bucket's dims scale
+    by ``train_resolution / 512`` and snap to multiples of 32 (ConvNeXt stem
+    stride) so shapes stay kernel-friendly. ``512`` (or ``<=0``/None) returns
+    the canonical table unchanged — SmartCache keys embed the bucket dims, so
+    the default table keeps every existing cache entry valid, while any other
+    resolution produces new dims and therefore fresh cache entries (stale ones
+    are reclaimed by the cache GC, and the dataset shape guard rebuilds on
+    mismatch).
+    """
+    if not train_resolution or train_resolution == DEFAULT_TRAIN_RESOLUTION:
+        return ASPECT_RATIO_BUCKETS
+    scale = train_resolution / DEFAULT_TRAIN_RESOLUTION
+    return [
+        (max(32, round(w * scale / 32) * 32), max(32, round(h * scale / 32) * 32))
+        for w, h in ASPECT_RATIO_BUCKETS
+    ]
+
+
+def find_nearest_bucket(
+    orig_w: int, orig_h: int, train_resolution: int = DEFAULT_TRAIN_RESOLUTION
+) -> tuple[int, int]:
+    # Aspect selection always runs on the canonical ratios (scaling preserves
+    # them up to /32 snapping); only the returned dims scale.
     ratio = orig_w / orig_h
     best_idx = 0
     best_diff = abs(ratio - _BUCKET_RATIOS[0])
@@ -54,7 +81,7 @@ def find_nearest_bucket(orig_w: int, orig_h: int) -> tuple[int, int]:
         if diff < best_diff:
             best_diff = diff
             best_idx = i
-    return ASPECT_RATIO_BUCKETS[best_idx]
+    return scaled_buckets(train_resolution)[best_idx]
 
 
 # ---------------------------------------------------------------------------
@@ -224,6 +251,7 @@ class ConceptDataset(Dataset):
         cache: Any | None = None,           # SmartCache instance
         sourceless: bool = False,
         concept_name: str = "",
+        train_resolution: int = DEFAULT_TRAIN_RESOLUTION,
     ):
         self.concept_folder = Path(concept_folder)
         self.split = split
@@ -235,6 +263,7 @@ class ConceptDataset(Dataset):
         self._concept_name = concept_name or self.concept_folder.name
         self._cache = cache
         self._sourceless = sourceless
+        self._train_resolution = int(train_resolution or DEFAULT_TRAIN_RESOLUTION)
 
         if sourceless:
             self._init_sourceless()
@@ -299,7 +328,7 @@ class ConceptDataset(Dataset):
             if dims is None:
                 dims = self._read_image_size(p)
                 self._dim_cache.put(p, dims[0], dims[1])
-            bucket = find_nearest_bucket(dims[0], dims[1])
+            bucket = find_nearest_bucket(dims[0], dims[1], self._train_resolution)
             self._path_info[key] = {
                 "path": key,
                 "label": label,

@@ -134,6 +134,13 @@ class GroupTrainConfig:
     max_epochs: int = 50
     patience: int = 3
     backbone_variant: str = "nano"
+    # Per-group training resolution: scales the aspect-bucket table (512 = the
+    # canonical ~512px buckets; see bittrainer.dataset.scaled_buckets). For
+    # groups whose discriminative detail is too small even after region crops.
+    # SmartCache keys embed bucket dims (fresh entries on change) and the
+    # embedding cache era is namespaced by resolution (_embedding_preproc_sig).
+    # Ignored in sourceless mode (cached buckets rule).
+    train_resolution: int = 512
     label_smoothing: float = 0.1
     ordinal: bool = False
     ordinal_sigma: float = 1.0
@@ -883,6 +890,22 @@ def _train_one_epoch(
 # evenly subsampling large val sets preserves the curve shape.
 
 
+def _embedding_preproc_sig(train_resolution: int) -> str:
+    """EmbeddingCache preprocessing signature for a training resolution.
+
+    The sig is cache IDENTITY (it namespaces the era directory): vectors built
+    from differently-sized buckets have different VALUES at the same pooled
+    dim, so a non-default resolution must never silently reuse the default
+    era. 512 keeps the historical bare-hash directory name (existing caches
+    stay valid).
+    """
+    from bittrainer.dataset import DEFAULT_TRAIN_RESOLUTION
+
+    if not train_resolution or train_resolution == DEFAULT_TRAIN_RESOLUTION:
+        return "val_imagenet"
+    return f"val_imagenet@{int(train_resolution)}"
+
+
 def _prepare_datasets_and_cache(
     config: GroupTrainConfig,
     *,
@@ -955,12 +978,14 @@ def _prepare_datasets_and_cache(
             skin_normalise=config.skin_normalise, group_name=group_name,
             oversample_none=initial_oversample_none,
             extra_paths=config.extra_paths_train,
+            train_resolution=config.train_resolution,
         )
         val_ds = GroupDataset(
             group_folder, config.class_names, split="val",
             multi_label=config.multi_label,
             skin_normalise=config.skin_normalise, group_name=group_name,
             extra_paths=config.extra_paths_val,
+            train_resolution=config.train_resolution,
         )
 
         # --- Face/region-aware cropping pre-computation ---
@@ -1204,7 +1229,10 @@ def _warmup_head_probe(
     backbone_hash = backbone_feature_hash(model)
     group_folder = Path(config.group_folder)
     embed_root = config.embedding_cache_dir or str(group_folder / ".embedding_cache")
-    embed_cache = EmbeddingCache(embed_root, backbone_hash, int(getattr(model, "num_features", 0)))
+    embed_cache = EmbeddingCache(
+        embed_root, backbone_hash, int(getattr(model, "num_features", 0)),
+        preproc_sig=_embedding_preproc_sig(config.train_resolution),
+    )
     all_samples = train_ds.samples + val_ds.samples
 
     def _stop() -> bool:
