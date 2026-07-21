@@ -123,6 +123,16 @@ class GroupTrainConfig:
     # composite (ordinal). Opt in per-group when __none__ recall matters more
     # than raw macro-F1.
     none_guard: bool = False
+    # Non-ordinal checkpoint-selection metric (ISSUE-0490 B): "macro_f1"
+    # (default, unchanged), "weighted_f1" (support-weighted per-class F1), or
+    # "balanced" (harmonic mean of macro and weighted). IGNORED for ordinal
+    # groups, which always select on the QWK+macro composite.
+    selection_metric: str = "macro_f1"
+    # Inference-time prior correction (ISSUE-0490 A): tau scales the Bayes logit
+    # adjustment log(natural_prior) - log(effective_train_prior). 1.0 = full
+    # correction; stored in the checkpoint so it can be tuned later without a
+    # retrain. Not exposed in UI for v1.
+    prior_tau: float = 1.0
     multi_label: bool = False
     # Spatial-grid groups (e.g. Subject Location): per-class grid cell masks in
     # class-index order (``__none__`` = empty list). When set, the trainer
@@ -350,11 +360,31 @@ def _guarded_metric_enabled(config: GroupTrainConfig) -> bool:
     return config.none_guard and _has_none_class(config) and not config.multi_label
 
 
+def _selection_base_f1(metrics: dict, config: GroupTrainConfig) -> float:
+    """The non-ordinal selection driver F1 under ``config.selection_metric``.
+
+    ``macro_f1`` (default, balanced-training behaviour), ``weighted_f1``
+    (support-weighted, so majority classes count for their real prevalence), or
+    ``balanced`` (harmonic mean of the two — punishes collapsing either side,
+    consistent with the ordinal composite's harmonic style).
+    """
+    macro = float(metrics.get("macro_f1") or 0.0)
+    metric = getattr(config, "selection_metric", "macro_f1") or "macro_f1"
+    if metric == "weighted_f1":
+        return float(metrics.get("weighted_f1") or 0.0)
+    if metric == "balanced":
+        weighted = float(metrics.get("weighted_f1") or 0.0)
+        if macro <= 0.0 or weighted <= 0.0:
+            return 0.5 * (macro + weighted)
+        return 2.0 * macro * weighted / (macro + weighted)
+    return macro
+
+
 def _guarded_score(metrics: dict, config: GroupTrainConfig) -> float:
     none_f1 = float(metrics.get("none_f1") or 0.0)
     if config.ordinal and _primary_validation_metric(config) == "guarded_qwk":
         return float(metrics.get("qwk") or 0.0) + _NONE_F1_WEIGHT * none_f1
-    return float(metrics.get("macro_f1") or 0.0) + _NONE_F1_WEIGHT * none_f1
+    return _selection_base_f1(metrics, config) + _NONE_F1_WEIGHT * none_f1
 
 
 def _ordinal_primary_score(metrics: dict, config: GroupTrainConfig) -> float:
@@ -394,10 +424,79 @@ def _metric_score(metrics: dict, config: GroupTrainConfig) -> float:
     # Non-ordinal groups: macro-F1 (with the __none__ guard term when present).
     if _guarded_metric_enabled(config) and not config.ordinal:
         return _guarded_score(metrics, config)
+    # Non-ordinal, no __none__ guard: the configured selection metric.
+    if not config.ordinal:
+        return _selection_base_f1(metrics, config)
     # Ordinal-as-macro_f1 or any other fallthrough: the primary metric as-is.
     metric = _primary_validation_metric(config)
     value = metrics.get("qwk" if metric == "qwk" else "macro_f1")
     return float(value) if value is not None else 0.0
+
+
+def _build_epoch_message(
+    *,
+    epoch: int,
+    config: GroupTrainConfig,
+    train_loss: float,
+    val_metrics: dict,
+    best_val_macro_f1: float,
+    best_val_qwk: float,
+    selected_score: float,
+    best_validation_score: float,
+    best_epoch: int,
+    per_class_train_loss: dict,
+    elapsed_seconds: float | None = None,
+    dcw_multipliers: dict | None = None,
+) -> dict:
+    """Assemble the per-epoch ``epoch_complete`` progress payload.
+
+    Extracted so the Engine-facing contract (which drives per-epoch run-history
+    persistence, ISSUE-0491) is unit-testable without a training loop. Carries
+    ``val_weighted_f1`` / ``val_micro_f1`` / ``elapsed_seconds`` alongside the
+    existing loss / macro-F1 / per-class fields the history graphs need.
+    """
+    msg = {
+        "type": "epoch_complete",
+        "stage": "training",
+        "status_text": (
+            f"Epoch {epoch + 1}/{config.max_epochs} complete "
+            f"(val macro F1 {val_metrics.get('macro_f1', 0.0):.3f})"
+        ),
+        "epoch": epoch + 1,
+        "max_epochs": config.max_epochs,
+        "train_loss": train_loss,
+        "val_loss": val_metrics.get("val_loss"),
+        "val_macro_f1": val_metrics.get("macro_f1"),
+        "val_weighted_f1": val_metrics.get("weighted_f1"),
+        "val_micro_f1": val_metrics.get("micro_f1"),
+        "val_macro_f1_supported": val_metrics.get("macro_f1_supported"),
+        "val_macro_precision": val_metrics.get("macro_precision", 0.0),
+        "val_macro_recall": val_metrics.get("macro_recall", 0.0),
+        "per_class_f1": val_metrics.get("per_class_f1", {}),
+        "per_class_precision": val_metrics.get("per_class_precision", {}),
+        "per_class_recall": val_metrics.get("per_class_recall", {}),
+        "per_class_support": val_metrics.get("per_class_support", {}),
+        "per_class_val_loss": val_metrics.get("per_class_val_loss", {}),
+        "per_class_train_loss": per_class_train_loss,
+        "val_none_precision": val_metrics.get("none_precision"),
+        "val_none_recall": val_metrics.get("none_recall"),
+        "val_none_f1": val_metrics.get("none_f1"),
+        "val_none_false_positive_rate": val_metrics.get("none_false_positive_rate"),
+        "best_val_macro_f1": best_val_macro_f1,
+        "selected_validation_score": selected_score,
+        "best_validation_score": best_validation_score,
+        "validation_metric": _primary_validation_metric(config),
+        "best_epoch": best_epoch + 1,
+        "elapsed_seconds": elapsed_seconds,
+    }
+    if dcw_multipliers is not None:
+        msg["per_class_weight_multiplier"] = dcw_multipliers
+    if config.ordinal:
+        msg["val_qwk"] = val_metrics.get("qwk", 0.0)
+        msg["val_ordinal_mae"] = val_metrics.get("ordinal_mae")
+        msg["val_adjacent_accuracy"] = val_metrics.get("adjacent_accuracy")
+        msg["best_val_qwk"] = best_val_qwk
+    return msg
 
 
 def _score_metric_label(config: GroupTrainConfig) -> str:
@@ -1538,6 +1637,116 @@ def _persist_ordinal_cut_points(checkpoint_path: str | None, cut_points: list[fl
         logger.warning("Failed to persist ordinal_cut_points to checkpoint", exc_info=True)
 
 
+def _compute_prior_vectors_from_counts(
+    natural_counts: dict[int, int],
+    effective_counts: dict[int, int],
+    config: GroupTrainConfig,
+) -> tuple[dict[str, float], dict[str, float]] | None:
+    """Natural + effective-train log-prior vectors for prior correction.
+
+    ``natural`` = raw (un-oversampled) per-class train counts; ``effective`` =
+    per-class counts after oversample expansion (the model's real class
+    exposure). Both Laplace-smoothed and returned as ``{str(idx): log_prob}``.
+    Returns ``None`` for multi-label groups (no single-label prior to correct).
+    """
+    if config.multi_label:
+        return None
+    from bittrainer.group_dataset import compute_class_log_priors
+
+    natural = {int(k): int(v or 0) for k, v in natural_counts.items()}
+    effective = {int(k): int(v or 0) for k, v in effective_counts.items()}
+    log_natural = compute_class_log_priors(natural, config.num_classes)
+    log_effective = compute_class_log_priors(effective, config.num_classes)
+    return log_natural, log_effective
+
+
+def _compute_prior_vectors(
+    train_ds: GroupDataset,
+    config: GroupTrainConfig,
+) -> tuple[dict[str, float], dict[str, float]] | None:
+    """Prior vectors derived directly from a train dataset (natural counts +
+    post-oversample effective counts). Thin wrapper over
+    :func:`_compute_prior_vectors_from_counts`."""
+    if config.multi_label:
+        return None
+    return _compute_prior_vectors_from_counts(
+        train_ds.get_class_counts(), train_ds.get_effective_class_counts(), config
+    )
+
+
+def _persist_class_priors(
+    checkpoint_path: str | None,
+    *,
+    log_natural: dict[str, float],
+    log_effective: dict[str, float],
+    tau: float,
+) -> None:
+    """Write the prior-correction vectors into the checkpoint sidecar meta,
+    mirroring :func:`_persist_ordinal_cut_points`. Old checkpoints lack these
+    keys, so Engine decode is a byte-identical no-op for them (ISSUE-0490 A)."""
+    if not checkpoint_path:
+        return
+    try:
+        ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+        if isinstance(ckpt, dict):
+            ckpt["class_log_prior_natural"] = {str(k): float(v) for k, v in log_natural.items()}
+            ckpt["class_log_prior_train_effective"] = {
+                str(k): float(v) for k, v in log_effective.items()
+            }
+            ckpt["prior_tau"] = float(tau)
+            torch.save(ckpt, checkpoint_path)
+    except Exception:
+        logger.warning("Failed to persist class priors to checkpoint", exc_info=True)
+
+
+def _prior_logit_delta(
+    log_natural: dict[str, float],
+    log_effective: dict[str, float],
+    num_classes: int,
+    tau: float,
+) -> "np.ndarray":
+    """``tau * (log_natural - log_effective)`` as a ``[num_classes]`` vector.
+
+    Added to raw logits BEFORE calibration so the shipped calibration constants
+    are fit on the logits inference will actually see (ISSUE-0490 A)."""
+    delta = np.zeros(num_classes, dtype=np.float64)
+    for i in range(num_classes):
+        delta[i] = tau * (
+            float(log_natural.get(str(i), 0.0)) - float(log_effective.get(str(i), 0.0))
+        )
+    return delta
+
+
+def _apply_and_persist_priors(
+    logits: torch.Tensor,
+    natural_counts: dict[int, int],
+    effective_counts: dict[int, int],
+    config: GroupTrainConfig,
+    checkpoint_path: str | None,
+) -> torch.Tensor:
+    """Compute prior-correction vectors, persist them to the checkpoint, and
+    return the prior-adjusted val logits.
+
+    Called at finalisation BEFORE calibration so ``calibration_temperature`` and
+    ``none_logit_bias`` are fit on the logits inference will actually see
+    (decode order: raw -> prior adjustment -> temperature -> none bias). Returns
+    the logits unchanged when there is no single-label prior to correct
+    (multi-label) so callers can use the result unconditionally (ISSUE-0490 A)."""
+    vectors = _compute_prior_vectors_from_counts(natural_counts, effective_counts, config)
+    if vectors is None:
+        return logits
+    log_natural, log_effective = vectors
+    _persist_class_priors(
+        checkpoint_path,
+        log_natural=log_natural,
+        log_effective=log_effective,
+        tau=config.prior_tau,
+    )
+    delta = _prior_logit_delta(log_natural, log_effective, config.num_classes, config.prior_tau)
+    delta_t = torch.tensor(delta, dtype=torch.float32, device=logits.device)
+    return logits.float() + delta_t
+
+
 def _prepare_datasets_and_cache(
     config: GroupTrainConfig,
     *,
@@ -2326,6 +2535,7 @@ def _compare_promote_finalize(
     checkpoint_dir: Path,
     class_counts: dict[int, int],
     total_raw: int,
+    effective_class_counts: dict[int, int] | None = None,
     cb: Callable[[dict], None] | None = None,
 ) -> dict:
     """Promote-if-better vs the incumbent, tune thresholds, build the result dict.
@@ -2478,20 +2688,36 @@ def _compare_promote_finalize(
     # Reused below to persist the strictness val data without a second val pass.
     val_logits_cache: torch.Tensor | None = None
     val_labels_cache: torch.Tensor | None = None
-    if (
-        best_checkpoint_path
-        and not config.multi_label
-        and (_has_none_class(config) or config.ordinal)
-    ):
+    # Single-label groups always reach finalisation so prior-correction vectors
+    # are persisted (ISSUE-0490 A) — even plain groups with no __none__ / ordinal
+    # calibration, which is the motivating class-imbalance case. Calibration
+    # (temperature / none-bias / cut-points) is layered on only when applicable.
+    if best_checkpoint_path and not config.multi_label:
+        needs_calibration = _has_none_class(config) or config.ordinal
         try:
-            _emit("calibrating", "Calibrating decision boundaries")
+            _emit(
+                "calibrating",
+                "Calibrating decision boundaries" if needs_calibration else "Finalising priors",
+            )
             calib_model = load_checkpoint(
                 best_checkpoint_path, device=str(device), dtype=dtype,
                 model_size=config.backbone_variant, num_classes=config.num_classes,
             ).to(device)
             logits, labels = _collect_val_logits(calib_model, val_loader, config, device, dtype)
-            val_logits_cache, val_labels_cache = logits, labels
             del calib_model
+
+            # Prior correction (ISSUE-0490 A): adjust val logits by
+            # tau*(log natural - log effective train prior) and persist both
+            # vectors, BEFORE fitting temperature / none-bias so calibration
+            # (and the strictness val data below) sees the shipped decode input.
+            logits = _apply_and_persist_priors(
+                logits,
+                class_counts,
+                effective_class_counts if effective_class_counts is not None else class_counts,
+                config,
+                best_checkpoint_path,
+            )
+            val_logits_cache, val_labels_cache = logits, labels
 
             # __none__ gate: temperature + none-bias (only when a none class exists).
             if _has_none_class(config):
@@ -2519,6 +2745,14 @@ def _compare_promote_finalize(
                 best_metrics = decoded_metrics
                 if ordinal_cut_points is not None:
                     _persist_ordinal_cut_points(best_checkpoint_path, ordinal_cut_points)
+
+            # Plain single-label groups (no __none__ gate, not ordinal) skipped
+            # both re-scoring branches above, so their best_metrics still reflect
+            # the pre-prior epoch-loop decode. Re-score on the prior-adjusted
+            # logits (already in memory — no extra forward pass) so reported
+            # final_val_* match what the shipped model actually decodes.
+            elif not _has_none_class(config):
+                best_metrics = _metrics_from_logits(logits, labels, config, none_idx)
 
             best_val_macro_f1 = best_metrics.get("macro_f1", best_val_macro_f1)
             best_val_qwk = best_metrics.get("qwk", best_val_qwk)
@@ -2589,6 +2823,13 @@ def _compare_promote_finalize(
         "validation_metric": _primary_validation_metric(config),
         "selected_validation_score": _metric_score(best_metrics, config),
         "final_val_macro_f1": best_metrics.get("macro_f1"),
+        "final_val_weighted_f1": best_metrics.get("weighted_f1"),
+        "final_val_micro_f1": best_metrics.get("micro_f1"),
+        # What drove checkpoint selection this run (ISSUE-0490 B). Ordinal groups
+        # ignore selection_metric, so record the composite label instead.
+        "selection_metric": (
+            "ordinal_composite" if config.ordinal else getattr(config, "selection_metric", "macro_f1")
+        ),
         "final_val_macro_f1_supported": best_metrics.get("macro_f1_supported"),
         "final_val_macro_f1_excl_none": best_metrics.get("macro_f1_excl_none"),
         "final_val_macro_f1_supported_excl_none": best_metrics.get(
@@ -3289,41 +3530,22 @@ def run_group_training(
                     config.soup_max_candidates,
                 )
 
-            epoch_msg = {
-                "type": "epoch_complete",
-                "stage": "training",
-                "status_text": f"Epoch {epoch + 1}/{config.max_epochs} complete (val macro F1 {val_macro_f1:.3f})",
-                "epoch": epoch + 1,
-                "max_epochs": config.max_epochs,
-                "train_loss": train_loss,
-                "val_loss": val_metrics["val_loss"],
-                "val_macro_f1": val_macro_f1,
-                "val_macro_f1_supported": val_metrics.get("macro_f1_supported"),
-                "val_macro_precision": val_metrics.get("macro_precision", 0.0),
-                "val_macro_recall": val_metrics.get("macro_recall", 0.0),
-                "per_class_f1": val_metrics.get("per_class_f1", {}),
-                "per_class_precision": val_metrics.get("per_class_precision", {}),
-                "per_class_recall": val_metrics.get("per_class_recall", {}),
-                "per_class_support": val_metrics.get("per_class_support", {}),
-                "per_class_val_loss": val_metrics.get("per_class_val_loss", {}),
-                "per_class_train_loss": per_class_train_loss,
-                "val_none_precision": val_metrics.get("none_precision"),
-                "val_none_recall": val_metrics.get("none_recall"),
-                "val_none_f1": val_metrics.get("none_f1"),
-                "val_none_false_positive_rate": val_metrics.get("none_false_positive_rate"),
-                "best_val_macro_f1": best_val_macro_f1,
-                "selected_validation_score": selected_score,
-                "best_validation_score": best_validation_score,
-                "validation_metric": _primary_validation_metric(config),
-                "best_epoch": best_epoch + 1,
-            }
-            if dcw_controller is not None:
-                epoch_msg["per_class_weight_multiplier"] = dcw_controller.multipliers()
-            if config.ordinal:
-                epoch_msg["val_qwk"] = val_qwk
-                epoch_msg["val_ordinal_mae"] = val_metrics.get("ordinal_mae")
-                epoch_msg["val_adjacent_accuracy"] = val_metrics.get("adjacent_accuracy")
-                epoch_msg["best_val_qwk"] = best_val_qwk
+            epoch_msg = _build_epoch_message(
+                epoch=epoch,
+                config=config,
+                train_loss=train_loss,
+                val_metrics=val_metrics,
+                best_val_macro_f1=best_val_macro_f1,
+                best_val_qwk=best_val_qwk,
+                selected_score=selected_score,
+                best_validation_score=best_validation_score,
+                best_epoch=best_epoch,
+                per_class_train_loss=per_class_train_loss,
+                elapsed_seconds=time.monotonic() - epoch_start_mono,
+                dcw_multipliers=(
+                    dcw_controller.multipliers() if dcw_controller is not None else None
+                ),
+            )
             cb(epoch_msg)
 
             # Epoch-boundary backup: the cleanest resume point (scheduler stepped,
@@ -3459,6 +3681,7 @@ def run_group_training(
             device=device, dtype=dtype,
             checkpoint_dir=checkpoint_dir,
             class_counts=train_ds.get_class_counts(),
+            effective_class_counts=train_ds.get_effective_class_counts(),
             total_raw=total_raw,
             cb=cb,
         )

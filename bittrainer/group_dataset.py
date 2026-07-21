@@ -52,6 +52,19 @@ def rare_group_none_target(max_count: int, non_none_class_count: int) -> int:
     return max(max_count, math.ceil(_RARE_GROUP_OVERSAMPLE_FACTOR * non_none_total))
 
 
+def compute_class_log_priors(counts: dict[int, int], num_classes: int) -> dict[str, float]:
+    """Laplace-smoothed log-prior vector keyed by ``str(class_index)``.
+
+    ``+1`` smoothing keeps empty classes finite (``log(1/total)`` rather than
+    ``log(0)``), so a class with no samples never poisons the decode-time
+    ``log(natural) - log(effective)`` adjustment. Values are natural logs of the
+    normalised (smoothed) class probabilities (ISSUE-0490 A).
+    """
+    smoothed = [float(counts.get(i, 0) or 0) + 1.0 for i in range(num_classes)]
+    total = sum(smoothed)
+    return {str(i): math.log(smoothed[i] / total) for i in range(num_classes)}
+
+
 def _list_class_images(group_folder: Path, class_name: str, split: str) -> list[Path]:
     d = group_folder / class_name / split
     if not d.is_dir():
@@ -491,6 +504,21 @@ class GroupDataset(Dataset):
                     counts[lbl] = counts.get(lbl, 0) + 1
             return counts
         return {i: len(paths) for i, paths in enumerate(self._class_paths)}
+
+    def get_effective_class_counts(self) -> dict[int, int]:
+        """Per-class sample counts AFTER oversample expansion — the model's
+        actual per-epoch class exposure.
+
+        Counts the built ``samples`` list (single-label only; multi-label labels
+        are tensors and have no single class index). This is the numerator of the
+        effective train prior that inference-time prior correction divides out
+        (ISSUE-0490 A)."""
+        counts: dict[int, int] = {}
+        for s in self.samples:
+            lbl = s["label"]
+            if isinstance(lbl, int):
+                counts[lbl] = counts.get(lbl, 0) + 1
+        return counts
 
 
 class GroupBucketBatchSampler(Sampler):

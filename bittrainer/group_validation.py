@@ -25,6 +25,8 @@ def compute_multiclass_metrics(
     if len(labels) == 0:
         return {
             "macro_f1": 0.0,
+            "weighted_f1": 0.0,
+            "micro_f1": 0.0,
             "macro_precision": 0.0,
             "macro_recall": 0.0,
             "per_class_f1": {},
@@ -40,6 +42,16 @@ def compute_multiclass_metrics(
     class_labels = list(range(num_classes))
 
     macro_f1 = float(f1_score(y_true, y_pred, average="macro", zero_division=0, labels=class_labels))
+    # weighted_f1: support-weighted mean of per-class F1 (diverges from macro
+    # under imbalance); micro_f1: global TP/FP/FN pool (== accuracy for
+    # single-label exclusive predictions). Both surface the "actual spread"
+    # number balanced-training macro selection hides (ISSUE-0490 B).
+    weighted_f1 = float(
+        f1_score(y_true, y_pred, average="weighted", zero_division=0, labels=class_labels)
+    )
+    micro_f1 = float(
+        f1_score(y_true, y_pred, average="micro", zero_division=0, labels=class_labels)
+    )
     macro_precision = float(precision_score(y_true, y_pred, average="macro", zero_division=0, labels=class_labels))
     macro_recall = float(recall_score(y_true, y_pred, average="macro", zero_division=0, labels=class_labels))
 
@@ -61,6 +73,8 @@ def compute_multiclass_metrics(
 
     return {
         "macro_f1": macro_f1,
+        "weighted_f1": weighted_f1,
+        "micro_f1": micro_f1,
         "macro_precision": macro_precision,
         "macro_recall": macro_recall,
         "per_class_f1": per_class_f1,

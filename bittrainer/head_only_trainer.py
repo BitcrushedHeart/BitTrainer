@@ -204,6 +204,7 @@ def run_head_only_training(
         device=device, dtype=dtype,
         checkpoint_dir=checkpoint_dir,
         class_counts=class_counts,
+        effective_class_counts=train_ds.get_effective_class_counts(),
         total_raw=total_raw,
         cb=cb,
     )

@@ -131,6 +131,12 @@ class BackboneTrainingCancelled(RuntimeError):
 # --------------------------------------------------------------------------- #
 
 
+def _safe_module_key(name: str) -> str:
+    """nn.Module/ModuleDict keys reject '.' (e.g. a person concept like
+    "Carmen B. Sanchez") - normalise before using a label as one."""
+    return name.replace(".", "_") if name else name
+
+
 class _Vocab:
     """Label spaces derived from the record payload."""
 
@@ -140,10 +146,10 @@ class _Vocab:
         for record in records:
             for concept, label in (record.get("binary") or {}).items():
                 if str(label).lower() in _POSITIVE_LABELS | _NEGATIVE_LABELS:
-                    concepts.add(concept)
+                    concepts.add(_safe_module_key(concept))
             for group, class_name in (record.get("groups") or {}).items():
                 if class_name:
-                    group_classes.setdefault(group, set()).add(str(class_name))
+                    group_classes.setdefault(_safe_module_key(group), set()).add(str(class_name))
         self.concepts = sorted(concepts)
         # Single-class groups carry no training signal for CE.
         self.groups = {
@@ -180,15 +186,17 @@ def _build_samples(records: list[dict], vocab: _Vocab) -> tuple[list[_Sample], i
         binary: dict[str, float] = {}
         for concept, label in (record.get("binary") or {}).items():
             lowered = str(label).lower()
+            key = _safe_module_key(concept)
             if lowered in _POSITIVE_LABELS:
-                binary[concept] = 1.0
+                binary[key] = 1.0
             elif lowered in _NEGATIVE_LABELS:
-                binary[concept] = 0.0
+                binary[key] = 0.0
         groups: dict[str, int] = {}
         for group, class_name in (record.get("groups") or {}).items():
-            classes = vocab.groups.get(group)
+            key = _safe_module_key(group)
+            classes = vocab.groups.get(key)
             if classes and str(class_name) in classes:
-                groups[group] = classes.index(str(class_name))
+                groups[key] = classes.index(str(class_name))
         if binary or groups:
             samples.append(_Sample(path, binary, groups))
     return samples, missing
