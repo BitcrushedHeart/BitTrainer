@@ -18,6 +18,7 @@ computed by :func:`bittrainer.model.pooled_features` with the backbone in
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import random
@@ -39,9 +40,24 @@ logger = logging.getLogger(__name__)
 EMBED_CACHE_VERSION = 1
 
 # Era namespace = backbone-feature hash (16-char hex digest from
-# model.backbone_feature_hash). Used to recognise our own era directories when
-# pruning so we never touch an unrelated sibling under the cache root.
-_ERA_DIR_RE = re.compile(r"^[0-9a-f]{16}$")
+# model.backbone_feature_hash), optionally suffixed with a preprocessing
+# signature digest (see _sig_suffix). Used to recognise our own era directories
+# when pruning so we never touch an unrelated sibling under the cache root.
+_ERA_DIR_RE = re.compile(r"^[0-9a-f]{16}(-[0-9a-f]{8})?$")
+
+
+def _sig_suffix(preproc_sig: str) -> str:
+    """Directory-name suffix folding ``preproc_sig`` into the era identity.
+
+    ``preproc_sig`` is cache IDENTITY, not just provenance: a preprocessing
+    change (e.g. a different input resolution) changes every pooled vector's
+    VALUES while the dim stays fixed, so vectors built under a different sig
+    must never be silently reused. The historical default ``"val_imagenet"``
+    maps to the empty suffix so existing caches keep their directory name.
+    """
+    if preproc_sig == "val_imagenet":
+        return ""
+    return "-" + hashlib.sha1(preproc_sig.encode("utf-8")).hexdigest()[:8]
 
 
 class EmbeddingCacheMismatch(RuntimeError):
@@ -71,7 +87,7 @@ class EmbeddingCache:
         *,
         preproc_sig: str = "val_imagenet",
     ) -> None:
-        self.root = Path(cache_dir) / backbone_hash
+        self.root = Path(cache_dir) / (backbone_hash + _sig_suffix(preproc_sig))
         self.backbone_hash = backbone_hash
         self.pooled_dim = int(pooled_dim)
         self.preproc_sig = preproc_sig
@@ -121,7 +137,10 @@ class EmbeddingCache:
             return []
         removed: list[str] = []
         for child in parent.iterdir():
-            if not child.is_dir() or child.name == self.backbone_hash:
+            # Compare against the full namespaced name: two preproc sigs of the
+            # same backbone hash are mutually pruning (a preprocessing switch
+            # invalidates the old vectors just like a weight change does).
+            if not child.is_dir() or child.name == self.root.name:
                 continue
             if not _ERA_DIR_RE.match(child.name) and not (child / "meta.json").is_file():
                 continue

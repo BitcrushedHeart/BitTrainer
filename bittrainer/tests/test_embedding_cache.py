@@ -90,6 +90,44 @@ def test_stale_era_pruned_on_backbone_change(tmp_path):
     assert eras == [h2]
 
 
+def test_preproc_sig_namespaces_on_disk(tmp_path):
+    """preproc_sig is cache IDENTITY: a non-default sig gets its own era dir
+    (resolution changes pooled-vector VALUES at fixed dim, so vectors built
+    under different preprocessing must never be silently reused). The default
+    sig keeps the bare backbone-hash dir name — existing caches stay valid."""
+    model = create_model(model_size="nano", pretrained=False, num_classes=3).eval()
+    h = backbone_feature_hash(model)
+    default = EmbeddingCache(tmp_path / "embed", h, 640)
+    sized = EmbeddingCache(tmp_path / "embed", h, 640, preproc_sig="val_imagenet@256sq")
+    assert default.root.name == h
+    assert sized.root.name != h
+    assert sized.root.name.startswith(h + "-")
+    assert default.root != sized.root
+
+
+def test_prune_reclaims_other_sig_same_hash(tmp_path):
+    """Two sigs of the same backbone hash are mutually pruning: establishing
+    one era reclaims the other (a preprocessing switch invalidates the old
+    vectors just like a weight change does)."""
+    samples = _samples(tmp_path)
+    model = create_model(model_size="nano", pretrained=False, num_classes=3).eval()
+    root = tmp_path / "embed"
+    h = backbone_feature_hash(model)
+    EmbeddingCache(root, h, 640).ensure(samples, model, None, device=_DEV, dtype=_DT)
+    sized = EmbeddingCache(root, h, 640, preproc_sig="val_imagenet@256sq")
+    sized.ensure(samples, model, None, device=_DEV, dtype=_DT)
+    eras = sorted(p.name for p in root.iterdir() if p.is_dir())
+    assert eras == [sized.root.name]
+
+
+def test_era_regex_matches_suffixed_dirs(tmp_path):
+    from bittrainer.embedding_cache import _ERA_DIR_RE
+
+    assert _ERA_DIR_RE.match("0123456789abcdef")
+    assert _ERA_DIR_RE.match("0123456789abcdef-89abcdef")
+    assert not _ERA_DIR_RE.match("not-an-era")
+
+
 def test_prune_leaves_unrelated_dirs(tmp_path):
     """Pruning only touches recognisable era namespaces — an unrelated sibling
     directory under the cache root is never deleted."""
