@@ -9,6 +9,7 @@ timm weights are downloaded.
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
 
 import torch
 from PIL import Image
@@ -106,25 +107,44 @@ def test_amp_settings_float16():
     assert dtype is torch.float16
 
 
-def test_build_scheduler_cosine_default_on():
+def _task_optimizer(tmp_path, **config_extra):
+    """Build a BackboneTask and run its create_optimizer hook.
+
+    Scheduler/EMA construction moved off `backbone_trainer` into
+    `BackboneTask.create_optimizer` in the GenericTrainer refactor (ISSUE-0542);
+    these tests follow it there. `ctx` is only touched on resume, so None is safe
+    with `resume_state=None`.
+    """
+    from bittrainer.generic.tasks.backbone_task import BackboneTask
+
+    task = BackboneTask(_make_request(tmp_path, config_extra=config_extra))
     model = torch.nn.Linear(2, 2)
-    opt = torch.optim.AdamW(model.parameters(), lr=1e-3)
-    sched = bt._build_scheduler(opt, {}, epochs=5)
+    optimizer, scheduler, _t_max = task.create_optimizer(None, model, 2, None)
+    return task, optimizer, scheduler
+
+
+def test_scheduler_is_cosine_by_default(tmp_path):
+    _task, _opt, sched = _task_optimizer(tmp_path, epochs=5)
     assert isinstance(sched, torch.optim.lr_scheduler.CosineAnnealingLR)
 
 
-def test_build_scheduler_off():
-    model = torch.nn.Linear(2, 2)
-    opt = torch.optim.AdamW(model.parameters(), lr=1e-3)
-    assert bt._build_scheduler(opt, {"use_cosine": False}, epochs=5) is None
-
-
-def test_cosine_lr_decays_across_steps():
-    model = torch.nn.Linear(2, 2)
-    opt = torch.optim.AdamW(model.parameters(), lr=1e-3)
-    sched = bt._build_scheduler(opt, {}, epochs=4)
+def test_scheduler_off_is_a_constant_multiplier(tmp_path):
+    """use_cosine=False no longer returns None: the core steps and serialises the
+    scheduler every epoch, so the task hands back a constant-LR LambdaLR."""
+    _task, opt, sched = _task_optimizer(tmp_path, epochs=5, use_cosine=False)
+    assert isinstance(sched, torch.optim.lr_scheduler.LambdaLR)
     lr0 = opt.param_groups[0]["lr"]
-    opt.step()
+    # Scheduler only — the task builds a Prodigy_adv optimizer, whose .step()
+    # needs a real backward pass first. The LR schedule is what is under test.
+    sched.step()
+    sched.step()
+    assert opt.param_groups[0]["lr"] == lr0
+
+
+def test_cosine_lr_decays_across_steps(tmp_path):
+    _task, opt, sched = _task_optimizer(tmp_path, epochs=4)
+    lr0 = opt.param_groups[0]["lr"]
+    # See test_scheduler_off_is_a_constant_multiplier — scheduler steps only.
     sched.step()
     sched.step()
     assert opt.param_groups[0]["lr"] < lr0
@@ -143,20 +163,28 @@ def test_training_completes_and_writes_checkpoint(tmp_path):
 
 
 def test_ema_updates_are_applied(tmp_path):
+    """EMA now lives on the task (ISSUE-0542), so spy on the task's own symbol."""
+    import bittrainer.generic.tasks.backbone_task as bbtask
+
     calls = {"n": 0}
-    orig = bt.ModelEMA
+    orig = bbtask.ModelEMA
 
     class _SpyEMA(orig):  # type: ignore[misc, valid-type]
         def update(self, model):
             calls["n"] += 1
             super().update(model)
 
-    bt.ModelEMA = _SpyEMA
+    bbtask.ModelEMA = _SpyEMA
     try:
         _run(_make_request(tmp_path, config_extra={"use_ema": True, "max_steps": 3}))
     finally:
-        bt.ModelEMA = orig
+        bbtask.ModelEMA = orig
     assert calls["n"] >= 1
+
+
+def test_ema_is_off_when_disabled(tmp_path):
+    task, _opt, _sched = _task_optimizer(tmp_path, use_ema=False)
+    assert task.ema is None
 
 
 def test_backup_complete_emitted(tmp_path):
@@ -182,14 +210,15 @@ def test_backup_complete_emitted(tmp_path):
 
 def test_resume_emits_training_resumed(tmp_path):
     backup_dir = tmp_path / "backups"
-    # First run: produce a backup (do not delete on completion by pausing).
-    pause = _StubEvent()
-    pause.set()
+    # First run: produce a backup by pausing MID-RUN. A pause that is already set
+    # when run() starts is answered before any training with backup_path=None
+    # ("nothing trained, nothing to snapshot"), so it would leave backup_dir empty
+    # and this test would never reach the resume it exists to cover.
     _run(
         _make_request(
             tmp_path, config_extra={"backup_dir": str(backup_dir), "backup_every_steps": 1}
         ),
-        pause_event=pause,
+        pause_event=_DelayedStubEvent(after=4),
     )
     assert list(backup_dir.glob("backup_*.pt"))
 
@@ -218,6 +247,40 @@ def test_pause_returns_paused(tmp_path):
     assert result.get("paused") is True
 
 
+def test_pause_before_training_starts_reports_no_backup(tmp_path):
+    """A pause during data prep is answered before anything is trained, so there
+    is no state to snapshot — `backup_path` is None BY DESIGN. Pinned because
+    the Engine relies on it (`job.backup_path = msg[...] or job.backup_path`
+    keeps the previous backup rather than clobbering it with None)."""
+    backup_dir = tmp_path / "bk_early"
+    pause = _StubEvent()
+    pause.set()
+    result = _run(
+        _make_request(tmp_path, config_extra={"backup_dir": str(backup_dir)}),
+        pause_event=pause,
+    )
+    assert result.get("paused") is True
+    assert result.get("backup_path") is None
+    assert not list(backup_dir.glob("backup_*.pt"))
+
+
+def test_pause_mid_run_writes_a_resumable_backup(tmp_path):
+    """The pause that matters: once the epoch loop is running, the boundary hook
+    snapshots state and the returned backup_path points at a real file."""
+    backup_dir = tmp_path / "bk_mid"
+    result = _run(
+        _make_request(
+            tmp_path,
+            config_extra={"backup_dir": str(backup_dir), "backup_every_steps": 1, "epochs": 3},
+        ),
+        pause_event=_DelayedStubEvent(after=4),
+    )
+    assert result.get("paused") is True
+    assert result["backup_path"] is not None
+    assert Path(result["backup_path"]).is_file()
+    assert list(backup_dir.glob("backup_*.pt"))
+
+
 def test_early_stopping_on_non_improving_validation(tmp_path, monkeypatch):
     # Force validation to never improve -> patience should trip early.
     monkeypatch.setattr(
@@ -243,6 +306,22 @@ class _StubEvent:
 
     def is_set(self) -> bool:
         return self._set
+
+
+class _DelayedStubEvent(_StubEvent):
+    """Fires only after ``after`` polls, so the pause lands INSIDE the epoch loop
+    (where there is state worth backing up) rather than during data prep."""
+
+    def __init__(self, *, after: int) -> None:
+        super().__init__()
+        self._after = int(after)
+        self._polls = 0
+
+    def is_set(self) -> bool:
+        if self._set:
+            return True
+        self._polls += 1
+        return self._polls > self._after
 
 
 # --------------------------------------------------------------------------- #
