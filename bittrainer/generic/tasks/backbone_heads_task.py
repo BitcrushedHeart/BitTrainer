@@ -67,8 +67,14 @@ class BackboneHeadsTask(BackboneTask):
 
     trainer_name = "backbone_heads"
 
-    def __init__(self, request: dict, *, cancel_event: threading.Event | None = None) -> None:
-        super().__init__(request, cancel_event=cancel_event)
+    def __init__(
+        self,
+        request: dict,
+        *,
+        cancel_event: threading.Event | None = None,
+        stop_event: threading.Event | None = None,
+    ) -> None:
+        super().__init__(request, cancel_event=cancel_event, stop_event=stop_event)
         c = self.config
         # Vectors are cheap — a much larger batch than the image default.
         self.batch_size = int(c.get("head_batch_size") or 256)

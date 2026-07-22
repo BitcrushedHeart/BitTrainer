@@ -60,14 +60,23 @@ class BackboneTask(TrainingTask):
 
     trainer_name = "backbone"
 
-    def __init__(self, request: dict, *, cancel_event: threading.Event | None = None) -> None:
+    def __init__(
+        self,
+        request: dict,
+        *,
+        cancel_event: threading.Event | None = None,
+        stop_event: threading.Event | None = None,
+    ) -> None:
         self.request = request
         self.config = dict(request.get("training_config") or {})
         # Cancellation (raise BackboneTrainingCancelled) is distinct from the core's
         # stop_event: it propagates out instead of finalising. max_steps rides the
         # core's stop_event via ``steps_stop_event`` (graceful boundary stop).
         self.cancel_event = cancel_event
-        self.steps_stop_event = threading.Event()
+        # A caller-supplied ``stop_event`` (Bitcrush ISSUE-0554 finish-early)
+        # IS the steps event, so the task's own max_steps stop and the user's
+        # request share one graceful-boundary signal.
+        self.steps_stop_event = stop_event if stop_event is not None else threading.Event()
 
         c = self.config
         self.image_size = int(c.get("image_size") or 384)

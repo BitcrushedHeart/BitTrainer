@@ -243,3 +243,56 @@ class _StubEvent:
 
     def is_set(self) -> bool:
         return self._set
+
+
+# --------------------------------------------------------------------------- #
+# Graceful stop / stop-now (Bitcrush ISSUE-0554)                               #
+# --------------------------------------------------------------------------- #
+
+
+def test_graceful_stop_finishes_early_and_still_exports(tmp_path):
+    """`stop_event` breaks at the next epoch boundary but STILL finalises, so a
+    finish-early keeps the best candidate (unlike a pause, which ships nothing)."""
+    stop = _StubEvent()
+    stop.set()
+    messages = []
+    result = _run(
+        _make_request(tmp_path, config_extra={"epochs": 4}),
+        progress_callback=messages.append,
+        stop_event=stop,
+    )
+    assert result.get("paused") is not True
+    assert result["candidate_checkpoint_path"]
+    assert result["epochs_completed"] < 4
+    assert any(m.get("type") == "graceful_stop" for m in messages)
+
+
+def test_stop_now_breaks_immediately_and_still_exports(tmp_path):
+    stop_now = _StubEvent()
+    stop_now.set()
+    messages = []
+    result = _run(
+        _make_request(tmp_path, config_extra={"epochs": 4}),
+        progress_callback=messages.append,
+        stop_now_event=stop_now,
+    )
+    assert result["candidate_checkpoint_path"]
+    assert any(m.get("type") == "stop_now" for m in messages)
+
+
+def test_max_steps_still_stops_without_an_external_stop_event(tmp_path):
+    """The task's own max_steps stop must survive the external-event wiring."""
+    result = _run(_make_request(tmp_path, config_extra={"epochs": 4, "max_steps": 2}))
+    assert result["epochs_completed"] < 4
+
+
+def test_head_training_accepts_the_stop_events(tmp_path):
+    """Head-only shares the entry-point contract even though it has no loop to
+    interrupt — the kwargs must not raise."""
+    import inspect
+
+    from bittrainer.backbone_trainer import run_backbone_head_training
+
+    params = inspect.signature(run_backbone_head_training).parameters
+    assert "stop_event" in params
+    assert "stop_now_event" in params

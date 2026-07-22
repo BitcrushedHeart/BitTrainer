@@ -564,6 +564,8 @@ def _train_backbone(
     emit: Callable[[dict], None],
     stop: threading.Event,
     pause_event: object | None = None,
+    stop_event: object | None = None,
+    stop_now_event: object | None = None,
 ) -> dict:
     """Worker-thread target: drive :class:`GenericTrainer` with a ``BackboneTask``.
 
@@ -578,12 +580,13 @@ def _train_backbone(
     from bittrainer.generic.generic_trainer import GenericTrainer
     from bittrainer.generic.tasks.backbone_task import BackboneTask
 
-    task = BackboneTask(request, cancel_event=stop)
+    task = BackboneTask(request, cancel_event=stop, stop_event=stop_event)
     return GenericTrainer().run(
         task,
         progress_callback=emit,
         pause_event=pause_event,
         stop_event=task.steps_stop_event,
+        stop_now_event=stop_now_event,
     )
 
 
@@ -592,18 +595,21 @@ def _train_backbone_heads(
     emit: Callable[[dict], None],
     stop: threading.Event,
     pause_event: object | None = None,
+    stop_event: object | None = None,
+    stop_now_event: object | None = None,
 ) -> dict:
     """Worker-thread target for head-only retraining (frozen trunk, cached
     features); same shape as :func:`_train_backbone`."""
     from bittrainer.generic.generic_trainer import GenericTrainer
     from bittrainer.generic.tasks.backbone_heads_task import BackboneHeadsTask
 
-    task = BackboneHeadsTask(request, cancel_event=stop)
+    task = BackboneHeadsTask(request, cancel_event=stop, stop_event=stop_event)
     return GenericTrainer().run(
         task,
         progress_callback=emit,
         pause_event=pause_event,
         stop_event=task.steps_stop_event,
+        stop_now_event=stop_now_event,
     )
 
 
@@ -614,7 +620,14 @@ def _train_backbone_heads(
 _DONE = object()
 
 
-async def run_backbone_training(request: dict, progress_callback=None, *, pause_event=None) -> dict:
+async def run_backbone_training(
+    request: dict,
+    progress_callback=None,
+    *,
+    pause_event=None,
+    stop_event=None,
+    stop_now_event=None,
+) -> dict:
     """Train a backbone candidate; see module docstring for the contract.
 
     ``pause_event`` (Bitcrush ISSUE-0405/0476) is an optional threading/mp event.
@@ -622,12 +635,24 @@ async def run_backbone_training(request: dict, progress_callback=None, *, pause_
     ``{"paused": True, ...}``. Combined with ``training_config``'s ``backup_dir``
     / ``resume_from`` a later call rebuilds and resumes the run. All new config
     lives on ``training_config``, so the Engine wire contract stays additive.
+
+    ``stop_event`` / ``stop_now_event`` (Bitcrush ISSUE-0554) are the finish-early
+    signals: the first breaks at the next epoch boundary, the second also cuts the
+    current epoch short. BOTH still run finalisation, so the best candidate is
+    exported — unlike a pause, which deliberately ships nothing.
     """
-    return await _run_worker_async(_train_backbone, request, progress_callback, pause_event)
+    return await _run_worker_async(
+        _train_backbone, request, progress_callback, pause_event, stop_event, stop_now_event
+    )
 
 
 async def run_backbone_head_training(
-    request: dict, progress_callback=None, *, pause_event=None
+    request: dict,
+    progress_callback=None,
+    *,
+    pause_event=None,
+    stop_event=None,
+    stop_now_event=None,
 ) -> dict:
     """Retrain the multi-task heads against a FROZEN existing backbone.
 
@@ -642,10 +667,14 @@ async def run_backbone_head_training(
     byte-for-byte plus fresh ``heads.*`` tensors (``head_only_retrain`` = "1"
     in the metadata).
     """
-    return await _run_worker_async(_train_backbone_heads, request, progress_callback, pause_event)
+    return await _run_worker_async(
+        _train_backbone_heads, request, progress_callback, pause_event, stop_event, stop_now_event
+    )
 
 
-async def _run_worker_async(worker, request: dict, progress_callback, pause_event) -> dict:
+async def _run_worker_async(
+    worker, request: dict, progress_callback, pause_event, stop_event=None, stop_now_event=None
+) -> dict:
     loop = asyncio.get_running_loop()
     queue: asyncio.Queue = asyncio.Queue()
     stop = threading.Event()
@@ -666,7 +695,9 @@ async def _run_worker_async(worker, request: dict, progress_callback, pause_even
 
     forwarder = asyncio.create_task(forward())
     try:
-        return await asyncio.to_thread(worker, request, emit, stop, pause_event)
+        return await asyncio.to_thread(
+            worker, request, emit, stop, pause_event, stop_event, stop_now_event
+        )
     except asyncio.CancelledError:
         stop.set()
         raise
