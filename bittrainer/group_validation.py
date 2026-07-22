@@ -177,6 +177,12 @@ def _real_ordinal_indices(num_classes: int, none_index: int) -> list[int]:
     return [i for i in range(num_classes) if i != none_index]
 
 
+# Bimodal fallback (Bitcrush ISSUE-0562): when the two heaviest real classes
+# sit this far apart on the ordinal scale, E[j] lands between the modes where
+# almost no probability mass lives, so argmax is authoritative.
+_BIMODAL_GAP = 2.0
+
+
 def ordinal_decode(
     probs: np.ndarray,
     *,
@@ -197,9 +203,13 @@ def ordinal_decode(
     rounding the mean scores higher QWK — but only ambiguity justifies that
     (ISSUE-0540): when one real class holds ``confidence_gate`` or more of the
     renormalised ordinal mass, argmax is authoritative and no fitted boundary
-    may override it. The EV + cut-point decode only decides the sub-gate rows.
-    Because :func:`find_ordinal_cut_points` scores candidates through this
-    function, boundaries are fitted under the same gate.
+    may override it. Likewise (Bitcrush ISSUE-0562), when the two heaviest real
+    classes are ``_BIMODAL_GAP`` or more apart on the ordinal scale the
+    posterior is bimodal — E[j] falls between the modes where almost no mass
+    lives, so those rows also decode argmax. The EV + cut-point decode only
+    decides the remaining genuinely ambiguous rows. Because
+    :func:`find_ordinal_cut_points` scores candidates through this function,
+    boundaries are fitted under the same gates.
 
     ``__none__`` is off the ordinal scale: samples whose overall ``argmax`` is
     ``none_index`` are decoded as ``__none__`` (preserving the tuned none-bias
@@ -248,10 +258,14 @@ def ordinal_decode(
         decoded = real_arr[pos].astype(np.int64)
 
         # Confidence gate: a majority-of-ordinal-mass class is decoded as
-        # itself, whatever the boundaries say.
+        # itself, whatever the boundaries say. Bimodal gate: top-2 real
+        # classes >= _BIMODAL_GAP apart means E[j] sits in the trough between
+        # modes, so the mode wins there too.
         real_argmax = real_arr[norm.argmax(axis=1)].astype(np.int64)
         confident = norm.max(axis=1) >= confidence_gate
-        decoded = np.where(confident, real_argmax, decoded)
+        order = np.argsort(norm, axis=1)
+        bimodal = np.abs(real_arr[order[:, -1]] - real_arr[order[:, -2]]) >= _BIMODAL_GAP
+        decoded = np.where(confident | bimodal, real_argmax, decoded)
 
     if 0 <= none_index < num_classes:
         decoded = np.where(argmax_all == none_index, none_index, decoded)
@@ -266,6 +280,7 @@ def find_ordinal_cut_points(
     none_index: int = -1,
     grid_steps: int = 20,
     passes: int = 3,
+    clamp: float = 0.25,
 ) -> list[float] | None:
     """Fit ``E[j]`` decision boundaries that maximise validation QWK.
 
@@ -274,6 +289,12 @@ def find_ordinal_cut_points(
     boundaries (an OptimizedRounder, Kaggle-style) so the decode is tuned to the
     metric we actually ship on. Coordinate ascent over a per-boundary grid,
     keeping boundaries monotonic; deterministic and dependency-free.
+
+    Each boundary is confined to its neutral half-integer ``+/- clamp``
+    (Bitcrush ISSUE-0562): the unconstrained fit could drift a boundary far
+    enough to squeeze a class band to a fraction of its natural width —
+    aggregate-QWK-optimal on the val split, per-image indefensible. With the
+    default 0.25 no band can shrink below half its natural width.
 
     Returns the boundary list, or ``None`` when there is no ordinal scale to fit
     (fewer than two real classes) so callers fall back to round-to-nearest.
@@ -292,7 +313,8 @@ def find_ordinal_cut_points(
             labels, preds, num_classes, none_index=none_index,
         )["qwk"]
 
-    boundaries = (real_arr[:-1] + real_arr[1:]) / 2.0
+    neutral = (real_arr[:-1] + real_arr[1:]) / 2.0
+    boundaries = neutral.copy()
     best_score = _qwk(boundaries)
 
     for _ in range(max(1, passes)):
@@ -300,6 +322,11 @@ def find_ordinal_cut_points(
         for b in range(len(boundaries)):
             lo = real_arr[b] if b == 0 else boundaries[b - 1]
             hi = real_arr[b + 1] if b == len(boundaries) - 1 else boundaries[b + 1]
+            # Clamp to the neutral half-integer's neighbourhood (ISSUE-0562).
+            lo = max(lo, neutral[b] - clamp)
+            hi = min(hi, neutral[b] + clamp)
+            if hi - lo <= 1e-9:
+                continue
             # Open interval so boundaries stay strictly monotonic.
             candidates = np.linspace(lo, hi, grid_steps + 2)[1:-1]
             for c in candidates:

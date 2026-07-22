@@ -74,6 +74,43 @@ def test_none_override_survives_gate():
     assert ordinal_decode(probs, none_index=0, cut_points=[1.4, 2.5]) == [0]
 
 
+def test_bimodal_top2_two_apart_decodes_argmax():
+    """Top-2 real classes >= 2 apart: E[j] lands between the modes where almost
+    no mass lives, so argmax is authoritative (Bitcrush ISSUE-0562)."""
+    # Modes at 0 (0.48) and 2 (0.47); EV ~= 0.99 would decode the near-empty
+    # middle class under midpoint boundaries. Confidence gate does not fire.
+    probs = np.array([[0.48, 0.05, 0.47]])
+    assert ordinal_decode(probs, none_index=-1, cut_points=[0.5, 1.5]) == [0]
+
+
+def test_bimodal_adjacent_top2_still_ev_decoded():
+    """Top-2 real classes adjacent: the EV + cut-point decode is untouched."""
+    probs = np.array([[0.10, 0.35, 0.30, 0.25]])  # top-2 are classes 1 and 2
+    assert ordinal_decode(probs, none_index=-1, cut_points=[0.5, 1.5, 2.5]) == [2]
+
+
+def test_bimodal_gate_reads_renormalised_real_mass():
+    """The top-2 separation is measured on the real (non-none) ordinal scale."""
+    # none_index=0; real modes at 1 (0.45) and 3 (0.43), two apart. EV ~= 1.98
+    # would decode the middle class 2; renormalised max 0.45/0.94 < 0.5 so the
+    # confidence gate alone would not save it.
+    probs = np.array([[0.06, 0.45, 0.06, 0.43]])
+    assert ordinal_decode(probs, none_index=0, cut_points=[1.5, 2.5]) == [1]
+
+
+def test_none_override_survives_bimodal_gate():
+    """Overall argmax == __none__ still decodes __none__, bimodal or not."""
+    probs = np.array([[0.40, 0.31, 0.01, 0.28]])
+    assert ordinal_decode(probs, none_index=0, cut_points=[1.5, 2.5]) == [0]
+
+
+def test_bimodal_and_confidence_gates_compose():
+    """A row tripping both gates decodes argmax, same as tripping either."""
+    probs = np.array([[0.55, 0.00, 0.45]])  # confident AND bimodal
+    # Adversarial boundary at 0.9 would bucket EV=0.90 into class 1.
+    assert ordinal_decode(probs, none_index=-1, cut_points=[0.9, 1.1]) == [0]
+
+
 def test_fitter_never_flips_majority_confident_samples():
     """find_ordinal_cut_points scores through the gated decode, so no fitted
     boundary can flip a row whose renormalised top real prob >= 0.5."""
