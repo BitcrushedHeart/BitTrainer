@@ -171,6 +171,13 @@ class GroupTrainConfig:
     cell_masks: list[list[int]] | None = None
     grid_rows: int = 3
     grid_cols: int = 3
+    # General label-aware horizontal flip: ``flip_class_map[i]`` is the class
+    # index a mirrored image's label becomes. Set by any group whose labels are
+    # left/right-sensitive but which has no grid to derive a map from — Engine's
+    # Gaze Direction (Left<->Right and the two diagonal pairs). Takes precedence
+    # over the ``cell_masks``-derived spatial map; same effect on augmentation
+    # (labels flip with images, RandAugment stays photometric).
+    flip_class_map: list[int] | None = None
     oversample_none: bool = False
     extra_paths_train: dict[str, list[str]] = field(default_factory=dict)
     extra_paths_val: dict[str, list[str]] = field(default_factory=dict)
@@ -768,7 +775,13 @@ def _train_one_epoch(
     # flip inside apply_train_augment would teach left/right classes to
     # collapse into each other.
     spatial_flip_map: torch.Tensor | None = None
-    if config.cell_masks:
+    if config.flip_class_map:
+        # An explicitly supplied map wins: the caller already knows how mirroring
+        # permutes its labels and needs no grid to say so.
+        spatial_flip_map = torch.tensor(
+            config.flip_class_map, dtype=torch.long, device=device,
+        )
+    elif config.cell_masks:
         from bittrainer.spatial import build_hflip_class_map
 
         spatial_flip_map = torch.tensor(
