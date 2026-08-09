@@ -28,6 +28,7 @@ def _stop_event_is_set(event) -> bool:
     survive pickling when datasets ship to DataLoader workers on Windows spawn."""
     return event is not None and event.is_set()
 
+
 _NUM_STAGES = 4  # ConvNeXt V2 has 4 stages
 
 
@@ -53,6 +54,15 @@ class TrainConfig:
     backbone_init: dict | None = None
     extra_positive_dirs: list[str] = field(default_factory=list)
     negative_dirs: list[str] = field(default_factory=list)
+    # Explicit per-file split contract. ``None`` preserves legacy directory
+    # scanning; an explicit empty list means the split intentionally has no
+    # files. Engine uses these for flat mapped datasets.
+    train_positive_paths: list[str] | None = None
+    val_positive_paths: list[str] | None = None
+    train_negative_paths: list[str] | None = None
+    val_negative_paths: list[str] | None = None
+    train_hard_negative_paths: list[str] | None = None
+    val_hard_negative_paths: list[str] | None = None
     hard_negative_paths: list[str] = field(default_factory=list)
     hard_negative_weight: int = 3
     label_smoothing: float = 0.1
@@ -107,7 +117,11 @@ def _make_optimizer(model: nn.Module, config: "TrainConfig") -> Prodigy_adv:
 
 
 def _get_dtype(name: str) -> torch.dtype:
-    return {"bfloat16": torch.bfloat16, "float16": torch.float16, "float32": torch.float32}[name]
+    return {
+        "bfloat16": torch.bfloat16,
+        "float16": torch.float16,
+        "float32": torch.float32,
+    }[name]
 
 
 def _unwrap_state_dict(data: dict | object) -> dict:
@@ -164,14 +178,17 @@ def train_one_epoch(
             break
         images = images.to(device, non_blocking=True)
         images = apply_train_augment(
-            images, dtype=dtype,
+            images,
+            dtype=dtype,
             randaugment_n=randaugment_n,
             randaugment_m=randaugment_m,
             random_erasing_p=random_erasing_p,
         )
         labels = labels.to(device)
 
-        with torch.amp.autocast(device_type=device.type, dtype=dtype, enabled=(dtype != torch.float32)):
+        with torch.amp.autocast(
+            device_type=device.type, dtype=dtype, enabled=(dtype != torch.float32)
+        ):
             logits = model(images)
             loss = criterion(logits, labels)
 
@@ -186,7 +203,9 @@ def train_one_epoch(
 
         # Backup/pause boundary (every batch — the binary trainer has no grad
         # accumulation). "stop" => a pause was requested and backed up; break.
-        boundary_signal = boundary_hook(num_batches) if boundary_hook is not None else None
+        boundary_signal = (
+            boundary_hook(num_batches) if boundary_hook is not None else None
+        )
 
         if step_callback is not None:
             now = time.monotonic()
@@ -222,7 +241,9 @@ def evaluate(
         images = apply_val_transform(images, dtype=dtype)
         labels = labels.to(device)
 
-        with torch.amp.autocast(device_type=device.type, dtype=dtype, enabled=(dtype != torch.float32)):
+        with torch.amp.autocast(
+            device_type=device.type, dtype=dtype, enabled=(dtype != torch.float32)
+        ):
             logits = model(images)
             loss = criterion(logits, labels)
 
@@ -250,7 +271,9 @@ def _tuned_val_metrics(val_result: dict) -> tuple[dict, float]:
     no optimism beyond what the served metric already carries.
     """
     threshold = find_optimal_threshold(val_result["labels"], val_result["probs"])
-    metrics = compute_metrics(val_result["labels"], val_result["probs"], threshold=threshold)
+    metrics = compute_metrics(
+        val_result["labels"], val_result["probs"], threshold=threshold
+    )
     return metrics, threshold
 
 
@@ -281,7 +304,11 @@ def _rebalance_val_negatives(train_ds: ConceptDataset, val_ds: ConceptDataset) -
 
     # Ensure val_ds has bucket info for donated paths (they were precomputed by train_ds)
     val_ds._path_info.update(
-        {str(p): train_ds._path_info[str(p)] for p in donated if str(p) in train_ds._path_info}
+        {
+            str(p): train_ds._path_info[str(p)]
+            for p in donated
+            if str(p) in train_ds._path_info
+        }
     )
 
     train_ds._build_samples()
@@ -289,7 +316,9 @@ def _rebalance_val_negatives(train_ds: ConceptDataset, val_ds: ConceptDataset) -
 
     logger.info(
         "Rebalanced val set: donated %d negatives from train → val (val now %d neg / %d pos)",
-        to_donate, len(val_ds._all_negative_paths), val_pos,
+        to_donate,
+        len(val_ds._all_negative_paths),
+        val_pos,
     )
 
 
@@ -355,14 +384,30 @@ def _binary_compare_promote(
             # Re-evaluate the old best.pt on the current validation set
             try:
                 old_data = torch.load(
-                    str(existing_best), map_location=device, weights_only=True,
+                    str(existing_best),
+                    map_location=device,
+                    weights_only=True,
                 )
-                old_sd = old_data["state_dict"] if isinstance(old_data, dict) and "state_dict" in old_data else old_data
-                old_size = old_data.get("model_size", config.model_size) if isinstance(old_data, dict) else config.model_size
-                old_model = create_model(model_size=old_size, pretrained=False, dtype=dtype).to(device)
+                old_sd = (
+                    old_data["state_dict"]
+                    if isinstance(old_data, dict) and "state_dict" in old_data
+                    else old_data
+                )
+                old_size = (
+                    old_data.get("model_size", config.model_size)
+                    if isinstance(old_data, dict)
+                    else config.model_size
+                )
+                old_model = create_model(
+                    model_size=old_size, pretrained=False, dtype=dtype
+                ).to(device)
                 old_model.load_state_dict(old_sd)
                 old_val_result = evaluate(
-                    old_model, val_loader, criterion, device, dtype,
+                    old_model,
+                    val_loader,
+                    criterion,
+                    device,
+                    dtype,
                 )
                 # Compare old vs new at the tuned threshold (consistent with the
                 # per-epoch selection metric and with what inference serves).
@@ -374,7 +419,8 @@ def _binary_compare_promote(
                     # Old model is better — keep existing best.pt, discard candidate
                     logger.info(
                         "Old checkpoint F1 %.4f > new F1 %.4f — keeping old",
-                        old_f1, best_val_f1,
+                        old_f1,
+                        best_val_f1,
                     )
                     candidate = Path(best_checkpoint_path)
                     if candidate.exists():
@@ -387,19 +433,31 @@ def _binary_compare_promote(
                     # New model wins — promote candidate to best.pt
                     logger.info(
                         "New checkpoint F1 %.4f >= old F1 %.4f — promoting new",
-                        best_val_f1, old_f1,
+                        best_val_f1,
+                        old_f1,
                     )
                     candidate = Path(best_checkpoint_path)
                     candidate.replace(existing_best)
                     best_checkpoint_path = str(existing_best)
-                    model.load_state_dict(_unwrap_state_dict(
-                        torch.load(best_checkpoint_path, map_location=device, weights_only=True),
-                    ))
+                    model.load_state_dict(
+                        _unwrap_state_dict(
+                            torch.load(
+                                best_checkpoint_path,
+                                map_location=device,
+                                weights_only=True,
+                            ),
+                        )
+                    )
                     val_result = evaluate(
-                        model, val_loader, criterion, device, dtype,
+                        model,
+                        val_loader,
+                        criterion,
+                        device,
+                        dtype,
                     )
                     optimal_threshold = find_optimal_threshold(
-                        val_result["labels"], val_result["probs"],
+                        val_result["labels"],
+                        val_result["probs"],
                     )
             except Exception:
                 # Old checkpoint incompatible (e.g. architecture change) — new wins
@@ -418,22 +476,32 @@ def _binary_compare_promote(
                     ),
                 )
                 val_result = evaluate(
-                    model, val_loader, criterion, device, dtype,
+                    model,
+                    val_loader,
+                    criterion,
+                    device,
+                    dtype,
                 )
                 optimal_threshold = find_optimal_threshold(
-                    val_result["labels"], val_result["probs"],
+                    val_result["labels"],
+                    val_result["probs"],
                 )
         else:
             # No existing best.pt — promote candidate directly
             candidate = Path(best_checkpoint_path)
             candidate.replace(existing_best)
             best_checkpoint_path = str(existing_best)
-            model.load_state_dict(_unwrap_state_dict(
-                torch.load(best_checkpoint_path, map_location=device, weights_only=True),
-            ))
+            model.load_state_dict(
+                _unwrap_state_dict(
+                    torch.load(
+                        best_checkpoint_path, map_location=device, weights_only=True
+                    ),
+                )
+            )
             val_result = evaluate(model, val_loader, criterion, device, dtype)
             optimal_threshold = find_optimal_threshold(
-                val_result["labels"], val_result["probs"],
+                val_result["labels"],
+                val_result["probs"],
             )
 
     return {

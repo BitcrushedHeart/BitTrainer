@@ -14,7 +14,6 @@ import torch
 from PIL import Image
 from torch.utils.data import Dataset, Sampler
 from torchvision import transforms
-from torchvision.transforms import functional as TF
 
 from bittrainer.image_utils import is_supported_image
 
@@ -31,15 +30,15 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 ASPECT_RATIO_BUCKETS: list[tuple[int, int]] = [
-    (512, 512),   # 1:1
-    (576, 448),   # 4:3
-    (448, 576),   # 3:4
-    (672, 384),   # 16:9
-    (384, 672),   # 9:16
-    (736, 352),   # 2:1
-    (352, 736),   # 1:2
-    (800, 320),   # 21:9
-    (320, 800),   # 9:21
+    (512, 512),  # 1:1
+    (576, 448),  # 4:3
+    (448, 576),  # 3:4
+    (672, 384),  # 16:9
+    (384, 672),  # 9:16
+    (736, 352),  # 2:1
+    (352, 736),  # 1:2
+    (800, 320),  # 21:9
+    (320, 800),  # 9:21
 ]
 
 _BUCKET_RATIOS: list[float] = [w / h for w, h in ASPECT_RATIO_BUCKETS]
@@ -47,7 +46,9 @@ _BUCKET_RATIOS: list[float] = [w / h for w, h in ASPECT_RATIO_BUCKETS]
 DEFAULT_TRAIN_RESOLUTION = 512
 
 
-def scaled_buckets(train_resolution: int = DEFAULT_TRAIN_RESOLUTION) -> list[tuple[int, int]]:
+def scaled_buckets(
+    train_resolution: int = DEFAULT_TRAIN_RESOLUTION,
+) -> list[tuple[int, int]]:
     """The aspect-bucket table scaled to a per-group training resolution.
 
     ``train_resolution`` is the square-bucket side; every bucket's dims scale
@@ -88,67 +89,96 @@ def find_nearest_bucket(
 # Transforms
 # ---------------------------------------------------------------------------
 
+
 def get_train_transform() -> transforms.Compose:
-    return transforms.Compose([
-        transforms.RandomHorizontalFlip(p=0.5),
-        transforms.ColorJitter(brightness=0.1, contrast=0.1, saturation=0.1, hue=0.02),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-    ])
+    return transforms.Compose(
+        [
+            transforms.RandomHorizontalFlip(p=0.5),
+            transforms.ColorJitter(
+                brightness=0.1, contrast=0.1, saturation=0.1, hue=0.02
+            ),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        ]
+    )
 
 
 def get_val_transform() -> transforms.Compose:
-    return transforms.Compose([
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-    ])
+    return transforms.Compose(
+        [
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        ]
+    )
 
 
 def get_heavy_augment_transform() -> transforms.Compose:
-    return transforms.Compose([
-        transforms.RandomHorizontalFlip(p=0.5),
-        transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.05),
-        transforms.RandomResizedCrop(size=(512, 512), scale=(0.8, 1.0), ratio=(0.9, 1.1)),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-    ])
+    return transforms.Compose(
+        [
+            transforms.RandomHorizontalFlip(p=0.5),
+            transforms.ColorJitter(
+                brightness=0.2, contrast=0.2, saturation=0.2, hue=0.05
+            ),
+            transforms.RandomResizedCrop(
+                size=(512, 512), scale=(0.8, 1.0), ratio=(0.9, 1.1)
+            ),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        ]
+    )
 
 
 def get_skin_normalised_train_transform() -> transforms.Compose:
     from bittrainer.skin_normalise import SkinNormalise
-    return transforms.Compose([
-        SkinNormalise(),
-        transforms.RandomHorizontalFlip(p=0.5),
-        transforms.ColorJitter(brightness=0.1, contrast=0.1, saturation=0.1, hue=0.02),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-    ])
+
+    return transforms.Compose(
+        [
+            SkinNormalise(),
+            transforms.RandomHorizontalFlip(p=0.5),
+            transforms.ColorJitter(
+                brightness=0.1, contrast=0.1, saturation=0.1, hue=0.02
+            ),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        ]
+    )
 
 
 def get_skin_normalised_val_transform() -> transforms.Compose:
     from bittrainer.skin_normalise import SkinNormalise
-    return transforms.Compose([
-        SkinNormalise(),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-    ])
+
+    return transforms.Compose(
+        [
+            SkinNormalise(),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        ]
+    )
 
 
 def get_skin_normalised_heavy_augment_transform() -> transforms.Compose:
     from bittrainer.skin_normalise import SkinNormalise
-    return transforms.Compose([
-        SkinNormalise(),
-        transforms.RandomHorizontalFlip(p=0.5),
-        transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.05),
-        transforms.RandomResizedCrop(size=(512, 512), scale=(0.8, 1.0), ratio=(0.9, 1.1)),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-    ])
+
+    return transforms.Compose(
+        [
+            SkinNormalise(),
+            transforms.RandomHorizontalFlip(p=0.5),
+            transforms.ColorJitter(
+                brightness=0.2, contrast=0.2, saturation=0.2, hue=0.05
+            ),
+            transforms.RandomResizedCrop(
+                size=(512, 512), scale=(0.8, 1.0), ratio=(0.9, 1.1)
+            ),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        ]
+    )
 
 
 # ---------------------------------------------------------------------------
 # Image dimension cache (persisted to disk, keyed by path + mtime)
 # ---------------------------------------------------------------------------
+
 
 class _DimensionCache:
     """Caches image (width, height) keyed by absolute path + mtime."""
@@ -209,6 +239,7 @@ class _DimensionCache:
 # Dataset
 # ---------------------------------------------------------------------------
 
+
 def _list_split_images(folder: Path, label: str, split: str) -> list[Path]:
     d = folder / label / split
     if not d.is_dir():
@@ -221,6 +252,20 @@ def _list_split_images_flat(folder: Path, split: str) -> list[Path]:
     if not d.is_dir():
         return []
     return sorted(f for f in d.iterdir() if f.is_file() and is_supported_image(f))
+
+
+def _explicit_image_paths(paths: list[str]) -> list[Path]:
+    """Return unique, existing supported images while preserving input order."""
+    result: list[Path] = []
+    seen: set[str] = set()
+    for raw_path in paths:
+        path = Path(raw_path)
+        key = os.path.normcase(str(path.resolve(strict=False)))
+        if key in seen or not path.is_file() or not is_supported_image(path):
+            continue
+        seen.add(key)
+        result.append(path)
+    return result
 
 
 class ConceptDataset(Dataset):
@@ -243,12 +288,14 @@ class ConceptDataset(Dataset):
         transform: Any | None = None,
         extra_positive_dirs: list[str] | None = None,
         negative_dirs: list[str] | None = None,
+        positive_paths: list[str] | None = None,
+        negative_paths: list[str] | None = None,
         hard_negative_paths: list[str] | None = None,
         hard_negative_weight: int = 3,
         dim_cache: _DimensionCache | None = None,
         face_bboxes: dict[str, list[int]] | None = None,
         skin_normalise: bool = False,
-        cache: Any | None = None,           # SmartCache instance
+        cache: Any | None = None,  # SmartCache instance
         sourceless: bool = False,
         concept_name: str = "",
         train_resolution: int = DEFAULT_TRAIN_RESOLUTION,
@@ -269,21 +316,34 @@ class ConceptDataset(Dataset):
             self._init_sourceless()
             return
 
-        # Positives: flat layout first, fall back to legacy
-        self._positive_paths = _list_split_images_flat(self.concept_folder, split)
-        if not self._positive_paths:
-            self._positive_paths = _list_split_images(self.concept_folder, "positive", split)
+        if positive_paths is not None:
+            # Engine owns the split assignment for mapped/flat datasets. An
+            # explicit empty list is intentional and must not fall back to a
+            # physical ``train``/``val`` directory scan.
+            self._positive_paths = _explicit_image_paths(positive_paths)
+        else:
+            # Legacy folder-backed contract: flat split layout first, then the
+            # older positive/train + positive/val tree.
+            self._positive_paths = _list_split_images_flat(self.concept_folder, split)
+            if not self._positive_paths:
+                self._positive_paths = _list_split_images(
+                    self.concept_folder, "positive", split
+                )
 
-        for extra_dir in (extra_positive_dirs or []):
-            extra_folder = Path(extra_dir)
-            extra_paths = _list_split_images_flat(extra_folder, split)
-            if not extra_paths:
-                extra_paths = _list_split_images(extra_folder, "positive", split)
-            self._positive_paths.extend(extra_paths)
+            for extra_dir in extra_positive_dirs or []:
+                extra_folder = Path(extra_dir)
+                extra_paths = _list_split_images_flat(extra_folder, split)
+                if not extra_paths:
+                    extra_paths = _list_split_images(extra_folder, "positive", split)
+                self._positive_paths.extend(extra_paths)
 
         self._all_negative_paths: list[Path] = []
-        self._has_cross_concept_negatives = bool(negative_dirs)
-        if negative_dirs:
+        self._has_cross_concept_negatives = negative_paths is not None or bool(
+            negative_dirs
+        )
+        if negative_paths is not None:
+            self._all_negative_paths = _explicit_image_paths(negative_paths)
+        elif negative_dirs:
             for neg_dir in negative_dirs:
                 neg_folder = Path(neg_dir)
                 paths = _list_split_images_flat(neg_folder, split)
@@ -291,14 +351,16 @@ class ConceptDataset(Dataset):
                     paths = _list_split_images(neg_folder, "positive", split)
                 self._all_negative_paths.extend(paths)
         else:
-            self._all_negative_paths = _list_split_images(self.concept_folder, "negative", split)
+            self._all_negative_paths = _list_split_images(
+                self.concept_folder, "negative", split
+            )
 
-        self._hard_negative_paths: list[Path] = [
-            Path(p) for p in (hard_negative_paths or []) if Path(p).is_file()
-        ]
+        self._hard_negative_paths = _explicit_image_paths(hard_negative_paths or [])
 
         self._cache_dir = self.concept_folder / ".resize_cache"
-        self._dim_cache = dim_cache or _DimensionCache(self._cache_dir / "dimensions.json")
+        self._dim_cache = dim_cache or _DimensionCache(
+            self._cache_dir / "dimensions.json"
+        )
 
         self._path_info: dict[str, dict] = {}
         self._precompute_path_info(self._positive_paths, label=1)
@@ -314,8 +376,12 @@ class ConceptDataset(Dataset):
             raise RuntimeError("sourceless=True requires a SmartCache instance")
         entries = self._cache.iter_sourceless()
         self.samples = [s for s in entries if s.get("split") == self.split]
-        self._positive_paths = [Path(s["path"]) for s in self.samples if s["label"] == 1]
-        self._all_negative_paths = [Path(s["path"]) for s in self.samples if s["label"] == 0]
+        self._positive_paths = [
+            Path(s["path"]) for s in self.samples if s["label"] == 1
+        ]
+        self._all_negative_paths = [
+            Path(s["path"]) for s in self.samples if s["label"] == 0
+        ]
         self._hard_negative_paths = []
         self._has_cross_concept_negatives = False
 
@@ -347,7 +413,11 @@ class ConceptDataset(Dataset):
             self.samples.extend(hard_neg_samples)
 
         num_pos = len(self._positive_paths)
-        max_neg = int(num_pos * self._neg_pos_ratio) if self._neg_pos_ratio > 0 else len(self._all_negative_paths)
+        max_neg = (
+            int(num_pos * self._neg_pos_ratio)
+            if self._neg_pos_ratio > 0
+            else len(self._all_negative_paths)
+        )
         hard_slots = len(hard_neg_samples) * self._hard_negative_weight
         remaining = max(0, max_neg - hard_slots)
 
@@ -408,6 +478,7 @@ class ConceptDataset(Dataset):
         # Fallback: build on-the-fly
         from bittrainer.cache_builders import build_image_tensor
         import numpy as np
+
         arr = build_image_tensor(sample)
         img_tensor = torch.from_numpy(np.ascontiguousarray(arr))
 
@@ -421,6 +492,7 @@ class ConceptDataset(Dataset):
 # ---------------------------------------------------------------------------
 # Bucket batch sampler
 # ---------------------------------------------------------------------------
+
 
 class BucketBatchSampler(Sampler):
     def __init__(
@@ -445,7 +517,7 @@ class BucketBatchSampler(Sampler):
         for bucket, indices in bucket_indices.items():
             random.shuffle(indices)
             for start in range(0, len(indices), self.batch_size):
-                batch = indices[start:start + self.batch_size]
+                batch = indices[start : start + self.batch_size]
                 if len(batch) < self.batch_size:
                     if self.drop_last or self.undersized_policy == "drop":
                         continue
