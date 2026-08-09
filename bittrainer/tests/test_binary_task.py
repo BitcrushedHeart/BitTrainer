@@ -60,9 +60,17 @@ def _bin_cfg(concept, ckpt, **kw):
     from bittrainer.trainer import TrainConfig
 
     base = dict(
-        concept_folder=str(concept), checkpoint_dir=str(ckpt), max_epochs=2, patience=99,
-        model_size="atto", device="cpu", dtype="float32", use_cache=False, from_scratch=True,
-        dataloader_workers=0, backbone_init={"source": "random_init", "checkpoint_path": None},
+        concept_folder=str(concept),
+        checkpoint_dir=str(ckpt),
+        max_epochs=2,
+        patience=99,
+        model_size="atto",
+        device="cpu",
+        dtype="float32",
+        use_cache=False,
+        from_scratch=True,
+        dataloader_workers=0,
+        backbone_init={"source": "random_init", "checkpoint_path": None},
     )
     base.update(kw)
     return TrainConfig(**base)
@@ -121,10 +129,20 @@ def test_worse_candidate_keeps_incumbent(tmp_path, monkeypatch):
     )
     before = best_pt.read_bytes()
 
-    _low = {"f1": 0.10, "precision": 0.1, "recall": 0.1, "auprc": 0.1,
-            "confusion_matrix": [[1, 0], [0, 1]]}
-    _high = {"f1": 0.95, "precision": 0.9, "recall": 0.9, "auprc": 0.9,
-             "confusion_matrix": [[2, 0], [0, 2]]}
+    _low = {
+        "f1": 0.10,
+        "precision": 0.1,
+        "recall": 0.1,
+        "auprc": 0.1,
+        "confusion_matrix": [[1, 0], [0, 1]],
+    }
+    _high = {
+        "f1": 0.95,
+        "precision": 0.9,
+        "recall": 0.9,
+        "auprc": 0.9,
+        "confusion_matrix": [[2, 0], [0, 2]],
+    }
     calls = {"n": 0}
 
     def _fake_tuned(val_result):
@@ -145,6 +163,34 @@ def test_worse_candidate_keeps_incumbent(tmp_path, monkeypatch):
     assert not (ckpt / "candidate.pt").exists()
 
 
+def test_incompatible_incumbent_promotes_wrapped_candidate(tmp_path):
+    """The incompatible-incumbent fallback must unwrap candidate metadata.
+
+    Regression for the production failure that reported every ConvNeXt weight as
+    missing and ``state_dict``/``num_classes``/``model_size``/``training_mode`` as
+    unexpected after training had already completed.
+    """
+    from bittrainer.model import load_checkpoint
+    from bittrainer.trainer import run_training
+
+    _make_concept(tmp_path / "c", n_pos=8, n_neg=8, n_val=4)
+    ckpt = tmp_path / "ck"
+    ckpt.mkdir()
+    torch.save(
+        {
+            "state_dict": {"not_a_convnext_weight": torch.tensor(1.0)},
+            "num_classes": 2,
+            "model_size": "atto",
+        },
+        ckpt / "best.pt",
+    )
+
+    result = run_training(_bin_cfg(tmp_path / "c", ckpt, max_epochs=1))
+
+    assert result["checkpoint_path"].endswith("best.pt")
+    load_checkpoint(result["checkpoint_path"], device="cpu", model_size="atto")
+
+
 def test_pause_resume_across_unfreeze_boundary_completes(tmp_path):
     """Pausing at the epoch-0→1 boundary (the non-gradual unfreeze) and resuming
     replays the reconstruction and completes with no crash."""
@@ -162,15 +208,21 @@ def test_pause_resume_across_unfreeze_boundary_completes(tmp_path):
     _seed(0)
     first = run_training(
         _bin_cfg(tmp_path / "c", tmp_path / "ck", max_epochs=3, backup_dir=backups),
-        progress_callback=_cb, pause_event=pause,
+        progress_callback=_cb,
+        pause_event=pause,
     )
     assert first["paused"] is True
     assert first["epoch"] == 1
 
     _seed(0)
     resumed = run_training(
-        _bin_cfg(tmp_path / "c", tmp_path / "ck", max_epochs=3,
-                 backup_dir=backups, resume_from=backups),
+        _bin_cfg(
+            tmp_path / "c",
+            tmp_path / "ck",
+            max_epochs=3,
+            backup_dir=backups,
+            resume_from=backups,
+        ),
     )
     assert "paused" not in resumed
     assert resumed["checkpoint_path"].endswith("best.pt")

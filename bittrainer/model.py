@@ -57,6 +57,31 @@ def _infer_head_hidden_size(state_dict: dict[str, torch.Tensor]) -> int | None:
     return None
 
 
+# Stochastic-depth (drop-path) maxima scaled by trunk size, following the
+# ConvNeXt recipe: the shallow atto..nano trunks tolerate only light regularisation
+# (0.1), tiny sits mid (0.2) and the deep base/large/huge trunks want the full 0.3.
+_DROP_PATH_RATE: dict[str, float] = {
+    "atto": 0.1,
+    "femto": 0.1,
+    "pico": 0.1,
+    "nano": 0.1,
+    "tiny": 0.2,
+    "base": 0.3,
+    "large": 0.3,
+    "huge": 0.3,
+}
+
+
+def default_drop_path_rate(model_size: str) -> float:
+    """Size-scaled stochastic-depth maximum for a ConvNeXt V2 trunk.
+
+    Long-horizon trunk training (the backbone builder) benefits from stochastic
+    depth; the value scales with depth so shallow trunks are not over-regularised.
+    Unknown sizes fall back to the conservative 0.1.
+    """
+    return _DROP_PATH_RATE.get(model_size, 0.1)
+
+
 def create_model(
     *,
     model_size: str = "nano",
@@ -64,6 +89,7 @@ def create_model(
     dtype: torch.dtype = torch.float32,
     num_classes: int = 2,
     head_hidden_size: int | None = None,
+    drop_path_rate: float | None = None,
 ) -> nn.Module:
     """Create a ConvNeXt V2 model with *num_classes* output head.
 
@@ -71,15 +97,26 @@ def create_model(
     (``Linear -> GELU -> Linear``) ahead of the final layer — used by the
     cached-feature MLP probe as the intermediate rung between a linear probe
     and a full fine-tune.
+
+    ``drop_path_rate`` is the stochastic-depth maximum. ``None`` (the default)
+    forwards nothing to timm, so the created model is byte-identical to the
+    historical call; a float is passed straight through to timm's ConvNeXt
+    ``drop_path_rate`` (parameter-free, so it never changes the state-dict shape).
     """
     model_name = _MODEL_REGISTRY.get(model_size)
     if model_name is None:
-        raise ValueError(f"Unknown model_size '{model_size}'. Valid: {list(_MODEL_REGISTRY.keys())}")
+        raise ValueError(
+            f"Unknown model_size '{model_size}'. Valid: {list(_MODEL_REGISTRY.keys())}"
+        )
+    extra: dict = {}
+    if drop_path_rate is not None:
+        extra["drop_path_rate"] = drop_path_rate
     model = timm.create_model(
         model_name,
         pretrained=pretrained,
         num_classes=num_classes,
         head_hidden_size=head_hidden_size,
+        **extra,
     )
     if dtype != torch.float32:
         model = model.to(dtype=dtype)
@@ -199,19 +236,24 @@ def build_llrd_param_groups(model: nn.Module, decay: float) -> list[dict]:
     """
     buckets: dict[str, list[nn.Parameter]] = {k: [] for k in _LLRD_DEPTH}
     for name, param in model.named_parameters():
-        if name.startswith("stem."):
+        # The multi-task backbone builder wraps the trunk as ``backbone.*`` and the
+        # heads as ``heads.*``; strip one optional leading ``backbone.`` so the trunk
+        # buckets by its true stem/stage depth, and route ``heads.*`` (like the
+        # trunk's own ``head.*``) to the fastest depth-0 head bucket. A plain model
+        # carries neither prefix, so it buckets exactly as before.
+        depth_name = name[len("backbone.") :] if name.startswith("backbone.") else name
+        if depth_name.startswith("stem."):
             bucket = "stem"
-        elif name.startswith("stages.0."):
+        elif depth_name.startswith("stages.0."):
             bucket = "stages.0"
-        elif name.startswith("stages.1."):
+        elif depth_name.startswith("stages.1."):
             bucket = "stages.1"
-        elif name.startswith("stages.2."):
+        elif depth_name.startswith("stages.2."):
             bucket = "stages.2"
-        elif name.startswith("stages.3."):
+        elif depth_name.startswith("stages.3."):
             bucket = "stages.3"
-        elif name.startswith("head."):
-            bucket = "head"
         else:
+            # head.*, heads.*, norm_pre and anything else train at depth 0.
             bucket = "head"
         buckets[bucket].append(param)
 
@@ -219,11 +261,13 @@ def build_llrd_param_groups(model: nn.Module, decay: float) -> list[dict]:
     for key, params in buckets.items():
         if not params:
             continue
-        groups.append({
-            "params": params,
-            "lr": decay ** _LLRD_DEPTH[key],
-            "name": key,
-        })
+        groups.append(
+            {
+                "params": params,
+                "lr": decay ** _LLRD_DEPTH[key],
+                "name": key,
+            }
+        )
     return groups
 
 
@@ -267,8 +311,11 @@ def load_checkpoint(
     head_hidden_size = _infer_head_hidden_size(state_dict)
 
     model = create_model(
-        model_size=ckpt_size, pretrained=False, dtype=dtype,
-        num_classes=ckpt_classes, head_hidden_size=head_hidden_size,
+        model_size=ckpt_size,
+        pretrained=False,
+        dtype=dtype,
+        num_classes=ckpt_classes,
+        head_hidden_size=head_hidden_size,
     )
     if cell_masks is not None:
         # Spatial checkpoint: swap in the cell-structured head before loading —

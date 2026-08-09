@@ -30,13 +30,15 @@ def _spy_transforms(monkeypatch):
     calls = {"train": [], "val": []}
     real_train, real_val = bb._train_transform, bb._val_transform
 
-    def _train(size):
+    # Forward-compatible spies: the trainer-parity round adds an optional aug
+    # settings argument to _train_transform; the spy records sizes either way.
+    def _train(size, *a, **k):
         calls["train"].append(size)
-        return real_train(size)
+        return real_train(size, *a, **k)
 
-    def _val(size):
+    def _val(size, *a, **k):
         calls["val"].append(size)
-        return real_val(size)
+        return real_val(size, *a, **k)
 
     monkeypatch.setattr(bb, "_train_transform", _train)
     monkeypatch.setattr(bb, "_val_transform", _val)
@@ -75,7 +77,9 @@ def test_tail_resets_best_and_exports_tail_candidate(tmp_path, monkeypatch):
 
     def _spy_save(self, ctx, model, epoch, metrics, best):
         real_save(self, ctx, model, epoch, metrics, best)
-        snapshots.append({k: v.clone() for k, v in (self.best_heads_state or {}).items()})
+        snapshots.append(
+            {k: v.clone() for k, v in (self.best_heads_state or {}).items()}
+        )
 
     monkeypatch.setattr(bt.BackboneTask, "save_candidate", _spy_save)
 

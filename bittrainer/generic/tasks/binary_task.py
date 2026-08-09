@@ -473,7 +473,7 @@ class BinaryTask(TrainingTask):
     def on_epoch_start(
         self, ctx, model, epoch, *, optimizer, scheduler, scheduler_t_max, start_epoch
     ):
-        if self.config.training_mode == "head_only":
+        if self.config.training_mode == "frozen_backbone":
             return None
         # The resumed epoch's reconstruction already ran in create_optimizer.
         if ctx.resume_state is not None and epoch == start_epoch:

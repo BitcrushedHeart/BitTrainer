@@ -32,7 +32,7 @@ from torch.utils.data import DataLoader, Dataset
 
 import bittrainer.backbone_trainer as bb
 from bittrainer.backbone_init import apply_backbone_init
-from bittrainer.generic.optimizer import make_optimizer
+from bittrainer.generic.optimizer import clip_gradients, make_optimizer
 from bittrainer.generic.task import BestTracker, TaskContext
 from bittrainer.generic.tasks.backbone_task import BackboneTask
 from bittrainer.model import create_model
@@ -66,6 +66,9 @@ class BackboneHeadsTask(BackboneTask):
     """Head-only backbone training: frozen trunk, cached features, fresh heads."""
 
     trainer_name = "backbone_heads"
+    # Cached-vector val calibration is a follow-up; keep the calibration keys out
+    # of the head-only candidate metadata this round.
+    _calibration_enabled = False
 
     def __init__(
         self,
@@ -105,7 +108,9 @@ class BackboneHeadsTask(BackboneTask):
 
     def create_model(self, ctx: TaskContext, resume_state: dict | None):
         spec = self.request.get("backbone_init")
-        backbone = create_model(model_size=self.model_size, pretrained=False, num_classes=0)
+        backbone = create_model(
+            model_size=self.model_size, pretrained=False, num_classes=0
+        )
         if not apply_backbone_init(backbone, spec):
             raise RuntimeError(
                 f"Could not load the source backbone checkpoint {spec.get('checkpoint_path')!r}"
@@ -152,19 +157,29 @@ class BackboneHeadsTask(BackboneTask):
 
         def _progress(done: int, total: int) -> None:
             self._emit(
-                "embedding_build", f"Building feature cache ({done}/{total})",
-                step=done, total_steps=total,
+                "embedding_build",
+                f"Building feature cache ({done}/{total})",
+                step=done,
+                total_steps=total,
             )
 
         self.embedding_cache_stats = cache.ensure(
-            cache_samples, model.backbone, None,
-            device=ctx.device, dtype=self.amp_dtype, batch_size=64,
+            cache_samples,
+            model.backbone,
+            None,
+            device=ctx.device,
+            dtype=self.amp_dtype,
+            batch_size=64,
             progress_cb=_progress,
-            stop_check=lambda: self.cancel_event is not None and self.cancel_event.is_set(),
+            stop_check=lambda: (
+                self.cancel_event is not None and self.cancel_event.is_set()
+            ),
         )
         if self.cancel_event is not None and self.cancel_event.is_set():
             raise bb.BackboneTrainingCancelled
-        cache.verify(cache_samples, model.backbone, None, device=ctx.device, dtype=self.amp_dtype)
+        cache.verify(
+            cache_samples, model.backbone, None, device=ctx.device, dtype=self.amp_dtype
+        )
 
         dropped = 0
         for sample in all_samples:
@@ -175,12 +190,15 @@ class BackboneHeadsTask(BackboneTask):
             self._vectors[sample.path] = vector
         if dropped:
             logger.warning(
-                "BackboneHeadsTask: %d sample(s) have no cached vector and are skipped", dropped
+                "BackboneHeadsTask: %d sample(s) have no cached vector and are skipped",
+                dropped,
             )
         if not any(s.path in self._vectors for s in self.train_samples):
             raise RuntimeError("No cached feature vectors for any training sample.")
 
-    def create_optimizer(self, ctx: TaskContext, model, eff_bs: int, resume_state: dict | None):
+    def create_optimizer(
+        self, ctx: TaskContext, model, eff_bs: int, resume_state: dict | None
+    ):
         # Only the heads train; the frozen trunk never enters the optimizer.
         optimizer = make_optimizer(model.heads)
         t_max = max(1, self.epochs)
@@ -198,19 +216,39 @@ class BackboneHeadsTask(BackboneTask):
 
     # -- per-epoch ---------------------------------------------------------
     def build_loaders(self, ctx: TaskContext, epoch: int, eff_bs: int, resume_info):
-        loader_kwargs = {"batch_size": self.batch_size, "collate_fn": bb._collate, "num_workers": 0}
+        loader_kwargs = {
+            "batch_size": self.batch_size,
+            "collate_fn": bb._collate,
+            "num_workers": 0,
+        }
         if self._val_loader is None:
             self._val_loader = DataLoader(
-                _VectorDataset(self.val_samples, self._vectors), shuffle=False, **loader_kwargs,
+                _VectorDataset(self.val_samples, self._vectors),
+                shuffle=False,
+                **loader_kwargs,
             )
         epoch_samples, plan_stats = self._plan_epoch(epoch)
-        self._pos_weight = bb._head_pos_weights(plan_stats) if self.use_pos_weight else None
+        self._pos_weight = (
+            bb._head_pos_weights(plan_stats) if self.use_pos_weight else None
+        )
         train_loader = DataLoader(
-            _VectorDataset(epoch_samples, self._vectors), shuffle=True, **loader_kwargs,
+            _VectorDataset(epoch_samples, self._vectors),
+            shuffle=True,
+            **loader_kwargs,
         )
         return train_loader, None, 0
 
-    def train_epoch(self, ctx: TaskContext, model, optimizer, train_loader, *, step_callback, boundary_hook, start_batch: int):
+    def train_epoch(
+        self,
+        ctx: TaskContext,
+        model,
+        optimizer,
+        train_loader,
+        *,
+        step_callback,
+        boundary_hook,
+        start_batch: int,
+    ):
         device = ctx.device
         model.heads.train()
         epoch_loss = 0.0
@@ -223,12 +261,18 @@ class BackboneHeadsTask(BackboneTask):
                 break
             optimizer.zero_grad(set_to_none=True)
             loss = bb._batch_loss(
-                vectors.to(device).float(), model.heads, binary_labels, group_labels, device,
+                vectors.to(device).float(),
+                model.heads,
+                binary_labels,
+                group_labels,
+                device,
                 pos_weight=self._pos_weight,
             )
             if loss is None:
                 continue
             loss.backward()
+            if self.clip_grad_norm and self.clip_grad_norm > 0:
+                clip_gradients(model, self.clip_grad_norm)
             optimizer.step()
             self.step += 1
             epoch_loss += float(loss.detach())
@@ -238,7 +282,9 @@ class BackboneHeadsTask(BackboneTask):
         return epoch_loss / max(epoch_batches, 1)
 
     # -- finalisation ------------------------------------------------------
-    def finalize(self, ctx: TaskContext, model, best: BestTracker, epochs_completed: int) -> dict:
+    def finalize(
+        self, ctx: TaskContext, model, best: BestTracker, epochs_completed: int
+    ) -> dict:
         self._emit("validating", "Validating retrained heads")
         if self.val_samples and self.best_heads_state is not None:
             heads_state = self.best_heads_state
@@ -246,7 +292,8 @@ class BackboneHeadsTask(BackboneTask):
             validation_score = self.best_score
         else:
             heads_state = {
-                k: v.detach().cpu().clone() for k, v in self.model.heads.state_dict().items()
+                k: v.detach().cpu().clone()
+                for k, v in self.model.heads.state_dict().items()
             }
             validation_metrics = self.validation_metrics
             validation_score = self.validation_score
@@ -255,7 +302,9 @@ class BackboneHeadsTask(BackboneTask):
 
         # Trunk tensors are byte-copied from the source checkpoint (never
         # retrained here); any heads.* the source carried are replaced.
-        source_path = str((self.request.get("backbone_init") or {}).get("checkpoint_path"))
+        source_path = str(
+            (self.request.get("backbone_init") or {}).get("checkpoint_path")
+        )
         state = {
             key: value
             for key, value in load_file(source_path).items()
@@ -273,12 +322,16 @@ class BackboneHeadsTask(BackboneTask):
             state,
             str(candidate_path),
             metadata={
-                key: bb._stringify(value) for key, value in metadata.items() if value is not None
+                key: bb._stringify(value)
+                for key, value in metadata.items()
+                if value is not None
             },
         )
         self._emit(
-            "saving", "Retrained-heads candidate checkpoint written",
-            candidate_checkpoint_path=str(candidate_path), validation_score=validation_score,
+            "saving",
+            "Retrained-heads candidate checkpoint written",
+            candidate_checkpoint_path=str(candidate_path),
+            validation_score=validation_score,
         )
         return {
             "candidate_checkpoint_path": str(candidate_path),
@@ -287,7 +340,9 @@ class BackboneHeadsTask(BackboneTask):
             "heads": self.request.get("heads") or {},
             "release_blocking": bool(self.request.get("release_blocking")),
             "epochs_completed": int(epochs_completed),
-            "best_epoch": int(best.best_epoch + 1) if self.val_samples else int(epochs_completed),
+            "best_epoch": int(best.best_epoch + 1)
+            if self.val_samples
+            else int(epochs_completed),
             "mode": "backbone_head_only",
             "backbone_hash": self.backbone_hash,
             "embedding_cache_stats": self.embedding_cache_stats,

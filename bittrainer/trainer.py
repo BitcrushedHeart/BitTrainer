@@ -43,8 +43,9 @@ class TrainConfig:
     # SmartCache keys embed bucket dims, so a change simply builds fresh entries.
     train_resolution: int = 512
     model_size: str = "nano"
-    # ``head_only`` keeps the ConvNeXt trunk frozen for every epoch. ``full``
-    # preserves the historical epoch-0 head warmup followed by unfreezing.
+    # ``head_only`` dispatches to the cached-feature binary probe.
+    # ``frozen_backbone`` retains the legacy image loop with a frozen trunk.
+    # ``full`` preserves the historical epoch-0 warmup followed by unfreezing.
     training_mode: str = "full"
     device: str = "cuda"
     dtype: str = "bfloat16"
@@ -73,6 +74,11 @@ class TrainConfig:
     cache_dir: str | None = None
     use_cache: bool = True
     cache_workers: int = 10
+    # Pooled-feature cache used by genuine head-only training. None keeps the
+    # cache beside the concept; Engine supplies a shared content-addressed root.
+    embedding_cache_dir: str | None = None
+    embedding_batch_size: int = 64
+    head_weight_decay: float = 0.02
     sourceless: bool = False
     concept_name: str = ""
     modeltype: str = "convnext_v2"
@@ -345,6 +351,17 @@ def run_training(
     epoch** (mid-epoch snapshot, epoch-restart resume — the per-epoch scheduler
     keeps it consistent).
     """
+    if config.training_mode == "head_only":
+        from bittrainer.binary_head_only_trainer import run_binary_head_only_training
+
+        return run_binary_head_only_training(
+            config,
+            progress_callback=progress_callback,
+            stop_event=stop_event,
+            stop_now_event=stop_now_event,
+            pause_event=pause_event,
+        )
+
     from bittrainer.generic.generic_trainer import GenericTrainer
     from bittrainer.generic.tasks.binary_task import BinaryTask
 
@@ -469,10 +486,12 @@ def _binary_compare_promote(
                 candidate.replace(existing_best)
                 best_checkpoint_path = str(existing_best)
                 model.load_state_dict(
-                    torch.load(
-                        best_checkpoint_path,
-                        map_location=device,
-                        weights_only=True,
+                    _unwrap_state_dict(
+                        torch.load(
+                            best_checkpoint_path,
+                            map_location=device,
+                            weights_only=True,
+                        ),
                     ),
                 )
                 val_result = evaluate(

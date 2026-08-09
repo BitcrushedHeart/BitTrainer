@@ -76,6 +76,7 @@ import threading
 from pathlib import Path
 from typing import Callable
 
+import numpy as np
 import torch
 import torch.nn as nn
 from PIL import Image
@@ -114,7 +115,12 @@ def _amp_settings(config: dict) -> tuple[bool, torch.dtype]:
 
 
 def _backbone_fingerprint(
-    vocab: "_Vocab", model_size: str, epochs: int, *, resolution: str | None = None
+    vocab: "_Vocab",
+    model_size: str,
+    epochs: int,
+    *,
+    resolution: str | None = None,
+    optimizer_identity: str = "Prodigy_adv",
 ) -> dict:
     """Resume-compatibility identity for a backbone run.
 
@@ -122,7 +128,9 @@ def _backbone_fingerprint(
     so a resume whose dataset changed head layout starts fresh rather than
     crashing on a shape mismatch.
     """
-    names = [f"binary/{c}" for c in vocab.concepts] + [f"group/{g}" for g in vocab.groups]
+    names = [f"binary/{c}" for c in vocab.concepts] + [
+        f"group/{g}" for g in vocab.groups
+    ]
     fingerprint = make_fingerprint(
         class_names=names,
         num_classes=len(names),
@@ -133,9 +141,10 @@ def _backbone_fingerprint(
         model_size=str(model_size),
     )
     # Fold the optimizer identity into the fingerprint so an in-flight backup from
-    # an older AdamW run (which lacks this key) cleanly mismatches and starts fresh
-    # (resume_skipped) rather than trying to load AdamW state into Prodigy_adv.
-    fingerprint["optimizer"] = "Prodigy_adv"
+    # an older AdamW / flat-Prodigy run (which lacks this key, or carries a
+    # different layout string) cleanly mismatches and starts fresh (resume_skipped)
+    # rather than loading incompatible optimizer state.
+    fingerprint["optimizer"] = optimizer_identity
     # Resolution schedule identity ("384" or "256->384@2"): a backup from a run
     # with a different image size / finetune tail cleanly mismatches and starts
     # fresh (same accepted precedent as the optimizer key above).
@@ -143,9 +152,17 @@ def _backbone_fingerprint(
         fingerprint["resolution"] = resolution
     return fingerprint
 
+
 _POSITIVE_LABELS = frozenset({"positive", "explicit_positive", "1", "true"})
 _NEGATIVE_LABELS = frozenset(
-    {"negative", "known_negative", "explicit_known_negative", "implicit_negative", "0", "false"}
+    {
+        "negative",
+        "known_negative",
+        "explicit_known_negative",
+        "implicit_negative",
+        "0",
+        "false",
+    }
 )
 
 
@@ -176,7 +193,9 @@ class _Vocab:
                     concepts.add(_safe_module_key(concept))
             for group, class_name in (record.get("groups") or {}).items():
                 if class_name:
-                    group_classes.setdefault(_safe_module_key(group), set()).add(str(class_name))
+                    group_classes.setdefault(_safe_module_key(group), set()).add(
+                        str(class_name)
+                    )
         self.concepts = sorted(concepts)
         # Single-class groups carry no training signal for CE.
         self.groups = {
@@ -238,7 +257,8 @@ def _build_samples(records: list[dict], vocab: _Vocab) -> tuple[list[_Sample], i
         samples.append(_Sample(path, binary, groups))
     if duplicates:
         logger.warning(
-            "Backbone training: skipped %d duplicate record(s) sharing a content_hash", duplicates
+            "Backbone training: skipped %d duplicate record(s) sharing a content_hash",
+            duplicates,
         )
     return samples, missing
 
@@ -289,6 +309,7 @@ def _plan_epoch_samples(
     positive_cap: int = 1000,
     min_positive_threshold: int = 30,
     max_oversample_factor: float = 4.0,
+    positive_cap_mode: str = "density",
 ) -> tuple[list["_Sample"], dict[str, dict]]:
     """Build one epoch's training view of ``samples`` (ISSUE-0545/0546).
 
@@ -318,14 +339,24 @@ def _plan_epoch_samples(
         neg = [i for i, s in enumerate(samples) if s.binary.get(concept) == 0.0]
         pos_total = len(pos)
         if 0 < positive_cap < len(pos):
-            order = list(pos)
-            rng.shuffle(order)  # epoch-varying tiebreak among equal densities
-            order.sort(key=lambda i: -(len(samples[i].binary) + len(samples[i].groups)))
-            pos = order[:positive_cap]
+            if positive_cap_mode == "random":
+                # Plain seeded uniform draw: density-first selection systematically
+                # over-represents multi-label images. Deterministic per
+                # (seed, epoch, concept) via the same per-concept rng.
+                pos = rng.sample(pos, positive_cap)
+            else:
+                order = list(pos)
+                rng.shuffle(order)  # epoch-varying tiebreak among equal densities
+                order.sort(
+                    key=lambda i: -(len(samples[i].binary) + len(samples[i].groups))
+                )
+                pos = order[:positive_cap]
 
         ratio = _effective_neg_ratio(len(pos), neg_pos_ratio)
         unlabelled = (
-            [i for i, s in enumerate(samples) if concept not in s.binary] if soft else []
+            [i for i, s in enumerate(samples) if concept not in s.binary]
+            if soft
+            else []
         )
         cap = (
             len(neg) + len(unlabelled)
@@ -337,7 +368,9 @@ def _plan_epoch_samples(
         if soft:
             headroom = cap - len(neg_selected)
             if headroom > 0 and unlabelled:
-                implicit_selected = rng.sample(unlabelled, min(headroom, len(unlabelled)))
+                implicit_selected = rng.sample(
+                    unlabelled, min(headroom, len(unlabelled))
+                )
 
         for i in pos:
             eff_binary[i][concept] = 1.0
@@ -350,7 +383,10 @@ def _plan_epoch_samples(
         if 0 < len(pos) < min_positive_threshold:
             factor = max(
                 1,
-                min(int(max_oversample_factor), math.ceil(min_positive_threshold / len(pos))),
+                min(
+                    int(max_oversample_factor),
+                    math.ceil(min_positive_threshold / len(pos)),
+                ),
             )
         for _ in range(factor - 1):
             replicas.extend(_Sample(samples[i].path, {concept: 1.0}, {}) for i in pos)
@@ -373,7 +409,9 @@ def _plan_epoch_samples(
     return planned, stats
 
 
-def _head_pos_weights(stats: dict[str, dict], *, clamp: float = 10.0) -> dict[str, float]:
+def _head_pos_weights(
+    stats: dict[str, dict], *, clamp: float = 10.0
+) -> dict[str, float]:
     """Residual BCE ``pos_weight`` per head from the post-cap epoch plan.
 
     ``neg_selected / positive_occurrences`` (occurrences count oversample
@@ -382,8 +420,12 @@ def _head_pos_weights(stats: dict[str, dict], *, clamp: float = 10.0) -> dict[st
     """
     weights: dict[str, float] = {}
     for concept, head_stats in stats.items():
-        occurrences = head_stats.get("pos", 0) * max(head_stats.get("oversample_factor", 1), 1)
-        negatives = head_stats.get("neg_explicit", 0) + head_stats.get("neg_implicit", 0)
+        occurrences = head_stats.get("pos", 0) * max(
+            head_stats.get("oversample_factor", 1), 1
+        )
+        negatives = head_stats.get("neg_explicit", 0) + head_stats.get(
+            "neg_implicit", 0
+        )
         if occurrences <= 0 or negatives <= 0:
             weights[concept] = 1.0
         else:
@@ -409,21 +451,60 @@ class _BackboneDataset(Dataset):
 _NORMALIZE = transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
 
 
-def _train_transform(image_size: int) -> transforms.Compose:
-    return transforms.Compose(
-        [
-            transforms.Resize((image_size, image_size)),
-            transforms.RandomHorizontalFlip(p=0.5),
-            transforms.ColorJitter(brightness=0.1, contrast=0.1, saturation=0.1, hue=0.02),
-            transforms.ToTensor(),
-            _NORMALIZE,
-        ]
+def _train_transform(image_size: int, aug: dict | None = None) -> transforms.Compose:
+    """Backbone train transform, defaulting to the group trainer's recipe.
+
+    ``aug=None`` == every knob at its parity default (RandomResizedCrop replacing
+    the squash Resize, RandAugment(2, 9), RandomErasing(0.25)), so the backbone
+    trains under the same augmentation the group trainer already runs. Each knob
+    gates independently:
+
+    * ``use_random_resized_crop`` (True) -> ``RandomResizedCrop(scale=(min, 1))``;
+      False -> the legacy squash ``Resize((s, s))``.
+    * ``randaugment_n`` / ``randaugment_m`` (2 / 9) -> ``RandAugment``; either 0
+      disables it (applied on the PIL image before ToTensor).
+    * ``random_erasing_p`` (0.25) -> ``RandomErasing`` after Normalize; 0 disables.
+    """
+    aug = aug or {}
+    use_rrc = bool(aug.get("use_random_resized_crop", True))
+    rrc_scale_min = float(aug.get("rrc_scale_min", 0.6))
+    ra_n = int(aug.get("randaugment_n", 2))
+    ra_m = int(aug.get("randaugment_m", 9))
+    erasing_p = float(aug.get("random_erasing_p", 0.25))
+
+    ops: list = []
+    if use_rrc:
+        ops.append(transforms.RandomResizedCrop(image_size, scale=(rrc_scale_min, 1.0)))
+    else:
+        ops.append(transforms.Resize((image_size, image_size)))
+    ops.append(transforms.RandomHorizontalFlip(p=0.5))
+    if ra_n > 0 and ra_m > 0:
+        ops.append(transforms.RandAugment(num_ops=ra_n, magnitude=ra_m))
+    ops.append(
+        transforms.ColorJitter(brightness=0.1, contrast=0.1, saturation=0.1, hue=0.02)
     )
+    ops.append(transforms.ToTensor())
+    ops.append(_NORMALIZE)
+    if erasing_p > 0:
+        ops.append(transforms.RandomErasing(p=erasing_p))
+    return transforms.Compose(ops)
 
 
 def _val_transform(image_size: int) -> transforms.Compose:
+    """Deterministic eval transform: aspect-preserving Resize + CenterCrop.
+
+    The ImageNet eval convention (resize the shorter side to ``image_size``, then
+    centre-crop) matches what an RRC-trained model sees and removes the squash
+    distortion the old ``Resize((s, s))`` introduced. Deterministic by
+    construction, so the val score is reproducible.
+    """
     return transforms.Compose(
-        [transforms.Resize((image_size, image_size)), transforms.ToTensor(), _NORMALIZE]
+        [
+            transforms.Resize(image_size),
+            transforms.CenterCrop(image_size),
+            transforms.ToTensor(),
+            _NORMALIZE,
+        ]
     )
 
 
@@ -444,7 +525,10 @@ class _MultiTaskHeads(nn.Module):
             {concept: nn.Linear(feature_dim, 1) for concept in vocab.concepts}
         )
         self.groups = nn.ModuleDict(
-            {group: nn.Linear(feature_dim, len(classes)) for group, classes in vocab.groups.items()}
+            {
+                group: nn.Linear(feature_dim, len(classes))
+                for group, classes in vocab.groups.items()
+            }
         )
 
 
@@ -471,7 +555,17 @@ def _batch_loss(
     device: torch.device,
     *,
     pos_weight: dict[str, float] | None = None,
+    group_label_smoothing: float = 0.0,
+    reduction: str = "sum",
 ) -> torch.Tensor | None:
+    """Masked multi-task loss over whichever heads each row carries a label for.
+
+    ``group_label_smoothing`` smooths the group-CE targets (parity with the group
+    trainer's default). ``reduction`` combines the per-head losses: ``"sum"`` (the
+    legacy default, so direct callers are unchanged) or ``"mean"`` — averaging over
+    the number of contributing head losses so the gradient scale no longer grows
+    with per-batch label density.
+    """
     losses: list[torch.Tensor] = []
     bce = nn.functional.binary_cross_entropy_with_logits
     ce = nn.functional.cross_entropy
@@ -486,7 +580,11 @@ def _batch_loss(
         weight = (pos_weight or {}).get(concept)
         if weight is not None and weight != 1.0:
             losses.append(
-                bce(logits, targets, pos_weight=torch.tensor(weight, device=device, dtype=logits.dtype))
+                bce(
+                    logits,
+                    targets,
+                    pos_weight=torch.tensor(weight, device=device, dtype=logits.dtype),
+                )
             )
         else:
             losses.append(bce(logits, targets))
@@ -496,10 +594,143 @@ def _batch_loss(
             continue
         logits = head(features[rows])
         targets = torch.tensor([group_labels[i][group] for i in rows], device=device)
-        losses.append(ce(logits, targets))
+        losses.append(ce(logits, targets, label_smoothing=group_label_smoothing))
     if not losses:
         return None
-    return torch.stack(losses).sum()
+    stacked = torch.stack(losses)
+    return stacked.mean() if reduction == "mean" else stacked.sum()
+
+
+@torch.no_grad()
+def _collect_val_scores(
+    backbone: nn.Module,
+    heads: _MultiTaskHeads,
+    loader: DataLoader,
+    device: torch.device,
+    *,
+    amp_enabled: bool = False,
+    amp_dtype: torch.dtype = torch.bfloat16,
+) -> tuple[
+    dict[str, tuple[np.ndarray, np.ndarray]], dict[str, tuple[np.ndarray, np.ndarray]]
+]:
+    """One pass over the (masked-unknown) val loader collecting raw head logits.
+
+    Returns ``(binary_scores, group_scores)`` where
+    ``binary_scores[concept] = (logits[N] float64, targets[N] float64)`` and
+    ``group_scores[group] = (logits[N, C] float64, targets[N] int64)``. Heads run
+    in fp32 exactly like the legacy ``_evaluate`` (avoids the autocast dtype
+    mismatch); the raw logits feed both the metric panel and calibration.
+    """
+    backbone.eval()
+    heads.eval()
+    bin_logits: dict[str, list[np.ndarray]] = {c: [] for c in heads.binary}
+    bin_targets: dict[str, list[np.ndarray]] = {c: [] for c in heads.binary}
+    grp_logits: dict[str, list[np.ndarray]] = {g: [] for g in heads.groups}
+    grp_targets: dict[str, list[np.ndarray]] = {g: [] for g in heads.groups}
+    for images, binary_labels, group_labels in loader:
+        with torch.amp.autocast(
+            device_type=device.type, dtype=amp_dtype, enabled=amp_enabled
+        ):
+            features = backbone(images.to(device))
+        features = features.float()  # heads run in fp32; avoids autocast dtype mismatch
+        for concept, head in heads.binary.items():
+            rows = [i for i, labels in enumerate(binary_labels) if concept in labels]
+            if not rows:
+                continue
+            logits = head(features[rows]).squeeze(-1)
+            bin_logits[concept].append(
+                logits.detach().cpu().numpy().astype(np.float64).reshape(-1)
+            )
+            bin_targets[concept].append(
+                np.asarray([binary_labels[i][concept] for i in rows], dtype=np.float64)
+            )
+        for group, head in heads.groups.items():
+            rows = [i for i, labels in enumerate(group_labels) if group in labels]
+            if not rows:
+                continue
+            logits = head(features[rows])
+            grp_logits[group].append(logits.detach().cpu().numpy().astype(np.float64))
+            grp_targets[group].append(
+                np.asarray([group_labels[i][group] for i in rows], dtype=np.int64)
+            )
+    backbone.train()
+    heads.train()
+    binary_scores = {
+        c: (np.concatenate(bin_logits[c]), np.concatenate(bin_targets[c]))
+        for c in heads.binary
+        if bin_logits[c]
+    }
+    group_scores = {
+        g: (np.concatenate(grp_logits[g]), np.concatenate(grp_targets[g]))
+        for g in heads.groups
+        if grp_logits[g]
+    }
+    return binary_scores, group_scores
+
+
+def _backbone_metrics(
+    binary_scores: dict[str, tuple[np.ndarray, np.ndarray]],
+    group_scores: dict[str, tuple[np.ndarray, np.ndarray]],
+) -> dict[str, float]:
+    """Per-head F1/AP + per-group macro-F1 + a defensible ``selection`` aggregate.
+
+    Accuracy at ``logit > 0`` saturates on imbalanced heads and the blind mean of
+    accuracies is dominated by easy heads, so selection moves to F1/AP. Legacy
+    accuracy keys (``binary/<c>`` at ``logit > 0``, ``group/<g>`` argmax) are kept
+    byte-for-byte (additive wire contract). Zero-positive binary heads get no
+    F1/AP (never a frozen zero — only a ``binary_support`` key) and are excluded
+    from ``binary_macro_f1``; a panel's aggregate is omitted (not zeroed) when it
+    has no qualifying member. ``selection`` is the equal-weight mean of whichever
+    of the two panel aggregates exist, else 0.0.
+    """
+    from sklearn.metrics import average_precision_score, f1_score
+
+    from bittrainer.group_validation import compute_multiclass_metrics
+
+    metrics: dict[str, float] = {}
+    binary_f1s: list[float] = []
+    for concept, (logits, targets) in binary_scores.items():
+        logits = np.asarray(logits, dtype=np.float64)
+        tgt_int = np.asarray(targets, dtype=np.float64).astype(np.int64)
+        preds = (logits > 0).astype(np.int64)
+        n = int(tgt_int.shape[0])
+        metrics[f"binary/{concept}"] = float((preds == tgt_int).mean()) if n else 0.0
+        support = int(tgt_int.sum())
+        metrics[f"binary_support/{concept}"] = support
+        if support >= 1:
+            f1 = float(f1_score(tgt_int, preds, zero_division=0))
+            probs = 1.0 / (1.0 + np.exp(-logits))
+            metrics[f"binary_f1/{concept}"] = f1
+            metrics[f"binary_ap/{concept}"] = float(
+                average_precision_score(tgt_int, probs)
+            )
+            binary_f1s.append(f1)
+
+    group_f1s: list[float] = []
+    for group, (logits, targets) in group_scores.items():
+        logits = np.asarray(logits, dtype=np.float64)
+        tgt = np.asarray(targets, dtype=np.int64)
+        n = int(tgt.shape[0])
+        preds = logits.argmax(axis=1)
+        metrics[f"group/{group}"] = float((preds == tgt).mean()) if n else 0.0
+        metrics[f"group_val_support/{group}"] = n
+        if n:
+            gm = compute_multiclass_metrics(
+                tgt.tolist(), preds.tolist(), int(logits.shape[1])
+            )
+            f1 = float(gm["macro_f1"])
+            metrics[f"group_f1/{group}"] = f1
+            group_f1s.append(f1)
+
+    aggregates: list[float] = []
+    if binary_f1s:
+        metrics["binary_macro_f1"] = float(np.mean(binary_f1s))
+        aggregates.append(metrics["binary_macro_f1"])
+    if group_f1s:
+        metrics["group_macro_f1"] = float(np.mean(group_f1s))
+        aggregates.append(metrics["group_macro_f1"])
+    metrics["selection"] = float(np.mean(aggregates)) if aggregates else 0.0
+    return metrics
 
 
 @torch.no_grad()
@@ -512,38 +743,65 @@ def _evaluate(
     *,
     amp_enabled: bool = False,
     amp_dtype: torch.dtype = torch.bfloat16,
+    score_sink: dict | None = None,
 ) -> dict[str, float]:
-    backbone.eval()
-    heads.eval()
-    correct: dict[str, int] = {}
-    total: dict[str, int] = {}
-    for images, binary_labels, group_labels in loader:
-        with torch.amp.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_enabled):
-            features = backbone(images.to(device))
-        features = features.float()  # heads run in fp32; avoids autocast dtype mismatch
-        for concept, head in heads.binary.items():
-            rows = [i for i, labels in enumerate(binary_labels) if concept in labels]
-            if not rows:
-                continue
-            predictions = (head(features[rows]).squeeze(-1) > 0).float()
-            targets = torch.tensor(
-                [binary_labels[i][concept] for i in rows], device=device
-            )
-            key = f"binary/{concept}"
-            correct[key] = correct.get(key, 0) + int((predictions == targets).sum())
-            total[key] = total.get(key, 0) + len(rows)
-        for group, head in heads.groups.items():
-            rows = [i for i, labels in enumerate(group_labels) if group in labels]
-            if not rows:
-                continue
-            predictions = head(features[rows]).argmax(dim=-1)
-            targets = torch.tensor([group_labels[i][group] for i in rows], device=device)
-            key = f"group/{group}"
-            correct[key] = correct.get(key, 0) + int((predictions == targets).sum())
-            total[key] = total.get(key, 0) + len(rows)
-    backbone.train()
-    heads.train()
-    return {key: correct[key] / total[key] for key in sorted(total) if total[key]}
+    """Collect raw val logits then compute the metric panel (see
+    :func:`_backbone_metrics`). Kept as the live monkeypatch seam.
+
+    When ``score_sink`` is provided the raw ``{"binary": ..., "groups": ...}``
+    scores of THIS pass are stashed there so calibration can fit on the winning
+    epoch's logits; fakes that ignore the kwarg simply leave the sink empty.
+    """
+    binary_scores, group_scores = _collect_val_scores(
+        backbone, heads, loader, device, amp_enabled=amp_enabled, amp_dtype=amp_dtype
+    )
+    if score_sink is not None:
+        score_sink["binary"] = binary_scores
+        score_sink["groups"] = group_scores
+    return _backbone_metrics(binary_scores, group_scores)
+
+
+def _tune_binary_thresholds(
+    binary_scores: dict[str, tuple[np.ndarray, np.ndarray]], *, min_positive: int = 1
+) -> dict[str, float]:
+    """F1-optimal per-head decision threshold on ``sigmoid(logit)``.
+
+    Reuses :func:`group_validation.find_per_class_thresholds` one column at a time
+    (its F1 grid sweep + min-positive 0.5 fallback), so a head below
+    ``min_positive`` val positives keeps the naive 0.5.
+    """
+    from bittrainer.group_validation import find_per_class_thresholds
+
+    thresholds: dict[str, float] = {}
+    for concept, (logits, targets) in binary_scores.items():
+        probs = 1.0 / (1.0 + np.exp(-np.asarray(logits, dtype=np.float64)))
+        labels = np.asarray(targets, dtype=np.float64)
+        column = find_per_class_thresholds(
+            probs.reshape(-1, 1), labels.reshape(-1, 1), min_positive=min_positive
+        )
+        thresholds[concept] = float(column[0])
+    return thresholds
+
+
+def _fit_binary_temperature(logits: np.ndarray, targets: np.ndarray) -> float:
+    """Deterministic grid search for the BCE-NLL-minimising temperature.
+
+    Sweeps ``T in geomspace(0.25, 4.0, 33)`` and returns the ``T`` minimising the
+    mean BCE negative-log-likelihood of ``sigmoid(logit / T)``. ``T > 1`` cools an
+    overconfident head; ``T ~ 1`` means the logits are already calibrated.
+    """
+    logits = np.asarray(logits, dtype=np.float64)
+    targets = np.asarray(targets, dtype=np.float64)
+    best_t = 1.0
+    best_nll = np.inf
+    for t in np.geomspace(0.25, 4.0, 33):
+        p = 1.0 / (1.0 + np.exp(-logits / t))
+        p = np.clip(p, 1e-12, 1.0 - 1e-12)
+        nll = float(-(targets * np.log(p) + (1.0 - targets) * np.log(1.0 - p)).mean())
+        if nll < best_nll:
+            best_nll = nll
+            best_t = float(t)
+    return best_t
 
 
 # --------------------------------------------------------------------------- #
@@ -642,7 +900,12 @@ async def run_backbone_training(
     exported — unlike a pause, which deliberately ships nothing.
     """
     return await _run_worker_async(
-        _train_backbone, request, progress_callback, pause_event, stop_event, stop_now_event
+        _train_backbone,
+        request,
+        progress_callback,
+        pause_event,
+        stop_event,
+        stop_now_event,
     )
 
 
@@ -668,12 +931,22 @@ async def run_backbone_head_training(
     in the metadata).
     """
     return await _run_worker_async(
-        _train_backbone_heads, request, progress_callback, pause_event, stop_event, stop_now_event
+        _train_backbone_heads,
+        request,
+        progress_callback,
+        pause_event,
+        stop_event,
+        stop_now_event,
     )
 
 
 async def _run_worker_async(
-    worker, request: dict, progress_callback, pause_event, stop_event=None, stop_now_event=None
+    worker,
+    request: dict,
+    progress_callback,
+    pause_event,
+    stop_event=None,
+    stop_now_event=None,
 ) -> dict:
     loop = asyncio.get_running_loop()
     queue: asyncio.Queue = asyncio.Queue()

@@ -57,7 +57,10 @@ from bittrainer.generic.evaluation import (
     _shipped_decode_metrics as _shipped_decode_metrics,
     _tune_softmax_calibration as _tune_softmax_calibration,
 )
-from bittrainer.generic.optimizer import make_optimizer as make_optimizer
+from bittrainer.generic.optimizer import (
+    clip_gradients as clip_gradients,
+    make_optimizer as make_optimizer,
+)
 from bittrainer.priors import (
     _apply_and_persist_priors as _apply_and_persist_priors,
     _compute_prior_vectors as _compute_prior_vectors,
@@ -109,7 +112,12 @@ logger = logging.getLogger(__name__)
 def _make_optimizer(model: nn.Module, config: GroupTrainConfig) -> Prodigy_adv:
     """Delegate to the shared factory (Bitcrush ISSUE-0542); signature kept so
     ``run_group_training`` / ``head_only_trainer`` call sites are unchanged."""
-    return make_optimizer(model, llrd=config.llrd, llrd_decay=config.llrd_decay)
+    return make_optimizer(
+        model,
+        llrd=config.llrd,
+        llrd_decay=config.llrd_decay,
+        wd_exclusions=config.wd_exclusions,
+    )
 
 
 # --- Checkpoint selection (epoch "best" criterion) -------------------------
@@ -123,7 +131,9 @@ def _make_optimizer(model: nn.Module, config: GroupTrainConfig) -> Prodigy_adv:
 # mean), and require a minimum improvement so epoch-to-epoch noise cannot flip
 # the choice (one-standard-error-rule spirit: Breiman/CART, ESL 7.10;
 # min_delta: Prechelt 1998, Keras EarlyStopping).
-_SELECTION_MIN_DELTA = 0.002        # min composite gain required to replace the incumbent best
+_SELECTION_MIN_DELTA = (
+    0.002  # min composite gain required to replace the incumbent best
+)
 
 
 @dataclass
@@ -239,6 +249,19 @@ class GroupTrainConfig:
     # Layer-wise learning rate decay
     llrd: bool = True
     llrd_decay: float = 0.8
+    # Weight-decay exclusions: place every 1-D param (norm scales, biases, GRN
+    # gains) in a no-decay group. ON by default — decaying scale/shift params has
+    # no upside; the fingerprint carries the optimizer identity so a pre-round
+    # backup (flat layout) cleanly mismatches instead of crashing on resume.
+    wd_exclusions: bool = True
+    # Gradient clipping at the optimizer-step boundary (max total grad norm).
+    # 1.0 is the standard protective default for AdamW-family recipes; 0 disables.
+    # Deterministic and layout-neutral, so resume bit-exactness is unaffected.
+    clip_grad_norm: float = 1.0
+    # Stochastic depth (drop-path) maximum. OFF (0.0) by default for group
+    # fine-tunes — short horizons plus the repo's own A/B caution; parameter-free
+    # so enabling it never perturbs warm-start/state-dict compatibility.
+    drop_path_rate: float = 0.0
     # Asymmetric loss (multi-label only â€” no effect on single-label paths)
     use_asl: bool = True
     asl_gamma_neg: float = 4.0
@@ -463,39 +486,47 @@ def _build_data_quality_warnings(
         none_train_ratio = none_train / total_train if total_train else 0.0
         none_val_ratio = none_val / total_val if total_val else 0.0
         if none_train_ratio < 0.10:
-            warnings.append({
-                "code": "low_none_train_ratio",
-                "severity": "warning",
-                "message": "__none__ training coverage is below 10%",
-                "none_train": none_train,
-                "total_train": total_train,
-                "ratio": none_train_ratio,
-            })
+            warnings.append(
+                {
+                    "code": "low_none_train_ratio",
+                    "severity": "warning",
+                    "message": "__none__ training coverage is below 10%",
+                    "none_train": none_train,
+                    "total_train": total_train,
+                    "ratio": none_train_ratio,
+                }
+            )
         if none_val < 25:
-            warnings.append({
-                "code": "low_none_val_support",
-                "severity": "warning",
-                "message": "__none__ validation support is below 25 images",
-                "none_val": none_val,
-                "total_val": total_val,
-            })
+            warnings.append(
+                {
+                    "code": "low_none_val_support",
+                    "severity": "warning",
+                    "message": "__none__ validation support is below 25 images",
+                    "none_val": none_val,
+                    "total_val": total_val,
+                }
+            )
         if none_val_ratio < 0.05:
-            warnings.append({
-                "code": "low_none_val_ratio",
-                "severity": "warning",
-                "message": "__none__ validation coverage is below 5%",
-                "none_val": none_val,
-                "total_val": total_val,
-                "ratio": none_val_ratio,
-            })
+            warnings.append(
+                {
+                    "code": "low_none_val_ratio",
+                    "severity": "warning",
+                    "message": "__none__ validation coverage is below 5%",
+                    "none_val": none_val,
+                    "total_val": total_val,
+                    "ratio": none_val_ratio,
+                }
+            )
     elif not config.multi_label:
-        warnings.append({
-            "code": "missing_none_class",
-            "severity": "high",
-            "message": "Open-world group has no absence class",
-            "total_train": total_train,
-            "total_val": total_val,
-        })
+        warnings.append(
+            {
+                "code": "missing_none_class",
+                "severity": "high",
+                "message": "Open-world group has no absence class",
+                "total_train": total_train,
+                "total_val": total_val,
+            }
+        )
     return warnings
 
 
@@ -505,7 +536,11 @@ _STEP_REPORT_INTERVAL = 0.25
 
 
 def _get_dtype(name: str) -> torch.dtype:
-    return {"bfloat16": torch.bfloat16, "float16": torch.float16, "float32": torch.float32}[name]
+    return {
+        "bfloat16": torch.bfloat16,
+        "float16": torch.float16,
+        "float32": torch.float32,
+    }[name]
 
 
 # ---------------------------------------------------------------------------
@@ -554,7 +589,8 @@ def build_group_loss_fn(
 
         def loss_fn(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
             soft = _build_soft_targets(
-                labels, config.num_classes,
+                labels,
+                config.num_classes,
                 ordinal=config.ordinal,
                 ordinal_sigma=config.ordinal_sigma,
                 label_smoothing=config.label_smoothing,
@@ -565,7 +601,10 @@ def build_group_loss_fn(
             )
             log_probs = torch.log_softmax(logits.float(), dim=1)
             return _soft_ce_loss(
-                log_probs, soft, class_weights=class_weights, focal_gamma=focal_gamma,
+                log_probs,
+                soft,
+                class_weights=class_weights,
+                focal_gamma=focal_gamma,
             )
 
     elif focal_gamma > 0:
@@ -583,7 +622,9 @@ def build_group_loss_fn(
     return loss_fn
 
 
-def _resolve_class_balance(config: GroupTrainConfig, class_counts: dict[int, int]) -> str:
+def _resolve_class_balance(
+    config: GroupTrainConfig, class_counts: dict[int, int]
+) -> str:
     """Resolve ``class_balance_mode`` to a concrete "resample"/"reweight".
 
     ``auto`` picks "reweight" only when the max/min class-count ratio (over
@@ -645,7 +686,8 @@ def _build_dcw_controller(
         else torch.ones(config.num_classes, device=device)
     )
     return DynamicClassWeightController(
-        config.num_classes, base,
+        config.num_classes,
+        base,
         metric=config.dcw_metric,
         patience=config.dcw_patience,
         ema_decay=config.dcw_ema_decay,
@@ -695,7 +737,9 @@ class _SWA:
 
     @torch.no_grad()
     def update(self, model: nn.Module) -> None:
-        sd = {k: v.detach().float().cpu().clone() for k, v in model.state_dict().items()}
+        sd = {
+            k: v.detach().float().cpu().clone() for k, v in model.state_dict().items()
+        }
         if self._avg is None:
             self._avg = sd
         else:
@@ -762,8 +806,11 @@ def _train_one_epoch(
     none_index = _resolve_none_index(config.class_names)
 
     loss_fn = build_group_loss_fn(
-        config, use_soft_targets=use_soft_targets,
-        none_index=none_index, device=device, class_weights=class_weights,
+        config,
+        use_soft_targets=use_soft_targets,
+        none_index=none_index,
+        device=device,
+        class_weights=class_weights,
     )
     focal_gamma = config.focal_gamma if config.use_focal else 0.0
 
@@ -779,14 +826,19 @@ def _train_one_epoch(
         # An explicitly supplied map wins: the caller already knows how mirroring
         # permutes its labels and needs no grid to say so.
         spatial_flip_map = torch.tensor(
-            config.flip_class_map, dtype=torch.long, device=device,
+            config.flip_class_map,
+            dtype=torch.long,
+            device=device,
         )
     elif config.cell_masks:
         from bittrainer.spatial import build_hflip_class_map
 
         spatial_flip_map = torch.tensor(
-            build_hflip_class_map(config.cell_masks, config.grid_rows, config.grid_cols),
-            dtype=torch.long, device=device,
+            build_hflip_class_map(
+                config.cell_masks, config.grid_rows, config.grid_cols
+            ),
+            dtype=torch.long,
+            device=device,
         )
 
     memory_format = torch.channels_last if config.channels_last else None
@@ -807,7 +859,8 @@ def _train_one_epoch(
 
             images, labels = spatial_hflip_batch(images, labels, spatial_flip_map)
         images = apply_train_augment(
-            images, dtype=dtype,
+            images,
+            dtype=dtype,
             randaugment_n=config.randaugment_n,
             randaugment_m=config.randaugment_m,
             random_erasing_p=config.random_erasing_p,
@@ -821,11 +874,14 @@ def _train_one_epoch(
         mix_soft = None
         if mixup_enabled and torch.rand(1).item() < config.mixup_prob:
             mix_soft = _build_soft_targets(
-                labels, config.num_classes,
-                ordinal=config.ordinal, ordinal_sigma=config.ordinal_sigma,
+                labels,
+                config.num_classes,
+                ordinal=config.ordinal,
+                ordinal_sigma=config.ordinal_sigma,
                 label_smoothing=config.label_smoothing,
                 soft_aliases=config.soft_aliases or None,
-                none_index=none_index, device=device,
+                none_index=none_index,
+                device=device,
                 perceptual_kernel=_build_perceptual_kernel(
                     list(config.class_names),
                     config.class_similarity_centroids or {},
@@ -834,17 +890,24 @@ def _train_one_epoch(
                 ),
             )
             images, mix_soft = apply_mixing(
-                images, mix_soft, config.num_classes,
-                mixup_alpha=config.mixup_alpha, cutmix_alpha=config.cutmix_alpha,
+                images,
+                mix_soft,
+                config.num_classes,
+                mixup_alpha=config.mixup_alpha,
+                cutmix_alpha=config.cutmix_alpha,
                 label_smoothing=0.0,
             )
 
-        with torch.amp.autocast(device_type=device.type, dtype=dtype, enabled=(dtype != torch.float32)):
+        with torch.amp.autocast(
+            device_type=device.type, dtype=dtype, enabled=(dtype != torch.float32)
+        ):
             logits = model(images)
             if mix_soft is not None:
                 loss = _soft_ce_loss(
-                    torch.log_softmax(logits.float(), dim=1), mix_soft,
-                    class_weights=class_weights, focal_gamma=focal_gamma,
+                    torch.log_softmax(logits.float(), dim=1),
+                    mix_soft,
+                    class_weights=class_weights,
+                    focal_gamma=focal_gamma,
                 )
             else:
                 loss = loss_fn(logits, labels)
@@ -855,6 +918,11 @@ def _train_one_epoch(
         ran += 1
         boundary_signal = None
         if num_batches % accum == 0 or num_batches == total_steps:
+            # Clip on the SUMMED gradients at the real accumulation boundary (never
+            # mid-window, where the grads are only half-accumulated). Called through
+            # the module global so tests can monkeypatch the seam.
+            if config.clip_grad_norm and config.clip_grad_norm > 0:
+                clip_gradients(model, config.clip_grad_norm)
             optimizer.step()
             optimizer.zero_grad()
             if ema is not None:
@@ -879,7 +947,10 @@ def _train_one_epoch(
 
         if step_callback is not None:
             now = time.monotonic()
-            if now - _last_report >= _STEP_REPORT_INTERVAL or num_batches == total_steps:
+            if (
+                now - _last_report >= _STEP_REPORT_INTERVAL
+                or num_batches == total_steps
+            ):
                 _last_report = now
                 step_callback(num_batches, total_steps, total_loss / max(ran, 1))
 
@@ -940,7 +1011,12 @@ def _prepare_datasets_and_cache(
     smart_cache = None
     if config.use_cache:
         from bittrainer.smart_cache import SmartCache, region_signature
-        cache_root = Path(config.cache_dir) if config.cache_dir else (group_folder / ".smart_cache")
+
+        cache_root = (
+            Path(config.cache_dir)
+            if config.cache_dir
+            else (group_folder / ".smart_cache")
+        )
         # region_signature reduces to the historical face_model_signature for
         # face-style args, so existing face-crop caches stay valid.
         smart_cache = SmartCache(
@@ -960,43 +1036,64 @@ def _prepare_datasets_and_cache(
     # caller rebuild it once the sweep has chosen. A manual oversample_none is
     # only honoured up-front when the auto sweep is off.
     initial_oversample_none = config.oversample_none and not _auto_oversample_enabled(
-        config, _resolve_none_index(config.class_names),
+        config,
+        _resolve_none_index(config.class_names),
     )
 
     if config.sourceless:
         if smart_cache is None:
-            raise RuntimeError("sourceless=True requires use_cache=True and a cache_dir")
-        cb({
-            "type": "training_progress", "stage": "validating",
-            "status_text": "Loading sourceless samples from cache",
-            "step": 0, "total_steps": 0,
-        })
+            raise RuntimeError(
+                "sourceless=True requires use_cache=True and a cache_dir"
+            )
+        cb(
+            {
+                "type": "training_progress",
+                "stage": "validating",
+                "status_text": "Loading sourceless samples from cache",
+                "step": 0,
+                "total_steps": 0,
+            }
+        )
         train_ds = GroupDataset(
-            group_folder, config.class_names, split="train",
+            group_folder,
+            config.class_names,
+            split="train",
             multi_label=config.multi_label,
-            cache=smart_cache, sourceless=True, group_name=group_name,
+            cache=smart_cache,
+            sourceless=True,
+            group_name=group_name,
             oversample_none=initial_oversample_none,
             extra_paths=config.extra_paths_train,
         )
         val_ds = GroupDataset(
-            group_folder, config.class_names, split="val",
+            group_folder,
+            config.class_names,
+            split="val",
             multi_label=config.multi_label,
-            cache=smart_cache, sourceless=True, group_name=group_name,
+            cache=smart_cache,
+            sourceless=True,
+            group_name=group_name,
             extra_paths=config.extra_paths_val,
         )
     else:
         train_ds = GroupDataset(
-            group_folder, config.class_names, split="train",
+            group_folder,
+            config.class_names,
+            split="train",
             multi_label=config.multi_label,
-            skin_normalise=config.skin_normalise, group_name=group_name,
+            skin_normalise=config.skin_normalise,
+            group_name=group_name,
             oversample_none=initial_oversample_none,
             extra_paths=config.extra_paths_train,
             train_resolution=config.train_resolution,
         )
         val_ds = GroupDataset(
-            group_folder, config.class_names, split="val",
+            group_folder,
+            config.class_names,
+            split="val",
             multi_label=config.multi_label,
-            skin_normalise=config.skin_normalise, group_name=group_name,
+            skin_normalise=config.skin_normalise,
+            group_name=group_name,
             extra_paths=config.extra_paths_val,
             train_resolution=config.train_resolution,
         )
@@ -1010,9 +1107,12 @@ def _prepare_datasets_and_cache(
                 precompute_region_bboxes,
                 region_bbox_cache_name,
             )
+
             if config.region_model_path:
                 cache_name = region_bbox_cache_name(
-                    config.region_model_path, config.region_classes, config.region_selection,
+                    config.region_model_path,
+                    config.region_classes,
+                    config.region_selection,
                 )
                 target_classes = config.region_classes or None
                 selection = config.region_selection
@@ -1023,18 +1123,27 @@ def _prepare_datasets_and_cache(
                 selection = "union"
                 stage, verb = "face_detection", "Detecting faces"
             bbox_cache = FaceBBoxCache(group_folder / ".resize_cache" / cache_name)
-            all_image_paths = [s["path"] for s in train_ds.samples] + [s["path"] for s in val_ds.samples]
+            all_image_paths = [s["path"] for s in train_ds.samples] + [
+                s["path"] for s in val_ds.samples
+            ]
 
             def _crop_progress(done: int, total: int) -> None:
-                cb({
-                    "type": "training_progress", "stage": stage,
-                    "status_text": f"{verb} ({done}/{total})",
-                    "step": done, "total_steps": total,
-                })
+                cb(
+                    {
+                        "type": "training_progress",
+                        "stage": stage,
+                        "status_text": f"{verb} ({done}/{total})",
+                        "step": done,
+                        "total_steps": total,
+                    }
+                )
 
             precompute_region_bboxes(
-                all_image_paths, bbox_cache, crop_model,
-                target_classes=target_classes, selection=selection,
+                all_image_paths,
+                bbox_cache,
+                crop_model,
+                target_classes=target_classes,
+                selection=selection,
                 device=config.device,
                 progress_fn=_crop_progress,
             )
@@ -1052,25 +1161,36 @@ def _prepare_datasets_and_cache(
             if config.region_model_path and config.region_fallback == "drop":
                 dropped = train_ds.drop_paths_without_bbox(face_bboxes)
                 if dropped:
-                    cb({
-                        "type": "training_progress", "stage": stage,
-                        "status_text": f"Dropped {dropped} train images with no detected region",
-                    })
+                    cb(
+                        {
+                            "type": "training_progress",
+                            "stage": stage,
+                            "status_text": f"Dropped {dropped} train images with no detected region",
+                        }
+                    )
 
         # --- Warm SmartCache ---
         if smart_cache is not None:
             from bittrainer.cache_builders import build_image_tensor
             from bittrainer.smart_cache import CachingStoppedException
+
             all_cache_samples = train_ds.samples + val_ds.samples
             try:
                 smart_cache.prepare(
-                    all_cache_samples, build_image_tensor,
-                    num_workers=config.cache_workers, stage_label="caching",
+                    all_cache_samples,
+                    build_image_tensor,
+                    num_workers=config.cache_workers,
+                    stage_label="caching",
                 )
             except CachingStoppedException:
                 logger.info("Caching interrupted by stop_event")
-                cb({"type": "training_cancelled", "stage": "caching",
-                    "status_text": "Cancelled during cache build"})
+                cb(
+                    {
+                        "type": "training_cancelled",
+                        "stage": "caching",
+                        "status_text": "Cancelled during cache build",
+                    }
+                )
                 raise
             # Callbacks are only needed during prepare(). Replace with picklable
             # no-ops so the cache (now attached to datasets) survives pickling
@@ -1092,23 +1212,30 @@ def _prepare_datasets_and_cache(
             # Val default stays on the ORIGINAL view (prob 0); the epoch loop
             # flips skin_tone_force_view for the "normalized" scoring pass.
             val_ds.skin_tone_views = view_bank
-            cb({
-                "type": "training_progress", "stage": "preparing",
-                "status_text": f"Skin Tone dual-view: {len(view_bank)} image transforms loaded",
-            })
+            cb(
+                {
+                    "type": "training_progress",
+                    "stage": "preparing",
+                    "status_text": f"Skin Tone dual-view: {len(view_bank)} image transforms loaded",
+                }
+            )
 
     total_samples = len(train_ds)
     if total_samples == 0:
         raise RuntimeError("No training images found")
 
-    config.data_quality_warnings = _build_data_quality_warnings(train_ds, val_ds, config)
+    config.data_quality_warnings = _build_data_quality_warnings(
+        train_ds, val_ds, config
+    )
     if config.data_quality_warnings:
-        cb({
-            "type": "training_progress",
-            "stage": "data_quality",
-            "status_text": f"{len(config.data_quality_warnings)} data quality warning(s)",
-            "data_quality_warnings": config.data_quality_warnings,
-        })
+        cb(
+            {
+                "type": "training_progress",
+                "stage": "data_quality",
+                "status_text": f"{len(config.data_quality_warnings)} data quality warning(s)",
+                "data_quality_warnings": config.data_quality_warnings,
+            }
+        )
 
     # --- Count samples per bucket ---
     bucket_counts: dict[tuple[int, int], int] = {}
@@ -1125,10 +1252,16 @@ def _emit_model_load_stage(em, config: GroupTrainConfig, checkpoint_dir: Path) -
 
     existing_best = checkpoint_dir / config.best_model_name
     if not config.from_scratch and existing_best.exists():
-        em.stage(Stage.loading_model, f"Loading model ({config.backbone_variant}, warm start)")
+        em.stage(
+            Stage.loading_model,
+            f"Loading model ({config.backbone_variant}, warm start)",
+        )
         return
     if not wants_timm_pretrained(config.backbone_init):
-        em.stage(Stage.loading_model, f"Loading model ({config.backbone_variant}, local backbone)")
+        em.stage(
+            Stage.loading_model,
+            f"Loading model ({config.backbone_variant}, local backbone)",
+        )
         return
     try:
         from huggingface_hub import try_to_load_from_cache
@@ -1179,42 +1312,60 @@ def _create_or_warmstart_model(
             from bittrainer.spatial import install_spatial_head
 
             install_spatial_head(
-                model, config.cell_masks, config.grid_rows * config.grid_cols,
+                model,
+                config.cell_masks,
+                config.grid_rows * config.grid_cols,
             )
         return model
 
     existing_best = checkpoint_dir / config.best_model_name
     if not config.from_scratch and existing_best.exists():
         try:
-            data = torch.load(str(existing_best), map_location=device, weights_only=True)
+            data = torch.load(
+                str(existing_best), map_location=device, weights_only=True
+            )
             if isinstance(data, dict) and "state_dict" in data:
                 state = data["state_dict"]
                 size = data.get("model_size", config.backbone_variant)
             else:
                 state = data
                 size = config.backbone_variant
-            model = _finalise_head(create_model(
-                model_size=size, pretrained=False,
-                num_classes=config.num_classes, head_hidden_size=head_hidden_size,
-            )).to(device)
+            model = _finalise_head(
+                create_model(
+                    model_size=size,
+                    pretrained=False,
+                    num_classes=config.num_classes,
+                    head_hidden_size=head_hidden_size,
+                    drop_path_rate=config.drop_path_rate or None,
+                )
+            ).to(device)
             target = model.state_dict()
             matched = {
-                k: v.to(target[k].dtype) for k, v in state.items()
+                k: v.to(target[k].dtype)
+                for k, v in state.items()
                 if k in target and target[k].shape == v.shape
             }
             model.load_state_dict(matched, strict=False)
             logger.info(
                 "Warm-starting from %s (%d/%d tensors matched)",
-                existing_best, len(matched), len(target),
+                existing_best,
+                len(matched),
+                len(target),
             )
             return model
         except (RuntimeError, OSError, KeyError, EOFError):
-            logger.warning("Warm-start failed, falling back to pretrained", exc_info=True)
-    model = _finalise_head(create_model(
-        model_size=config.backbone_variant,
-        pretrained=wants_timm_pretrained(config.backbone_init),
-        num_classes=config.num_classes, head_hidden_size=head_hidden_size,
-    ))
+            logger.warning(
+                "Warm-start failed, falling back to pretrained", exc_info=True
+            )
+    model = _finalise_head(
+        create_model(
+            model_size=config.backbone_variant,
+            pretrained=wants_timm_pretrained(config.backbone_init),
+            num_classes=config.num_classes,
+            head_hidden_size=head_hidden_size,
+            drop_path_rate=config.drop_path_rate or None,
+        )
+    )
     apply_backbone_init(model, config.backbone_init)
     return model.to(device)
 
@@ -1243,7 +1394,9 @@ def _warmup_head_probe(
     group_folder = Path(config.group_folder)
     embed_root = config.embedding_cache_dir or str(group_folder / ".embedding_cache")
     embed_cache = EmbeddingCache(
-        embed_root, backbone_hash, int(getattr(model, "num_features", 0)),
+        embed_root,
+        backbone_hash,
+        int(getattr(model, "num_features", 0)),
         preproc_sig=_embedding_preproc_sig(config.train_resolution),
     )
     all_samples = train_ds.samples + val_ds.samples
@@ -1255,34 +1408,55 @@ def _warmup_head_probe(
         )
 
     def _build_progress(done: int, total: int) -> None:
-        cb({
-            "type": "training_progress", "stage": "embedding_build",
-            "status_text": f"Warmup: caching features ({done}/{total})",
-            "step": done, "total_steps": total,
-        })
+        cb(
+            {
+                "type": "training_progress",
+                "stage": "embedding_build",
+                "status_text": f"Warmup: caching features ({done}/{total})",
+                "step": done,
+                "total_steps": total,
+            }
+        )
 
-    cb({
-        "type": "training_progress", "stage": "embedding_build",
-        "status_text": f"Warmup: caching backbone features (era {backbone_hash})",
-    })
+    cb(
+        {
+            "type": "training_progress",
+            "stage": "embedding_build",
+            "status_text": f"Warmup: caching backbone features (era {backbone_hash})",
+        }
+    )
     embed_cache.ensure(
-        all_samples, model, smart_cache, device=device, dtype=dtype,
+        all_samples,
+        model,
+        smart_cache,
+        device=device,
+        dtype=dtype,
         batch_size=config.batch_size or 64,
-        progress_cb=_build_progress, stop_check=_stop,
+        progress_cb=_build_progress,
+        stop_check=_stop,
     )
     if _stop():
         return
     embed_cache.verify(all_samples, model, smart_cache, device=device, dtype=dtype)
-    cb({
-        "type": "training_progress", "stage": "training",
-        "status_text": f"Warmup: training head probe ({config.probe_head}) to convergence",
-    })
+    cb(
+        {
+            "type": "training_progress",
+            "stage": "training",
+            "status_text": f"Warmup: training head probe ({config.probe_head}) to convergence",
+        }
+    )
     none_index = _resolve_none_index(config.class_names)
     _run_auto_softness_probe(
-        model, config, embed_cache, smart_cache,
-        train_ds.samples, val_ds.samples,
-        device=device, none_index=none_index,
-        cb=cb, stop_event=stop_event,
+        model,
+        config,
+        embed_cache,
+        smart_cache,
+        train_ds.samples,
+        val_ds.samples,
+        device=device,
+        none_index=none_index,
+        cb=cb,
+        stop_event=stop_event,
     )
     if _stop():
         return
@@ -1290,10 +1464,16 @@ def _warmup_head_probe(
     # soft-label-selected head. Writes config.oversample_none; the caller
     # rebuilds train_ds to honour it before the full fine-tune.
     _run_auto_oversample_probe(
-        model, config, embed_cache, smart_cache,
-        train_ds.samples, val_ds.samples,
-        device=device, none_index=none_index,
-        cb=cb, stop_event=stop_event,
+        model,
+        config,
+        embed_cache,
+        smart_cache,
+        train_ds.samples,
+        val_ds.samples,
+        device=device,
+        none_index=none_index,
+        cb=cb,
+        stop_event=stop_event,
     )
 
 

@@ -185,10 +185,15 @@ def restore_optimizer_aux_state(
             # exist before we overwrite the accumulator.
             helper._get_or_init_layer_ema_tensor(layer_key, params, dev)
             if layer_key in saved:
-                helper.layer_state[layer_key]["sum_sq_accumulator"] = saved[layer_key].to(dev)
+                helper.layer_state[layer_key]["sum_sq_accumulator"] = saved[
+                    layer_key
+                ].to(dev)
         helper._current_step_prepared = int(aux.get("current_step_prepared", -1))
     except Exception:  # pragma: no cover - defensive: never let a resume crash here
-        logger.warning("Could not restore Kourkoutas accumulators; resume may drift slightly", exc_info=True)
+        logger.warning(
+            "Could not restore Kourkoutas accumulators; resume may drift slightly",
+            exc_info=True,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -254,6 +259,7 @@ def make_fingerprint(
     ordinal: bool,
     best_model_name: str,
     model_size: str,
+    optimizer_identity: str | None = None,
 ) -> dict:
     """Identity of the run a backup belongs to.
 
@@ -262,8 +268,14 @@ def make_fingerprint(
     optimizer/model state no longer fits, so the run starts fresh instead of
     crashing on a shape mismatch. ``model_size`` folds in both the group
     trainer's ``backbone_variant`` and the binary trainer's ``model_size``.
+
+    ``optimizer_identity`` is additive: when set it folds an ``"optimizer"`` key
+    into the fingerprint so a param-group layout change (weight-decay exclusions,
+    LLRD) makes a pre-change backup — which lacks the key — mismatch cleanly
+    rather than crash on ``optimizer.load_state_dict``. Untouched callers omit it
+    and keep the historical fingerprint shape.
     """
-    return {
+    fingerprint = {
         "class_names": list(class_names),
         "num_classes": int(num_classes),
         "max_epochs": int(max_epochs),
@@ -272,6 +284,9 @@ def make_fingerprint(
         "best_model_name": str(best_model_name),
         "model_size": str(model_size),
     }
+    if optimizer_identity is not None:
+        fingerprint["optimizer"] = str(optimizer_identity)
+    return fingerprint
 
 
 def fingerprint_matches(saved: dict | None, current: dict) -> bool:
@@ -330,7 +345,9 @@ class TrainingStateManager:
         stray ``.tmp`` files and anything not matching the backup pattern."""
         if not self.backup_dir.is_dir():
             return []
-        files = [p for p in self.backup_dir.glob("backup_*.pt") if _BACKUP_RE.match(p.name)]
+        files = [
+            p for p in self.backup_dir.glob("backup_*.pt") if _BACKUP_RE.match(p.name)
+        ]
         return sorted(files, key=self._sort_key)
 
     # -- save ---------------------------------------------------------------
@@ -381,7 +398,11 @@ class TrainingStateManager:
             try:
                 return torch.load(path, map_location="cpu", weights_only=False)
             except Exception:
-                logger.warning("Backup %s failed to load; trying next-older", path.name, exc_info=True)
+                logger.warning(
+                    "Backup %s failed to load; trying next-older",
+                    path.name,
+                    exc_info=True,
+                )
         return None
 
     def delete_all(self) -> None:
@@ -428,7 +449,9 @@ class BackupCoordinator:
         backup_every_steps: int = 500,
         cb: Callable[[dict], None] | None = None,
     ) -> None:
-        self.manager = TrainingStateManager(backup_dir, keep=keep) if backup_dir else None
+        self.manager = (
+            TrainingStateManager(backup_dir, keep=keep) if backup_dir else None
+        )
         self.pause_event = pause_event
         self.backup_every_steps = int(backup_every_steps)
         self.cb = cb
@@ -448,13 +471,15 @@ class BackupCoordinator:
         path = self.manager.save(state, reason=reason)
         self.last_backup_path = str(path)
         if emit and self.cb is not None:
-            self.cb({
-                "type": "backup_complete",
-                "backup_path": str(path),
-                "global_step": state.get("global_step"),
-                "epoch": state.get("epoch"),
-                "reason": reason,
-            })
+            self.cb(
+                {
+                    "type": "backup_complete",
+                    "backup_path": str(path),
+                    "global_step": state.get("global_step"),
+                    "epoch": state.get("epoch"),
+                    "reason": reason,
+                }
+            )
         return path
 
     def delete_backups(self) -> None:
@@ -480,7 +505,9 @@ class BackupCoordinator:
                     if torch.cuda.is_available():
                         torch.cuda.empty_cache()
                 except Exception:
-                    logger.warning("empty_cache() during exception backup failed", exc_info=True)
+                    logger.warning(
+                        "empty_cache() during exception backup failed", exc_info=True
+                    )
             if self.enabled:
                 try:
                     self.save(collect_state(), reason="exception")
@@ -490,7 +517,9 @@ class BackupCoordinator:
                     )
             raise
 
-    def on_boundary(self, collect_state: Callable[[], dict], global_step: int) -> str | None:
+    def on_boundary(
+        self, collect_state: Callable[[], dict], global_step: int
+    ) -> str | None:
         """Called at every gradient-accumulation boundary.
 
         Returns ``"stop"`` when the epoch loop should break (pause requested),
@@ -508,7 +537,9 @@ class BackupCoordinator:
             self.save(collect_state(), reason="periodic")
         return None
 
-    def load_resume(self, fingerprint: dict, *, resume_from: str | Path | None) -> dict | None:
+    def load_resume(
+        self, fingerprint: dict, *, resume_from: str | Path | None
+    ) -> dict | None:
         """Load the newest compatible backup for a resume, or ``None``.
 
         ``resume_from`` may point at a specific backup dir/file or be falsy (use
@@ -523,11 +554,15 @@ class BackupCoordinator:
                 try:
                     state = torch.load(rp, map_location="cpu", weights_only=False)
                 except Exception:
-                    logger.warning("resume_from file %s failed to load", rp, exc_info=True)
+                    logger.warning(
+                        "resume_from file %s failed to load", rp, exc_info=True
+                    )
                     self._emit_resume_skipped("unloadable_backup")
                     return None
                 return self._check_fingerprint(state, fingerprint)
-            manager = TrainingStateManager(rp, keep=self.manager.keep if self.manager else 2)
+            manager = TrainingStateManager(
+                rp, keep=self.manager.keep if self.manager else 2
+            )
         if manager is None:
             return None
         state = manager.load_latest()
@@ -539,7 +574,8 @@ class BackupCoordinator:
         if not fingerprint_matches(state.get("fingerprint"), fingerprint):
             logger.warning(
                 "Resume fingerprint mismatch (saved=%s current=%s) — starting fresh",
-                state.get("fingerprint"), fingerprint,
+                state.get("fingerprint"),
+                fingerprint,
             )
             self._emit_resume_skipped("fingerprint_mismatch")
             return None
@@ -547,11 +583,13 @@ class BackupCoordinator:
 
     def _emit_resume_skipped(self, reason: str) -> None:
         if self.cb is not None:
-            self.cb({
-                "type": "resume_skipped",
-                "reason": reason,
-                "status_text": "Backup incompatible with current run — starting fresh",
-            })
+            self.cb(
+                {
+                    "type": "resume_skipped",
+                    "reason": reason,
+                    "status_text": "Backup incompatible with current run — starting fresh",
+                }
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -570,13 +608,16 @@ def init_backup(
     never auto-resumes.
     """
     coordinator = BackupCoordinator(
-        backup_dir=config.backup_dir, pause_event=pause_event,
-        backup_every_steps=config.backup_every_steps, cb=cb,
+        backup_dir=config.backup_dir,
+        pause_event=pause_event,
+        backup_every_steps=config.backup_every_steps,
+        cb=cb,
     )
     fingerprint = make_fingerprint(**fingerprint_kwargs)
     resume_state = (
         coordinator.load_resume(fingerprint, resume_from=config.resume_from)
-        if config.resume_from else None
+        if config.resume_from
+        else None
     )
     return coordinator, fingerprint, resume_state
 
@@ -586,11 +627,21 @@ def paused_result(
 ) -> dict:
     """Emit ``training_paused`` and build the trainer's paused return value."""
     bp = str(backup_path) if backup_path else None
-    cb({
-        "type": "training_paused", **extra,
-        "epoch": epoch, "global_step": global_step, "backup_path": bp,
-    })
-    return {"paused": True, "backup_path": bp, "epoch": epoch, "global_step": global_step}
+    cb(
+        {
+            "type": "training_paused",
+            **extra,
+            "epoch": epoch,
+            "global_step": global_step,
+            "backup_path": bp,
+        }
+    )
+    return {
+        "paused": True,
+        "backup_path": bp,
+        "epoch": epoch,
+        "global_step": global_step,
+    }
 
 
 def collect_epoch_state(
@@ -643,7 +694,9 @@ def restore_optimizer_state(resume_state: dict, optimizer, scheduler, device) ->
     scheduler.load_state_dict(resume_state["scheduler"])
 
 
-def loader_kwargs(num_workers: int, *, pin_memory: bool = True, prefetch_factor: int = 4) -> dict:
+def loader_kwargs(
+    num_workers: int, *, pin_memory: bool = True, prefetch_factor: int = 4
+) -> dict:
     """DataLoader kwargs honouring ``config.dataloader_workers`` (0 disables the
     worker-only persistent/prefetch options; the trainers previously hardcoded 4/6)."""
     n = max(0, int(num_workers))
