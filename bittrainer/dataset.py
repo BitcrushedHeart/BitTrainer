@@ -44,6 +44,12 @@ ASPECT_RATIO_BUCKETS: list[tuple[int, int]] = [
 _BUCKET_RATIOS: list[float] = [w / h for w, h in ASPECT_RATIO_BUCKETS]
 
 DEFAULT_TRAIN_RESOLUTION = 512
+MIN_BINARY_NEG_POS_RATIO = 2.0
+
+
+def effective_binary_neg_pos_ratio(value: float | None) -> float:
+    """Return the implied-negative ratio, enforcing the binary 2:1 floor."""
+    return max(MIN_BINARY_NEG_POS_RATIO, float(value or MIN_BINARY_NEG_POS_RATIO))
 
 
 def scaled_buckets(
@@ -284,7 +290,7 @@ class ConceptDataset(Dataset):
         concept_folder: str | Path,
         split: str = "train",
         *,
-        neg_pos_ratio: float = 1.0,
+        neg_pos_ratio: float = MIN_BINARY_NEG_POS_RATIO,
         transform: Any | None = None,
         extra_positive_dirs: list[str] | None = None,
         negative_dirs: list[str] | None = None,
@@ -305,7 +311,7 @@ class ConceptDataset(Dataset):
         self.transform = transform
         self._face_bboxes: dict[str, list[int]] = face_bboxes or {}
         self._skin_normalise = skin_normalise
-        self._neg_pos_ratio = neg_pos_ratio
+        self._neg_pos_ratio = effective_binary_neg_pos_ratio(neg_pos_ratio)
         self._hard_negative_weight = hard_negative_weight
         self._concept_name = concept_name or self.concept_folder.name
         self._cache = cache
@@ -413,13 +419,10 @@ class ConceptDataset(Dataset):
             self.samples.extend(hard_neg_samples)
 
         num_pos = len(self._positive_paths)
-        max_neg = (
-            int(num_pos * self._neg_pos_ratio)
-            if self._neg_pos_ratio > 0
-            else len(self._all_negative_paths)
-        )
-        hard_slots = len(hard_neg_samples) * self._hard_negative_weight
-        remaining = max(0, max_neg - hard_slots)
+        # Implied negatives have their own ratio quota. Explicit negatives are
+        # additive (and retain their hard-negative repetition weight) rather
+        # than consuming slots from the implied pool.
+        remaining = math.ceil(num_pos * self._neg_pos_ratio)
 
         neg_samples = [self._path_info[str(p)] for p in self._all_negative_paths]
         if len(neg_samples) > remaining:

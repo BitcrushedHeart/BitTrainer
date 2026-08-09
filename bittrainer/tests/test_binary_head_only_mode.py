@@ -73,14 +73,20 @@ def test_head_only_samples_negative_quota_before_dataset_dimension_scan() -> Non
     sampled = _sample_negative_pool(
         pool,
         positive_count=12,
-        hard_negative_count=3,
-        hard_negative_weight=3,
         neg_pos_ratio=1.0,
     )
 
-    # Twelve total negative slots minus three hard negatives repeated 3x.
-    assert len(sampled) == 3
+    # The configured 1:1 is clamped to the binary minimum of 2:1. Explicit
+    # negatives are additive and therefore do not consume these 24 slots.
+    assert len(sampled) == 24
     assert set(sampled) <= set(pool)
+
+    stronger = _sample_negative_pool(
+        pool,
+        positive_count=12,
+        neg_pos_ratio=3.0,
+    )
+    assert len(stronger) == 36
 
 
 def test_head_only_builds_then_reuses_cached_features(tmp_path) -> None:

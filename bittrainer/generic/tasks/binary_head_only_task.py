@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import logging
+import math
 import random
 import time
 from pathlib import Path
@@ -13,7 +14,11 @@ import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
 
 import bittrainer.trainer as bt
-from bittrainer.dataset import DEFAULT_TRAIN_RESOLUTION, build_bucket_batch_sampler
+from bittrainer.dataset import (
+    DEFAULT_TRAIN_RESOLUTION,
+    build_bucket_batch_sampler,
+    effective_binary_neg_pos_ratio,
+)
 from bittrainer.embedding_cache import EmbeddingCache
 from bittrainer.generic.task import BestTracker, LoopSpec, TaskContext
 from bittrainer.generic.tasks.binary_task import BinaryTask
@@ -41,19 +46,21 @@ def _sample_negative_pool(
     paths: list[str],
     *,
     positive_count: int,
-    hard_negative_count: int,
-    hard_negative_weight: int,
     neg_pos_ratio: float,
+    reserve: int = 0,
 ) -> list[str]:
-    """Select the fixed head-probe quota before expensive dimension indexing."""
-    if neg_pos_ratio <= 0:
+    """Select implied negatives before expensive dimension indexing.
+
+    The implied pool independently receives at least two images per positive.
+    Explicit negatives live in a separate additive pool and are not subtracted.
+    ``reserve`` keeps enough train candidates available for a validation
+    shortfall to be donated without weakening the train ratio.
+    """
+    ratio = effective_binary_neg_pos_ratio(neg_pos_ratio)
+    quota = math.ceil(positive_count * ratio) + max(0, int(reserve))
+    if len(paths) <= quota:
         return list(paths)
-    max_negatives = int(positive_count * neg_pos_ratio)
-    hard_slots = hard_negative_count * hard_negative_weight
-    remaining = max(0, max_negatives - hard_slots)
-    if len(paths) <= remaining:
-        return list(paths)
-    return random.sample(paths, remaining)
+    return random.sample(paths, quota)
 
 
 def _train_cached_binary_head(
@@ -209,21 +216,23 @@ class BinaryHeadOnlyTask(BinaryTask):
         original_train = config.train_negative_paths
         original_val = config.val_negative_paths
         try:
+            ratio = effective_binary_neg_pos_ratio(config.neg_pos_ratio)
+            val_shortfall = 0
+            if original_val is not None and config.val_positive_paths is not None:
+                val_quota = math.ceil(len(config.val_positive_paths) * ratio)
+                val_shortfall = max(0, val_quota - len(original_val))
             if original_train is not None and config.train_positive_paths is not None:
                 config.train_negative_paths = _sample_negative_pool(
                     original_train,
                     positive_count=len(config.train_positive_paths),
-                    hard_negative_count=len(config.train_hard_negative_paths or []),
-                    hard_negative_weight=config.hard_negative_weight,
-                    neg_pos_ratio=config.neg_pos_ratio,
+                    neg_pos_ratio=ratio,
+                    reserve=val_shortfall,
                 )
             if original_val is not None and config.val_positive_paths is not None:
                 config.val_negative_paths = _sample_negative_pool(
                     original_val,
                     positive_count=len(config.val_positive_paths),
-                    hard_negative_count=len(config.val_hard_negative_paths or []),
-                    hard_negative_weight=1,
-                    neg_pos_ratio=1.0,
+                    neg_pos_ratio=ratio,
                 )
             super().prepare_data(ctx)
         finally:

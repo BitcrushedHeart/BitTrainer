@@ -234,6 +234,7 @@ class BinaryTask(TrainingTask):
             val_ds = ConceptDataset(
                 concept_folder,
                 split="val",
+                neg_pos_ratio=config.neg_pos_ratio,
                 extra_positive_dirs=config.extra_positive_dirs,
                 negative_dirs=config.negative_dirs,
                 positive_paths=config.val_positive_paths,
