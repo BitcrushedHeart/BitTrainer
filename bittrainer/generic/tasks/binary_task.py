@@ -255,7 +255,9 @@ class BinaryTask(TrainingTask):
         device, dtype = ctx.device, ctx.dtype
         checkpoint_dir = ctx.checkpoint_dir
         existing_best = checkpoint_dir / config.best_model_name
-        self.use_gradual_unfreeze = self.num_positives < 50
+        self.use_gradual_unfreeze = (
+            config.training_mode == "full" and self.num_positives < 50
+        )
         ctx.cb({"type": "training_progress", "stage": "preparing", "status_text": "Loading model"})
 
         if resume_state is not None:
@@ -321,7 +323,7 @@ class BinaryTask(TrainingTask):
             # Replay the gradual-unfreeze reconstruction so the optimizer param_groups
             # match the epoch we resume INTO, BEFORE loading optimizer/scheduler state.
             skip_opt_load = False
-            if start_epoch >= 1:
+            if config.training_mode == "full" and start_epoch >= 1:
                 if self.use_gradual_unfreeze:
                     unfreeze_stage(model, _NUM_STAGES - 1)  # epoch-1 transition
                     for e in range(2, start_epoch + 1):
@@ -352,6 +354,8 @@ class BinaryTask(TrainingTask):
 
     # -- per-epoch ---------------------------------------------------------
     def on_epoch_start(self, ctx, model, epoch, *, optimizer, scheduler, scheduler_t_max, start_epoch):
+        if self.config.training_mode == "head_only":
+            return None
         # The resumed epoch's reconstruction already ran in create_optimizer.
         if ctx.resume_state is not None and epoch == start_epoch:
             return None
@@ -464,6 +468,7 @@ class BinaryTask(TrainingTask):
             "state_dict": primary_state,
             "num_classes": 2,
             "model_size": config.model_size,
+            "training_mode": config.training_mode,
         }
         if self.ema is not None:
             ckpt_meta["model_state_dict"] = model.state_dict()
@@ -502,7 +507,7 @@ class BinaryTask(TrainingTask):
     def finalize(self, ctx: TaskContext, model, best: BestTracker, epochs_completed: int) -> dict:
         config = self.config
         existing_best = ctx.checkpoint_dir / config.best_model_name
-        return bt._binary_compare_promote(
+        result = bt._binary_compare_promote(
             config,
             best_checkpoint_path=best.best_checkpoint_path,
             existing_best=existing_best,
@@ -518,3 +523,5 @@ class BinaryTask(TrainingTask):
             num_positives=self.num_positives,
             train_ds=self.train_ds,
         )
+        result["mode"] = config.training_mode
+        return result

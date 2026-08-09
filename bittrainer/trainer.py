@@ -42,6 +42,9 @@ class TrainConfig:
     # SmartCache keys embed bucket dims, so a change simply builds fresh entries.
     train_resolution: int = 512
     model_size: str = "nano"
+    # ``head_only`` keeps the ConvNeXt trunk frozen for every epoch. ``full``
+    # preserves the historical epoch-0 head warmup followed by unfreezing.
+    training_mode: str = "full"
     device: str = "cuda"
     dtype: str = "bfloat16"
     from_scratch: bool = False
