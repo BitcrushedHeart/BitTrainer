@@ -4,12 +4,18 @@ stale-era pruning on backbone change. All CPU, no SmartCache (on-the-fly build).
 
 from __future__ import annotations
 
+import json
+
 import numpy as np
 import pytest
 import torch
 from PIL import Image
 
-from bittrainer.embedding_cache import EmbeddingCache, EmbeddingCacheMismatch, _content_hash
+from bittrainer.embedding_cache import (
+    EmbeddingCache,
+    EmbeddingCacheMismatch,
+    _content_hash,
+)
 from bittrainer.model import backbone_feature_hash, create_model
 
 _DEV = torch.device("cpu")
@@ -24,8 +30,15 @@ def _samples(tmp_path, n=6):
         p = d / f"im{i}.png"
         arr = np.random.default_rng(i).integers(0, 256, (80, 80, 3)).astype(np.uint8)
         Image.fromarray(arr).save(p)
-        samples.append({"path": str(p), "bucket": (64, 64), "label": i % 3,
-                        "skin_normalise": False, "face_bbox": None})
+        samples.append(
+            {
+                "path": str(p),
+                "bucket": (64, 64),
+                "label": i % 3,
+                "skin_normalise": False,
+                "face_bbox": None,
+            }
+        )
     return samples
 
 
@@ -45,6 +58,90 @@ def test_build_reuse_and_verify(tmp_path):
 
     stats2 = cache.ensure(samples, model, None, device=_DEV, dtype=_DT)
     assert stats2["built"] == 0 and stats2["reused"] == 6
+
+    meta = json.loads(cache._meta_path.read_text())
+    assert meta["complete"] is True
+
+
+def test_ensure_rebuilds_zero_filled_vector_even_if_shared_era_was_completed(
+    tmp_path,
+):
+    """A machine crash can leave a full-size .npy whose data pages are zero.
+
+    Another concept may subsequently complete the shared era, so ensure audits
+    every vector referenced by this run and selectively rebuilds the damage.
+    """
+    samples = _samples(tmp_path)
+    model = create_model(model_size="nano", pretrained=False, num_classes=3).eval()
+    cache = EmbeddingCache(tmp_path / "embed", backbone_feature_hash(model), 640)
+    cache.ensure(samples, model, None, device=_DEV, dtype=_DT)
+
+    damaged_hash = _content_hash(samples[0]["path"], None)
+    np.save(cache._vec_path(damaged_hash), np.zeros(640, dtype=np.float32))
+
+    stats = cache.ensure(samples, model, None, device=_DEV, dtype=_DT)
+
+    assert stats == {"built": 1, "reused": 5, "total": 6}
+    assert np.linalg.norm(np.load(cache._vec_path(damaged_hash))) > 0
+    assert json.loads(cache._meta_path.read_text())["complete"] is True
+    assert list(cache.root.glob("*.tmp")) == []
+
+
+def test_invalid_batched_forward_is_retried_per_image_before_persisting(
+    monkeypatch, tmp_path
+):
+    samples = _samples(tmp_path, n=2)
+    cache = EmbeddingCache(tmp_path / "embed", "0123456789abcdef", 4)
+    forward_batch_sizes: list[int] = []
+
+    def _forward(batch, _backbone, _device, _dtype):
+        forward_batch_sizes.append(len(batch))
+        if len(batch) > 1:
+            return np.zeros((len(batch), 4), dtype=np.float32)
+        return np.ones((1, 4), dtype=np.float32)
+
+    monkeypatch.setattr(cache, "_forward_pooled", _forward)
+
+    stats = cache.ensure(
+        samples,
+        torch.nn.Identity(),
+        None,
+        device=_DEV,
+        dtype=_DT,
+        batch_size=2,
+    )
+
+    assert stats == {"built": 2, "reused": 0, "total": 2}
+    assert forward_batch_sizes == [2, 1, 1]
+    for sample in samples:
+        vector = cache.get_vector(sample["path"], None)
+        assert vector is not None
+        assert np.array_equal(vector, np.ones(4, dtype=np.float32))
+
+
+def test_invalid_single_image_forward_leaves_era_incomplete(monkeypatch, tmp_path):
+    samples = _samples(tmp_path, n=1)
+    cache = EmbeddingCache(tmp_path / "embed", "0123456789abcdef", 4)
+    monkeypatch.setattr(
+        cache,
+        "_forward_pooled",
+        lambda batch, _backbone, _device, _dtype: np.zeros(
+            (len(batch), 4), dtype=np.float32
+        ),
+    )
+
+    with pytest.raises(EmbeddingCacheMismatch, match="no cache file was written"):
+        cache.ensure(
+            samples,
+            torch.nn.Identity(),
+            None,
+            device=_DEV,
+            dtype=_DT,
+            batch_size=1,
+        )
+
+    assert json.loads(cache._meta_path.read_text())["complete"] is False
+    assert list(cache.root.glob("*.npy")) == []
 
 
 def test_verify_raises_on_corrupt_vector(tmp_path):

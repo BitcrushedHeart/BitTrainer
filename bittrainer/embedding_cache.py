@@ -21,9 +21,11 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
 import random
 import re
 import shutil
+import uuid
 from collections import defaultdict
 from pathlib import Path
 from typing import Any, Callable
@@ -70,6 +72,7 @@ def _content_hash(path: str, smart_cache: Any | None) -> str | None:
         if h:
             return h
     from bittrainer.smart_cache import _hash_file
+
     try:
         return _hash_file(path)
     except OSError:
@@ -106,14 +109,77 @@ class EmbeddingCache:
     def _vec_path(self, content_hash: str) -> Path:
         return self.root / f"{content_hash}.npy"
 
-    def _write_meta(self) -> None:
+    def _read_meta(self) -> dict[str, Any]:
+        try:
+            data = json.loads(self._meta_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError, TypeError):
+            return {}
+        return data if isinstance(data, dict) else {}
+
+    def _write_meta(self, *, complete: bool) -> None:
+        """Durably publish the era state before/after vector writes.
+
+        ``complete=False`` is fsynced before building. If the machine dies
+        mid-cache, the next run audits every existing vector and selectively
+        rebuilds damaged files. The metadata itself is also replaced atomically
+        so a torn JSON write cannot make a healthy era look complete.
+        """
         self.root.mkdir(parents=True, exist_ok=True)
-        self._meta_path.write_text(json.dumps({
+        payload = {
             "version": EMBED_CACHE_VERSION,
             "backbone_hash": self.backbone_hash,
             "pooled_dim": self.pooled_dim,
             "preproc_sig": self.preproc_sig,
-        }))
+            "complete": bool(complete),
+        }
+        tmp_path = self._meta_path.with_name(
+            f".{self._meta_path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
+        )
+        try:
+            with tmp_path.open("w", encoding="utf-8") as handle:
+                json.dump(payload, handle)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(tmp_path, self._meta_path)
+        finally:
+            try:
+                tmp_path.unlink()
+            except FileNotFoundError:
+                pass
+
+    def _valid_vector(self, vector: np.ndarray) -> bool:
+        arr = np.asarray(vector)
+        return (
+            arr.shape == (self.pooled_dim,)
+            and np.issubdtype(arr.dtype, np.number)
+            and bool(np.isfinite(arr).all())
+            and float(np.linalg.norm(arr)) > 1e-12
+        )
+
+    def _load_vector_path(self, path: Path) -> np.ndarray | None:
+        try:
+            vector = np.load(path, allow_pickle=False)
+        except (OSError, ValueError, EOFError):
+            return None
+        return vector if self._valid_vector(vector) else None
+
+    def _save_vector(self, content_hash: str, vector: np.ndarray) -> None:
+        """Crash-durably save one vector via fsynced temp + atomic replace."""
+        final_path = self._vec_path(content_hash)
+        tmp_path = final_path.with_name(
+            f".{final_path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
+        )
+        try:
+            with tmp_path.open("wb") as handle:
+                np.save(handle, vector, allow_pickle=False)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(tmp_path, final_path)
+        finally:
+            try:
+                tmp_path.unlink()
+            except FileNotFoundError:
+                pass
 
     def prune_other_eras(self) -> list[str]:
         """Delete sibling era directories for other (now-invalid) backbone hashes.
@@ -142,7 +208,10 @@ class EmbeddingCache:
             # invalidates the old vectors just like a weight change does).
             if not child.is_dir() or child.name == self.root.name:
                 continue
-            if not _ERA_DIR_RE.match(child.name) and not (child / "meta.json").is_file():
+            if (
+                not _ERA_DIR_RE.match(child.name)
+                and not (child / "meta.json").is_file()
+            ):
                 continue
             try:
                 shutil.rmtree(child)
@@ -154,11 +223,14 @@ class EmbeddingCache:
         if removed:
             logger.info(
                 "EmbeddingCache: pruned %d stale backbone era(s): %s",
-                len(removed), ", ".join(removed),
+                len(removed),
+                ", ".join(removed),
             )
         return removed
 
-    def _load_input_tensor(self, sample: dict, smart_cache: Any | None) -> torch.Tensor | None:
+    def _load_input_tensor(
+        self, sample: dict, smart_cache: Any | None
+    ) -> torch.Tensor | None:
         if smart_cache is not None:
             res = smart_cache.get(sample["path"])
             if res is not None:
@@ -167,6 +239,7 @@ class EmbeddingCache:
                 if tuple(tensor.shape[-2:]) == (bh, bw):
                     return tensor
         from bittrainer.cache_builders import build_image_tensor
+
         try:
             arr = build_image_tensor(sample)
         except (OSError, ValueError):
@@ -174,13 +247,19 @@ class EmbeddingCache:
         return torch.from_numpy(np.ascontiguousarray(arr))
 
     def _forward_pooled(
-        self, batch: torch.Tensor, backbone: nn.Module,
-        device: torch.device, dtype: torch.dtype,
+        self,
+        batch: torch.Tensor,
+        backbone: nn.Module,
+        device: torch.device,
+        dtype: torch.dtype,
     ) -> np.ndarray:
         batch = batch.to(device)
         batch = apply_val_transform(batch, dtype=dtype)
-        with torch.no_grad(), torch.amp.autocast(
-            device_type=device.type, dtype=dtype, enabled=(dtype != torch.float32)
+        with (
+            torch.no_grad(),
+            torch.amp.autocast(
+                device_type=device.type, dtype=dtype, enabled=(dtype != torch.float32)
+            ),
         ):
             vecs = pooled_features(backbone, batch)
         return vecs.float().cpu().numpy()
@@ -207,7 +286,14 @@ class EmbeddingCache:
 
         Returns ``{"built": n, "reused": n, "total": n}``.
         """
-        self._write_meta()
+        previous_meta = self._read_meta()
+        audit_existing = not (
+            previous_meta.get("version") == EMBED_CACHE_VERSION
+            and previous_meta.get("backbone_hash") == self.backbone_hash
+            and previous_meta.get("pooled_dim") == self.pooled_dim
+            and previous_meta.get("preproc_sig") == self.preproc_sig
+            and previous_meta.get("complete") is True
+        )
         # Establishing this era invalidates any other backbone-hash era under the
         # same cache root — reclaim them now so the cache can't accumulate dead
         # vectors for hashes that will never recur.
@@ -223,10 +309,36 @@ class EmbeddingCache:
             by_hash.setdefault(h, s)
 
         total = len(by_hash)
-        missing = [(h, s) for h, s in by_hash.items() if not self._vec_path(h).is_file()]
+        missing: list[tuple[str, dict]] = []
+        for content_hash, sample in by_hash.items():
+            vector_path = self._vec_path(content_hash)
+            if not vector_path.is_file():
+                missing.append((content_hash, sample))
+                continue
+            # Validate every vector referenced by this run, even when the era
+            # marker says complete. The root is shared across concepts: a
+            # different concept may have set the era complete after a crash
+            # without referencing (and therefore auditing) this file.
+            if self._load_vector_path(vector_path) is None:
+                logger.warning(
+                    "EmbeddingCache: rebuilding invalid vector left by an "
+                    "interrupted cache build: %s",
+                    vector_path,
+                )
+                try:
+                    vector_path.unlink()
+                except FileNotFoundError:
+                    pass
+                missing.append((content_hash, sample))
         reused = total - len(missing)
         if not missing:
+            if audit_existing:
+                self._write_meta(complete=True)
             return {"built": 0, "reused": reused, "total": total}
+
+        # This marker reaches disk before any vector write. A hard reset then
+        # causes the next run to audit existing files rather than trusting them.
+        self._write_meta(complete=False)
 
         by_bucket: dict[tuple, list] = defaultdict(list)
         for h, s in missing:
@@ -237,28 +349,54 @@ class EmbeddingCache:
             for start in range(0, len(items), batch_size):
                 if stop_check is not None and stop_check():
                     return {"built": built, "reused": reused, "total": total}
-                chunk = items[start:start + batch_size]
-                tensors, hashes = [], []
+                chunk = items[start : start + batch_size]
+                tensors, hashes, sample_paths = [], [], []
                 for h, s in chunk:
                     t = self._load_input_tensor(s, smart_cache)
                     if t is None:
-                        logger.warning("EmbeddingCache: could not load input for %s", s["path"])
+                        logger.warning(
+                            "EmbeddingCache: could not load input for %s", s["path"]
+                        )
                         continue
                     tensors.append(t)
                     hashes.append(h)
+                    sample_paths.append(s["path"])
                 if not tensors:
                     continue
                 # Store at float32: a lossless capture of the pooled vector the
                 # backbone produced (under autocast), so the probe trains on the
                 # exact features without an extra fp16 quantisation step.
-                vecs = self._forward_pooled(torch.stack(tensors), backbone, device, dtype)
-                vecs = np.ascontiguousarray(vecs, dtype=np.float32)
-                for h, v in zip(hashes, vecs):
-                    np.save(self._vec_path(h), v)
+                vecs = self._forward_pooled(
+                    torch.stack(tensors), backbone, device, dtype
+                )
+                safe_vecs: list[np.ndarray] = []
+                for index, tensor in enumerate(tensors):
+                    vector = vecs[index] if index < len(vecs) else None
+                    if vector is None or not self._valid_vector(vector):
+                        logger.warning(
+                            "EmbeddingCache: invalid batched feature for %s; "
+                            "retrying that image independently",
+                            sample_paths[index],
+                        )
+                        retry = self._forward_pooled(
+                            tensor.unsqueeze(0), backbone, device, dtype
+                        )[0]
+                        if not self._valid_vector(retry):
+                            raise EmbeddingCacheMismatch(
+                                "Backbone produced an invalid pooled feature for "
+                                f"'{sample_paths[index]}' both in a batch and "
+                                "when retried independently; no cache file was written."
+                            )
+                        vector = retry
+                    safe_vecs.append(np.ascontiguousarray(vector, dtype=np.float32))
+                for content_hash, vector in zip(hashes, safe_vecs):
+                    self._save_vector(content_hash, vector)
                 built += len(hashes)
                 if progress_cb is not None:
                     progress_cb(built, len(missing))
 
+        if built == len(missing):
+            self._write_meta(complete=True)
         return {"built": built, "reused": reused, "total": total}
 
     def get_vector(self, path: str, smart_cache: Any | None) -> np.ndarray | None:
@@ -268,7 +406,7 @@ class EmbeddingCache:
         p = self._vec_path(h)
         if not p.is_file():
             return None
-        return np.load(p)
+        return self._load_vector_path(p)
 
     def verify(
         self,
@@ -326,7 +464,11 @@ class EmbeddingCache:
             live = self._forward_pooled(t.unsqueeze(0), backbone, device, dtype)[0]
             cached_vec = self.get_vector(s["path"], smart_cache)
             if cached_vec is None:
-                continue
+                raise EmbeddingCacheMismatch(
+                    f"Cached embedding for '{s['path']}' is unreadable, has the "
+                    "wrong shape, or contains zero/non-finite data. An incomplete "
+                    "era will be audited and repaired by ensure() on the next run."
+                )
             cached_vec = cached_vec.astype(np.float32)
             denom = float(np.linalg.norm(live)) or 1.0
             rel_err = float(np.linalg.norm(live - cached_vec)) / denom
@@ -340,6 +482,12 @@ class EmbeddingCache:
                 )
             checked += 1
         if checked == 0:
-            raise EmbeddingCacheMismatch("Verification could not load any input tensors")
-        logger.info("EmbeddingCache.verify: %d vectors OK (worst relative L2 %.3f)", checked, worst)
+            raise EmbeddingCacheMismatch(
+                "Verification could not load any input tensors"
+            )
+        logger.info(
+            "EmbeddingCache.verify: %d vectors OK (worst relative L2 %.3f)",
+            checked,
+            worst,
+        )
         return checked
