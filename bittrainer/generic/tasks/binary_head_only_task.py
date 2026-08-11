@@ -8,6 +8,7 @@ import math
 import random
 import time
 from pathlib import Path
+from typing import Callable
 
 import torch
 import torch.nn as nn
@@ -19,7 +20,7 @@ from bittrainer.dataset import (
     build_bucket_batch_sampler,
     effective_binary_neg_pos_ratio,
 )
-from bittrainer.embedding_cache import EmbeddingCache
+from bittrainer.embedding_cache import EmbeddingCache, cached_hashes_for_sig
 from bittrainer.generic.task import BestTracker, LoopSpec, TaskContext
 from bittrainer.generic.tasks.binary_task import BinaryTask
 from bittrainer.head_probe import _gather
@@ -42,25 +43,69 @@ def _embedding_preproc_sig(train_resolution: int) -> str:
     return f"val_imagenet@{int(train_resolution)}"
 
 
+def _cached_negative_predicate(
+    config: bt.TrainConfig,
+) -> Callable[[str], bool] | None:
+    """Build ``path -> already feature-passed`` for negative-pool seeding.
+
+    Binary concepts sharing a pinned backbone also share the pooled-vector
+    cache, so an implied negative whose content hash already has a vector under
+    the current preproc-sig eras trains for free. Path→hash resolution is a
+    read-only SmartCache index lookup; a path the smart cache has never seen
+    counts as a miss (no file hashing at sampling time). Returns ``None`` when
+    there is nothing to prefer, keeping the sampler purely random.
+    """
+    if not (config.use_cache and config.cache_dir and config.embedding_cache_dir):
+        return None
+    cached_hashes = cached_hashes_for_sig(
+        config.embedding_cache_dir, _embedding_preproc_sig(config.train_resolution)
+    )
+    if not cached_hashes:
+        return None
+    from bittrainer.smart_cache import SmartCache
+
+    index = SmartCache(config.cache_dir, modeltype=config.modeltype)
+
+    def is_cached(path: str) -> bool:
+        content_hash = index.content_hash(path)
+        return content_hash is not None and content_hash in cached_hashes
+
+    return is_cached
+
+
 def _sample_negative_pool(
     paths: list[str],
     *,
     positive_count: int,
     neg_pos_ratio: float,
     reserve: int = 0,
+    is_cached: Callable[[str], bool] | None = None,
 ) -> list[str]:
     """Select implied negatives before expensive dimension indexing.
 
-    The implied pool independently receives at least two images per positive.
+    The implied pool independently receives at least three images per positive.
     Explicit negatives live in a separate additive pool and are not subtracted.
     ``reserve`` keeps enough train candidates available for a validation
     shortfall to be donated without weakening the train ratio.
+
+    With ``is_cached``, the quota fills from already-feature-passed candidates
+    first (random within that tier) and tops up from uncached images only on
+    shortfall, so retrains reuse the transferable embedding cache instead of
+    paying backbone forwards for fresh random negatives.
     """
     ratio = effective_binary_neg_pos_ratio(neg_pos_ratio)
     quota = math.ceil(positive_count * ratio) + max(0, int(reserve))
     if len(paths) <= quota:
         return list(paths)
-    return random.sample(paths, quota)
+    if is_cached is None:
+        return random.sample(paths, quota)
+    hits: list[str] = []
+    misses: list[str] = []
+    for path in paths:
+        (hits if is_cached(path) else misses).append(path)
+    if len(hits) >= quota:
+        return random.sample(hits, quota)
+    return hits + random.sample(misses, quota - len(hits))
 
 
 def _train_cached_binary_head(
@@ -217,6 +262,7 @@ class BinaryHeadOnlyTask(BinaryTask):
         original_val = config.val_negative_paths
         try:
             ratio = effective_binary_neg_pos_ratio(config.neg_pos_ratio)
+            is_cached = _cached_negative_predicate(config)
             val_shortfall = 0
             if original_val is not None and config.val_positive_paths is not None:
                 val_quota = math.ceil(len(config.val_positive_paths) * ratio)
@@ -227,12 +273,14 @@ class BinaryHeadOnlyTask(BinaryTask):
                     positive_count=len(config.train_positive_paths),
                     neg_pos_ratio=ratio,
                     reserve=val_shortfall,
+                    is_cached=is_cached,
                 )
             if original_val is not None and config.val_positive_paths is not None:
                 config.val_negative_paths = _sample_negative_pool(
                     original_val,
                     positive_count=len(config.val_positive_paths),
                     neg_pos_ratio=ratio,
+                    is_cached=is_cached,
                 )
             super().prepare_data(ctx)
         finally:

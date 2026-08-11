@@ -44,11 +44,11 @@ ASPECT_RATIO_BUCKETS: list[tuple[int, int]] = [
 _BUCKET_RATIOS: list[float] = [w / h for w, h in ASPECT_RATIO_BUCKETS]
 
 DEFAULT_TRAIN_RESOLUTION = 512
-MIN_BINARY_NEG_POS_RATIO = 2.0
+MIN_BINARY_NEG_POS_RATIO = 3.0
 
 
 def effective_binary_neg_pos_ratio(value: float | None) -> float:
-    """Return the implied-negative ratio, enforcing the binary 2:1 floor."""
+    """Return the implied-negative ratio, enforcing the binary 3:1 floor."""
     return max(MIN_BINARY_NEG_POS_RATIO, float(value or MIN_BINARY_NEG_POS_RATIO))
 
 

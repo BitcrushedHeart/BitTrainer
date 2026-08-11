@@ -66,6 +66,33 @@ class EmbeddingCacheMismatch(RuntimeError):
     """A cached embedding disagrees with a fresh backbone forward (fail loud)."""
 
 
+def cached_hashes_for_sig(
+    cache_dir: str | Path, preproc_sig: str = "val_imagenet"
+) -> frozenset[str]:
+    """Content hashes holding a pooled vector under any era of *preproc_sig*.
+
+    Era directories are named ``{backbone_hash16}{_sig_suffix(preproc_sig)}``.
+    Scanning every era of the requested sig — rather than one known backbone
+    hash — lets callers that run before the model is built (negative-pool
+    seeding) treat "some era of this preprocessing already embedded this image"
+    as a hit. Engine shares one cache root across concepts with ``prune=False``,
+    so several eras coexist deliberately; a hit in a superseded era still
+    signals an image the pipeline has fully feature-passed before.
+    """
+    root = Path(cache_dir)
+    if not root.is_dir():
+        return frozenset()
+    suffix = _sig_suffix(preproc_sig)
+    hashes: set[str] = set()
+    for era in root.iterdir():
+        if not era.is_dir() or not _ERA_DIR_RE.match(era.name):
+            continue
+        if era.name[16:] != suffix:
+            continue
+        hashes.update(vector.stem for vector in era.glob("*.npy"))
+    return frozenset(hashes)
+
+
 def _content_hash(path: str, smart_cache: Any | None) -> str | None:
     if smart_cache is not None:
         h = smart_cache.content_hash(path)

@@ -86,10 +86,10 @@ def test_implied_negative_floor_is_additive_to_every_explicit_negative(
 
     sampled_paths = [Path(sample["path"]) for sample in dataset.samples]
     implied_count = sum(path in implied for path in sampled_paths)
-    assert implied_count == 4  # 2 positives x the enforced 2:1 implied ratio
+    assert implied_count == 6  # 2 positives x the enforced 3:1 implied ratio
     for path in explicit:
         assert sampled_paths.count(path) == 3
-    assert len(dataset.samples) == 2 + 4 + 2 * 3
+    assert len(dataset.samples) == 2 + 6 + 2 * 3
 
 
 def test_binary_task_routes_each_explicit_split_to_its_dataset(tmp_path: Path) -> None:
@@ -119,8 +119,8 @@ def test_binary_task_routes_each_explicit_split_to_its_dataset(tmp_path: Path) -
     assert task.train_ds._all_negative_paths == [train_negative]
     assert task.val_ds._positive_paths == [val_positive]
     assert task.val_ds._all_negative_paths == [val_negative]
-    assert task.train_ds._neg_pos_ratio == 2.0
-    assert task.val_ds._neg_pos_ratio == 2.0
+    assert task.train_ds._neg_pos_ratio == 3.0
+    assert task.val_ds._neg_pos_ratio == 3.0
 
 
 def test_validation_rebalance_preserves_train_implied_floor(tmp_path: Path) -> None:
@@ -157,7 +157,9 @@ def test_validation_rebalance_preserves_train_implied_floor(tmp_path: Path) -> N
 
     _rebalance_val_negatives(train, val)
 
-    assert len(train._all_negative_paths) == 4
-    assert len(val._all_negative_paths) == 6
+    # Val wants ceil(3 x 3.0) = 9 but the train pool may only donate down to its
+    # own implied floor of ceil(2 x 3.0) = 6, so exactly 2 negatives move over.
+    assert len(train._all_negative_paths) == 6
+    assert len(val._all_negative_paths) == 4
     assert set(train._all_negative_paths).isdisjoint(val._all_negative_paths)
     assert all(sample["split"] == "val" for sample in val.samples)

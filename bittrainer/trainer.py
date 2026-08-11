@@ -38,9 +38,9 @@ class TrainConfig:
     concept_folder: str
     max_epochs: int = 50
     patience: int = 3
-    # Implied negatives per positive. Binary datasets enforce a 2:1 floor;
+    # Implied negatives per positive. Binary datasets enforce a 3:1 floor;
     # explicit/hard negatives are additive and keep their repetition weight.
-    neg_pos_ratio: float = 2.0
+    neg_pos_ratio: float = 3.0
     # Per-concept training resolution: scales the aspect-bucket table
     # (512 = the canonical ~512px buckets; see bittrainer.dataset.scaled_buckets).
     # SmartCache keys embed bucket dims, so a change simply builds fresh entries.
@@ -289,7 +289,7 @@ def _tuned_val_metrics(val_result: dict) -> tuple[dict, float]:
 def _rebalance_val_negatives(train_ds: ConceptDataset, val_ds: ConceptDataset) -> None:
     """Ensure the val set has enough negatives for meaningful evaluation.
 
-    Target: the validation dataset's implied-negative ratio (minimum 2:1).
+    Target: the validation dataset's implied-negative ratio (minimum 3:1).
     Donation never takes the training pool below its own implied-negative quota.
     """
     val_pos = len(val_ds._positive_paths)
