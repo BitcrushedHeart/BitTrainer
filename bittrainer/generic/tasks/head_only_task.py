@@ -156,7 +156,7 @@ class HeadOnlyTask(TrainingTask):
             "status_text": f"Caching backbone features (era {self.backbone_hash})"})
         self.stats = embed_cache.ensure(
             all_samples, model, self.smart_cache, device=device, dtype=dtype,
-            batch_size=config.batch_size or 64, progress_cb=_build_progress,
+            batch_size=config.embedding_batch_size, progress_cb=_build_progress,
             stop_check=lambda: self._stop(ctx),
         )
         logger.info("EmbeddingCache: %s", self.stats)

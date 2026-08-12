@@ -144,6 +144,93 @@ def test_invalid_single_image_forward_leaves_era_incomplete(monkeypatch, tmp_pat
     assert list(cache.root.glob("*.npy")) == []
 
 
+def test_cuda_oom_backoff_halves_batch_and_remembers_cap(monkeypatch, tmp_path):
+    """A CUDA OOM during the embedding forward halves the sub-batch instead of
+    killing the run, and the reduced cap sticks for every later batch (the
+    forward is activation-bound, so the same size would just OOM again)."""
+    samples = _samples(tmp_path, n=8)
+    cache = EmbeddingCache(tmp_path / "embed", "0123456789abcdef", 4)
+    sizes: list[int] = []
+
+    def _forward(batch, _backbone, _device, _dtype):
+        sizes.append(len(batch))
+        if len(batch) > 2:
+            raise torch.cuda.OutOfMemoryError("CUDA out of memory (simulated)")
+        return np.ones((len(batch), 4), dtype=np.float32)
+
+    monkeypatch.setattr(cache, "_forward_pooled", _forward)
+
+    stats = cache.ensure(
+        samples, torch.nn.Identity(), None, device=_DEV, dtype=_DT, batch_size=4
+    )
+
+    assert stats == {"built": 8, "reused": 0, "total": 8}
+    # First batch probes 4 and OOMs; the cap of 2 then holds for the whole run.
+    assert sizes == [4, 2, 2, 2, 2]
+    for sample in samples:
+        assert cache.get_vector(sample["path"], None) is not None
+
+
+def test_save_failure_surfaces_and_leaves_era_incomplete(monkeypatch, tmp_path):
+    """A vector write failure must fail the build (never mark the era complete
+    over missing vectors), even though writes drain through a background
+    writer."""
+    samples = _samples(tmp_path, n=2)
+    cache = EmbeddingCache(tmp_path / "embed", "0123456789abcdef", 4)
+    monkeypatch.setattr(
+        cache,
+        "_forward_pooled",
+        lambda batch, _backbone, _device, _dtype: np.ones(
+            (len(batch), 4), dtype=np.float32
+        ),
+    )
+
+    def _boom(_content_hash, _vector):
+        raise OSError("disk full (simulated)")
+
+    monkeypatch.setattr(cache, "_save_vector", _boom)
+
+    with pytest.raises(OSError, match="disk full"):
+        cache.ensure(
+            samples, torch.nn.Identity(), None, device=_DEV, dtype=_DT, batch_size=2
+        )
+
+    assert json.loads(cache._meta_path.read_text())["complete"] is False
+
+
+def test_stop_mid_build_returns_partial_with_flushed_writes(monkeypatch, tmp_path):
+    """Stopping between batches returns partial stats, leaves the era
+    incomplete, and every vector reported as built is actually on disk."""
+    samples = _samples(tmp_path, n=8)
+    cache = EmbeddingCache(tmp_path / "embed", "0123456789abcdef", 4)
+    monkeypatch.setattr(
+        cache,
+        "_forward_pooled",
+        lambda batch, _backbone, _device, _dtype: np.ones(
+            (len(batch), 4), dtype=np.float32
+        ),
+    )
+    state = {"stop": False}
+
+    def _progress(_done: int, _total: int) -> None:
+        state["stop"] = True  # request stop after the first completed batch
+
+    stats = cache.ensure(
+        samples,
+        torch.nn.Identity(),
+        None,
+        device=_DEV,
+        dtype=_DT,
+        batch_size=2,
+        progress_cb=_progress,
+        stop_check=lambda: state["stop"],
+    )
+
+    assert stats["built"] == 2 and stats["total"] == 8
+    assert json.loads(cache._meta_path.read_text())["complete"] is False
+    assert len(list(cache.root.glob("*.npy"))) == 2
+
+
 def test_verify_raises_on_corrupt_vector(tmp_path):
     samples = _samples(tmp_path)
     model = create_model(model_size="nano", pretrained=False, num_classes=3).eval()

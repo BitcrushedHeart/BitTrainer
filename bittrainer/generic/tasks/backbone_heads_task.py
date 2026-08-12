@@ -169,7 +169,7 @@ class BackboneHeadsTask(BackboneTask):
             None,
             device=ctx.device,
             dtype=self.amp_dtype,
-            batch_size=64,
+            batch_size=256,
             progress_cb=_progress,
             stop_check=lambda: (
                 self.cancel_event is not None and self.cancel_event.is_set()

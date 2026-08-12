@@ -355,6 +355,9 @@ class GroupTrainConfig:
     head_patience: int = 5
     head_weight_decay: float = 0.02
     embedding_cache_dir: str | None = None
+    # Batch size for the pooled-feature cache build only (no-grad eval forward,
+    # so much larger than the training batch; EmbeddingCache backs off on OOM).
+    embedding_batch_size: int = 256
     auto_label_softness: bool = True
     selected_softness_kind: str | None = None
     selected_softness_value: float | None = None
@@ -1431,7 +1434,7 @@ def _warmup_head_probe(
         smart_cache,
         device=device,
         dtype=dtype,
-        batch_size=config.batch_size or 64,
+        batch_size=config.embedding_batch_size,
         progress_cb=_build_progress,
         stop_check=_stop,
     )

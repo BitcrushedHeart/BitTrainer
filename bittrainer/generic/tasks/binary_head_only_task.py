@@ -385,8 +385,10 @@ class BinaryHeadOnlyTask(BinaryTask):
         # ordinary binary training; the backbone is not repeated per head epoch.
         val_loader = DataLoader(
             self.val_ds,
+            # Capped at 64: this full-image backbone pass has no OOM backoff
+            # (unlike EmbeddingCache.ensure, where the larger default is safe).
             batch_sampler=build_bucket_batch_sampler(
-                self.val_ds, batch_size=config.embedding_batch_size
+                self.val_ds, batch_size=min(config.embedding_batch_size, 64)
             ),
             collate_fn=bt._collate_bucket_batch,
             num_workers=0,

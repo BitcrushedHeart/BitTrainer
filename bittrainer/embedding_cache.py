@@ -18,6 +18,7 @@ computed by :func:`bittrainer.model.pooled_features` with the backbone in
 
 from __future__ import annotations
 
+import concurrent.futures
 import hashlib
 import json
 import logging
@@ -26,7 +27,7 @@ import random
 import re
 import shutil
 import uuid
-from collections import defaultdict
+from collections import defaultdict, deque
 from pathlib import Path
 from typing import Any, Callable
 
@@ -125,6 +126,10 @@ class EmbeddingCache:
         # ensure() -> verify() -> probe gather all hash the same corpus; memoise
         # so only the first pass pays the per-path index lookups.
         self._hash_memo: dict[str, str | None] = {}
+        # Sticky CUDA-OOM cap for the embedding forward: once a batch size
+        # OOMs, every later batch runs at the reduced size (see
+        # _forward_pooled_capped).
+        self._forward_cap: int | None = None
 
     def _hash(self, path: str, smart_cache: Any | None) -> str | None:
         if path in self._hash_memo:
@@ -191,7 +196,15 @@ class EmbeddingCache:
         return vector if self._valid_vector(vector) else None
 
     def _save_vector(self, content_hash: str, vector: np.ndarray) -> None:
-        """Crash-durably save one vector via fsynced temp + atomic replace."""
+        """Save one vector via temp file + atomic replace (no per-vector fsync).
+
+        Durability comes from the era marker, not from flushing each vector:
+        ``ensure`` fsyncs ``complete=False`` before any vector write, and every
+        reader (ensure's audit, get_vector, verify) validates shape/finiteness/
+        norm on load — so a torn write after power loss is detected and rebuilt
+        rather than trusted. Dropping the per-vector fsync removes the dominant
+        write cost on NTFS (one fsync per image).
+        """
         final_path = self._vec_path(content_hash)
         tmp_path = final_path.with_name(
             f".{final_path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
@@ -199,8 +212,6 @@ class EmbeddingCache:
         try:
             with tmp_path.open("wb") as handle:
                 np.save(handle, vector, allow_pickle=False)
-                handle.flush()
-                os.fsync(handle.fileno())
             os.replace(tmp_path, final_path)
         finally:
             try:
@@ -280,7 +291,14 @@ class EmbeddingCache:
         device: torch.device,
         dtype: torch.dtype,
     ) -> np.ndarray:
-        batch = batch.to(device)
+        if device.type == "cuda":
+            # Pinned staging lets the H2D copy overlap the previous batch's
+            # compute instead of serialising behind it.
+            if not batch.is_pinned():
+                batch = batch.pin_memory()
+            batch = batch.to(device, non_blocking=True)
+        else:
+            batch = batch.to(device)
         batch = apply_val_transform(batch, dtype=dtype)
         with (
             torch.no_grad(),
@@ -291,6 +309,47 @@ class EmbeddingCache:
             vecs = pooled_features(backbone, batch)
         return vecs.float().cpu().numpy()
 
+    def _forward_pooled_capped(
+        self,
+        tensors: list[torch.Tensor],
+        backbone: nn.Module,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> np.ndarray:
+        """Pooled forward for a same-bucket batch under a CUDA-OOM backoff.
+
+        The no-grad eval forward is activation-bound, so a size that OOMs once
+        will OOM every time: on OOM the sub-batch halves and the reduced cap
+        sticks for the rest of the run (``self._forward_cap``). Callers can
+        therefore request an optimistic batch size without risking the run.
+        """
+        while True:
+            sub = min(len(tensors), self._forward_cap or len(tensors))
+            try:
+                chunks = [
+                    self._forward_pooled(
+                        torch.stack(tensors[start : start + sub]), backbone, device, dtype
+                    )
+                    for start in range(0, len(tensors), sub)
+                ]
+                return chunks[0] if len(chunks) == 1 else np.concatenate(chunks, axis=0)
+            except torch.cuda.OutOfMemoryError:
+                if sub <= 1:
+                    raise
+                self._forward_cap = max(1, sub // 2)
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                logger.warning(
+                    "EmbeddingCache: CUDA OOM at embedding batch %d; retrying at %d "
+                    "(cap holds for the rest of this run)",
+                    sub,
+                    self._forward_cap,
+                )
+
+    def _save_many(self, pairs: list[tuple[str, np.ndarray]]) -> None:
+        for content_hash, vector in pairs:
+            self._save_vector(content_hash, vector)
+
     def ensure(
         self,
         samples: list[dict],
@@ -299,12 +358,20 @@ class EmbeddingCache:
         *,
         device: torch.device,
         dtype: torch.dtype,
-        batch_size: int = 64,
+        batch_size: int = 256,
+        io_workers: int = 8,
+        prefetch_batches: int = 2,
         progress_cb: Callable[[int, int], None] | None = None,
         stop_check: Callable[[], bool] | None = None,
         prune: bool = True,
     ) -> dict:
         """Build any missing pooled vectors for *samples* under this backbone era.
+
+        The build is pipelined so the GPU never waits on disk: ``io_workers``
+        threads keep ``prefetch_batches`` batches of input tensors loading
+        ahead of the forward, and vector writes drain through a background
+        writer behind it. ``batch_size`` can be optimistic — the forward is
+        no-grad eval and backs off (halving, sticky) on CUDA OOM.
 
         ``prune=False`` skips the sibling-era reclaim — REQUIRED when several
         eras must coexist deliberately (the resolution probe builds one small
@@ -370,32 +437,59 @@ class EmbeddingCache:
         by_bucket: dict[tuple, list] = defaultdict(list)
         for h, s in missing:
             by_bucket[tuple(s["bucket"])].append((h, s))
-
-        built = 0
+        batches: list[list[tuple[str, dict]]] = []
         for items in by_bucket.values():
             for start in range(0, len(items), batch_size):
+                batches.append(items[start : start + batch_size])
+
+        built = 0
+        save_futures: list[concurrent.futures.Future] = []
+        batch_iter = iter(batches)
+        with (
+            concurrent.futures.ThreadPoolExecutor(max_workers=io_workers) as loader,
+            concurrent.futures.ThreadPoolExecutor(max_workers=1) as saver,
+        ):
+            # Sliding window of batches whose per-image loads are in flight.
+            window: deque[list[tuple[str, str, concurrent.futures.Future]]] = deque()
+
+            def _admit() -> None:
+                chunk = next(batch_iter, None)
+                if chunk is None:
+                    return
+                window.append(
+                    [
+                        (h, s["path"], loader.submit(self._load_input_tensor, s, smart_cache))
+                        for h, s in chunk
+                    ]
+                )
+
+            for _ in range(prefetch_batches):
+                _admit()
+            while window:
                 if stop_check is not None and stop_check():
-                    return {"built": built, "reused": reused, "total": total}
-                chunk = items[start : start + batch_size]
+                    for inflight in window:
+                        for _h, _p, fut in inflight:
+                            fut.cancel()
+                    break
+                inflight = window.popleft()
+                _admit()
                 tensors, hashes, sample_paths = [], [], []
-                for h, s in chunk:
-                    t = self._load_input_tensor(s, smart_cache)
+                for h, path, fut in inflight:
+                    t = fut.result()
                     if t is None:
                         logger.warning(
-                            "EmbeddingCache: could not load input for %s", s["path"]
+                            "EmbeddingCache: could not load input for %s", path
                         )
                         continue
                     tensors.append(t)
                     hashes.append(h)
-                    sample_paths.append(s["path"])
+                    sample_paths.append(path)
                 if not tensors:
                     continue
                 # Store at float32: a lossless capture of the pooled vector the
                 # backbone produced (under autocast), so the probe trains on the
                 # exact features without an extra fp16 quantisation step.
-                vecs = self._forward_pooled(
-                    torch.stack(tensors), backbone, device, dtype
-                )
+                vecs = self._forward_pooled_capped(tensors, backbone, device, dtype)
                 safe_vecs: list[np.ndarray] = []
                 for index, tensor in enumerate(tensors):
                     vector = vecs[index] if index < len(vecs) else None
@@ -416,11 +510,17 @@ class EmbeddingCache:
                             )
                         vector = retry
                     safe_vecs.append(np.ascontiguousarray(vector, dtype=np.float32))
-                for content_hash, vector in zip(hashes, safe_vecs):
-                    self._save_vector(content_hash, vector)
+                save_futures.append(
+                    saver.submit(self._save_many, list(zip(hashes, safe_vecs)))
+                )
                 built += len(hashes)
                 if progress_cb is not None:
                     progress_cb(built, len(missing))
+        # Exiting the pools joined every in-flight load and write. Surface the
+        # first write failure BEFORE the completeness check — the era must
+        # never be marked complete over vectors that never reached disk.
+        for fut in save_futures:
+            fut.result()
 
         if built == len(missing):
             self._write_meta(complete=True)

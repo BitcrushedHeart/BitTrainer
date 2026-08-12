@@ -80,7 +80,8 @@ class TrainConfig:
     # Pooled-feature cache used by genuine head-only training. None keeps the
     # cache beside the concept; Engine supplies a shared content-addressed root.
     embedding_cache_dir: str | None = None
-    embedding_batch_size: int = 64
+    # Cache-build forward only (no-grad eval; EmbeddingCache backs off on OOM).
+    embedding_batch_size: int = 256
     head_weight_decay: float = 0.02
     sourceless: bool = False
     concept_name: str = ""
