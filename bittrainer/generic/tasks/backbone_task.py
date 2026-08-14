@@ -748,6 +748,12 @@ class BackboneTask(TrainingTask):
             "content_hash_index_id": self.request.get("content_hash_index_id"),
             "license_provenance": self.request.get("license_provenance")
             or "locally_trained",
+            "initialization_source": self.request.get("initialization_source")
+            or (self.request.get("backbone_init") or {}).get("source"),
+            "pretrained_model_id": self.request.get("pretrained_model_id"),
+            "pretrained_license": self.request.get("pretrained_license"),
+            "pretrained_source_url": self.request.get("pretrained_source_url"),
+            "non_commercial_only": bool(self.request.get("non_commercial_only")),
             "external_pretrained_used": bool(
                 self.request.get("external_pretrained_used")
             ),

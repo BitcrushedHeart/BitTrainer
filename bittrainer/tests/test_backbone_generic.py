@@ -135,6 +135,42 @@ def test_candidate_has_bare_backbone_and_heads(tmp_path):
     assert gw.shape[0] == len(groups["shot_type"])
 
 
+def test_candidate_metadata_carries_pretrained_provenance(tmp_path):
+    """Approved external weights remain attributable through every export."""
+    import bittrainer.backbone_trainer as bb
+    from bittrainer.generic.tasks.backbone_task import BackboneTask
+
+    request = _request(tmp_path)
+    request.update(
+        {
+            "initialization_source": "timm_pretrained",
+            "license_provenance": "timm/convnextv2_atto.fcmae_ft_in1k",
+            "pretrained_model_id": "timm/convnextv2_atto.fcmae_ft_in1k",
+            "pretrained_license": "CC-BY-NC-4.0",
+            "pretrained_source_url": (
+                "https://huggingface.co/timm/convnextv2_atto.fcmae_ft_in1k"
+            ),
+            "non_commercial_only": True,
+            "external_pretrained_used": True,
+            "temporary_timm_fallback_used": False,
+            "release_blocking": False,
+        }
+    )
+
+    task = BackboneTask(request)
+    task.vocab = bb._Vocab(request["records"])
+    metadata = task._candidate_metadata(0.75, {"selection": 0.75})
+
+    assert metadata["initialization_source"] == "timm_pretrained"
+    assert metadata["pretrained_model_id"] == request["pretrained_model_id"]
+    assert metadata["pretrained_license"] == "CC-BY-NC-4.0"
+    assert metadata["pretrained_source_url"] == request["pretrained_source_url"]
+    assert metadata["non_commercial_only"] is True
+    assert metadata["external_pretrained_used"] is True
+    assert metadata["temporary_timm_fallback_used"] is False
+    assert metadata["release_blocking"] is False
+
+
 def test_apply_backbone_init_loads_new_format(tmp_path):
     """apply_backbone_init loads the NEW mixed-key candidate into a fresh atto."""
     from bittrainer.backbone_init import apply_backbone_init

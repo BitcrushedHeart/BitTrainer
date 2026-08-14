@@ -5,6 +5,7 @@ come from and passes the decision down as a plain dict (``backbone_init``):
 
     {
         "source": "local_active" | "local_candidate"
+                  | "timm_pretrained"
                   | "temporary_timm_pretrained_fallback" | "random_init",
         "checkpoint_path": str | None,   # safetensors backbone state dict
         "size_alias": str, "convnextv2_size": str, ...  # informational
@@ -14,7 +15,8 @@ Routing:
   * local_* + checkpoint_path  -> create the model with ``pretrained=False``
     and load the checkpoint into it (``apply_backbone_init``).
   * random_init                -> ``pretrained=False``, no load.
-  * fallback / missing / None  -> legacy behaviour (timm pretrained weights).
+  * timm_pretrained            -> exact size-matched catalog weights.
+  * temporary fallback / missing / None -> legacy timm-pretrained behaviour.
 
 Warm-starting from an existing ``best.pt`` always takes precedence in the
 trainers — ``backbone_init`` only governs the fresh-model path.

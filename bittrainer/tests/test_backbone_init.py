@@ -66,6 +66,7 @@ def test_backbone_init_defaults_to_none():
     [
         (None, True),  # legacy behaviour: no spec -> timm pretrained
         ({}, True),
+        ({"source": "timm_pretrained", "checkpoint_path": None}, True),
         ({"source": "temporary_timm_pretrained_fallback", "checkpoint_path": None}, True),
         ({"source": "local_active", "checkpoint_path": "x.safetensors"}, False),
         ({"source": "local_candidate", "checkpoint_path": "x.safetensors"}, False),
@@ -125,6 +126,7 @@ def test_apply_backbone_init_noop_for_non_local_sources(tmp_path):
     before = {k: v.clone() for k, v in target.state_dict().items()}
     assert apply_backbone_init(target, None) is False
     assert apply_backbone_init(target, {"source": "random_init"}) is False
+    assert apply_backbone_init(target, {"source": "timm_pretrained"}) is False
     assert (
         apply_backbone_init(
             target, {"source": "temporary_timm_pretrained_fallback", "checkpoint_path": None}

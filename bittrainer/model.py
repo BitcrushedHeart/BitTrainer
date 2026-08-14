@@ -6,16 +6,10 @@ import torch
 import torch.nn as nn
 import timm
 
+from bittrainer.convnextv2_catalog import CONVNEXTV2_PRETRAINED_SOURCES
 
 _MODEL_REGISTRY = {
-    "atto": "convnextv2_atto.fcmae_ft_in1k",
-    "femto": "convnextv2_femto.fcmae_ft_in1k",
-    "pico": "convnextv2_pico.fcmae_ft_in1k",
-    "nano": "convnextv2_nano.fcmae_ft_in22k_in1k",
-    "tiny": "convnextv2_tiny.fcmae_ft_in22k_in1k",
-    "base": "convnextv2_base.fcmae_ft_in22k_in1k",
-    "large": "convnextv2_large.fcmae_ft_in22k_in1k",
-    "huge": "convnextv2_huge.fcmae_ft_in22k_in1k",
+    size: source.model_name for size, source in CONVNEXTV2_PRETRAINED_SOURCES.items()
 }
 
 _STEM_DIM_TO_SIZE: dict[int, str] = {
