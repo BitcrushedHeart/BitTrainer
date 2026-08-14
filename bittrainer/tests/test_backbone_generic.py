@@ -171,6 +171,23 @@ def test_candidate_metadata_carries_pretrained_provenance(tmp_path):
     assert metadata["release_blocking"] is False
 
 
+def test_candidate_metadata_omits_missing_pretrained_details(tmp_path):
+    """Random/local-only runs must not export the string ``"null"`` as provenance."""
+    import bittrainer.backbone_trainer as bb
+    from bittrainer.generic.tasks.backbone_task import BackboneTask
+
+    request = _request(tmp_path)
+    task = BackboneTask(request)
+    task.vocab = bb._Vocab(request["records"])
+
+    metadata = task._candidate_metadata(0.5, {"selection": 0.5})
+
+    assert metadata["initialization_source"] == "random_init"
+    assert "pretrained_model_id" not in metadata
+    assert "pretrained_license" not in metadata
+    assert "pretrained_source_url" not in metadata
+
+
 def test_apply_backbone_init_loads_new_format(tmp_path):
     """apply_backbone_init loads the NEW mixed-key candidate into a fresh atto."""
     from bittrainer.backbone_init import apply_backbone_init

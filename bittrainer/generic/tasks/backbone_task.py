@@ -750,9 +750,6 @@ class BackboneTask(TrainingTask):
             or "locally_trained",
             "initialization_source": self.request.get("initialization_source")
             or (self.request.get("backbone_init") or {}).get("source"),
-            "pretrained_model_id": self.request.get("pretrained_model_id"),
-            "pretrained_license": self.request.get("pretrained_license"),
-            "pretrained_source_url": self.request.get("pretrained_source_url"),
             "non_commercial_only": bool(self.request.get("non_commercial_only")),
             "external_pretrained_used": bool(
                 self.request.get("external_pretrained_used")
@@ -772,6 +769,14 @@ class BackboneTask(TrainingTask):
             "heads_concepts_json": list(self.vocab.concepts),
             "heads_groups_json": {g: list(cs) for g, cs in self.vocab.groups.items()},
         }
+        for key in (
+            "pretrained_model_id",
+            "pretrained_license",
+            "pretrained_source_url",
+        ):
+            value = self.request.get(key)
+            if value is not None:
+                metadata[key] = value
         # Per-head calibration fitted on the WINNING epoch's val logits (A2). Keys
         # are absent (additive) unless enabled and val scores were captured, so a
         # consumer decoding ``sigmoid(logit / T) >= threshold`` keeps working with
