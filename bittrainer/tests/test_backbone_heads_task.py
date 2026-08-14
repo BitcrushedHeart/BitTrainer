@@ -20,7 +20,10 @@ import torch
 from safetensors import safe_open
 from safetensors.torch import load_file
 
-from bittrainer.backbone_trainer import run_backbone_head_training, run_backbone_training
+from bittrainer.backbone_trainer import (
+    run_backbone_head_training,
+    run_backbone_training,
+)
 from bittrainer.tests.test_backbone_generic import _request
 
 
@@ -37,13 +40,42 @@ def _heads_request(tmp_path, source_path, *, epochs=1, max_steps=8, n=8):
     request["candidate_checkpoint_path"] = str(
         tmp_path / "candidates" / "candidate_heads.safetensors"
     )
-    request["backbone_init"] = {"source": "local_active", "checkpoint_path": str(source_path)}
+    request["backbone_init"] = {
+        "source": "local_active",
+        "checkpoint_path": str(source_path),
+    }
+    request["training_config"]["embedding_cache_dir"] = str(tmp_path / "embed")
+    return request
+
+
+def _timm_heads_request(tmp_path, *, epochs=1, max_steps=8, n=8):
+    request = _request(tmp_path, epochs=epochs, max_steps=max_steps, n=n)
+    request["run_id"] = "run_heads_timm_test"
+    request["candidate_checkpoint_path"] = str(
+        tmp_path / "candidates" / "candidate_heads_timm.safetensors"
+    )
+    request["backbone_init"] = {
+        "source": "timm_pretrained",
+        "checkpoint_path": None,
+        "model_id": "timm/convnextv2_atto.fcmae_ft_in1k",
+    }
+    request["initialization_source"] = "timm_pretrained"
+    request["license_provenance"] = "timm/convnextv2_atto.fcmae_ft_in1k"
+    request["pretrained_model_id"] = "timm/convnextv2_atto.fcmae_ft_in1k"
+    request["pretrained_license"] = "CC-BY-NC-4.0"
+    request["pretrained_source_url"] = (
+        "https://huggingface.co/timm/convnextv2_atto.fcmae_ft_in1k"
+    )
+    request["non_commercial_only"] = True
+    request["external_pretrained_used"] = True
     request["training_config"]["embedding_cache_dir"] = str(tmp_path / "embed")
     return request
 
 
 def _run_heads(request, progress_callback=None):
-    return asyncio.run(run_backbone_head_training(request, progress_callback=progress_callback))
+    return asyncio.run(
+        run_backbone_head_training(request, progress_callback=progress_callback)
+    )
 
 
 def test_head_only_trains_from_cache_and_exports_convention(tmp_path):
@@ -61,7 +93,9 @@ def test_head_only_trains_from_cache_and_exports_convention(tmp_path):
         assert torch.equal(saved[key], source_state[key]), key
     # Heads are freshly trained, not copies of the source's.
     assert any(
-        not torch.equal(saved[k], source_state[k]) for k in head_keys if k in source_state
+        not torch.equal(saved[k], source_state[k])
+        for k in head_keys
+        if k in source_state
     ) or any(k not in source_state for k in head_keys)
 
     with safe_open(result["candidate_checkpoint_path"], framework="pt") as f:
@@ -76,8 +110,57 @@ def test_head_only_trains_from_cache_and_exports_convention(tmp_path):
 
     fresh = create_model(model_size="atto", pretrained=False, num_classes=0)
     assert apply_backbone_init(
-        fresh, {"source": "local_active", "checkpoint_path": result["candidate_checkpoint_path"]}
+        fresh,
+        {
+            "source": "local_active",
+            "checkpoint_path": result["candidate_checkpoint_path"],
+        },
     )
+
+
+def test_head_only_accepts_timm_pretrained_and_exports_frozen_trunk(
+    tmp_path, monkeypatch
+):
+    import bittrainer.generic.tasks.backbone_heads_task as task_module
+
+    real_create_model = task_module.create_model
+    created: dict[str, object] = {}
+
+    def _offline_pretrained_model(*, model_size, pretrained, num_classes):
+        # Exercise the routing contract without downloading weights in the unit suite.
+        created["pretrained"] = pretrained
+        model = real_create_model(
+            model_size=model_size,
+            pretrained=False,
+            num_classes=num_classes,
+        )
+        created["state"] = {
+            key: value.detach().cpu().clone()
+            for key, value in model.state_dict().items()
+        }
+        return model
+
+    monkeypatch.setattr(task_module, "create_model", _offline_pretrained_model)
+    request = _timm_heads_request(tmp_path)
+    result = _run_heads(request)
+
+    assert created["pretrained"] is True
+    saved = load_file(result["candidate_checkpoint_path"])
+    source_state = created["state"]
+    backbone_keys = [key for key in saved if not key.startswith("heads.")]
+    assert backbone_keys
+    for key in backbone_keys:
+        assert torch.equal(saved[key], source_state[key]), key
+
+    with safe_open(result["candidate_checkpoint_path"], framework="pt") as f:
+        metadata = f.metadata()
+    assert metadata["head_only_retrain"] == "1"
+    assert metadata["initialization_source"] == "timm_pretrained"
+    assert metadata["pretrained_model_id"] == "timm/convnextv2_atto.fcmae_ft_in1k"
+    assert metadata["pretrained_license"] == "CC-BY-NC-4.0"
+    assert metadata["external_pretrained_used"] == "true"
+    assert metadata["non_commercial_only"] == "true"
+    assert "source_backbone_checkpoint" not in metadata
 
 
 def test_backbone_frozen_during_head_training(tmp_path, monkeypatch):
@@ -139,5 +222,7 @@ def test_result_contract(tmp_path):
     assert isinstance(result["validation_score"], float)
     assert isinstance(result["validation_metrics"], dict)
     assert result["mode"] == "backbone_head_only"
-    assert isinstance(result["backbone_hash"], str) and len(result["backbone_hash"]) == 16
+    assert (
+        isinstance(result["backbone_hash"], str) and len(result["backbone_hash"]) == 16
+    )
     assert isinstance(result["epochs_completed"], int)

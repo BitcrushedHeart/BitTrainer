@@ -917,18 +917,18 @@ async def run_backbone_head_training(
     stop_event=None,
     stop_now_event=None,
 ) -> dict:
-    """Retrain the multi-task heads against a FROZEN existing backbone.
+    """Retrain the multi-task heads against a FROZEN backbone.
 
     Same request contract as :func:`run_backbone_training`, except
-    ``backbone_init.checkpoint_path`` is REQUIRED (the trunk to freeze) and
+    ``backbone_init`` must explicitly select either an active-local checkpoint
+    or the exact size-matched approved timm-pretrained model, and
     ``training_config`` may carry ``embedding_cache_dir`` (default: an
     ``.embedding_cache`` dir next to the candidate) and ``head_batch_size``
     (default 256). One embedding pass per backbone era is memoised in the
     :class:`~bittrainer.embedding_cache.EmbeddingCache`; head epochs then run
     over cached pooled vectors, so retraining every head after a labelling
-    round takes minutes. The exported candidate carries the source trunk
-    byte-for-byte plus fresh ``heads.*`` tensors (``head_only_retrain`` = "1"
-    in the metadata).
+    round takes minutes. The exported candidate carries the frozen trunk plus
+    fresh ``heads.*`` tensors (``head_only_retrain`` = "1" in the metadata).
     """
     return await _run_worker_async(
         _train_backbone_heads,

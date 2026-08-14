@@ -1,7 +1,7 @@
 """Backbone head-only retraining on cached pooled features.
 
 ``BackboneHeadsTask`` retrains the multi-task concept/group heads against a
-FROZEN existing backbone checkpoint: one embedding pass per backbone era
+FROZEN active-local or approved timm-pretrained backbone: one embedding pass per era
 (memoised in :class:`~bittrainer.embedding_cache.EmbeddingCache`, namespaced by
 backbone-feature hash x preprocessing signature), then head epochs over cached
 vectors — seconds per epoch instead of a full backbone forward per image. This
@@ -12,9 +12,9 @@ Subclasses :class:`BackboneTask` so the record/vocab assembly, the per-epoch
 sampling plan (neg:pos cap, tiny-head oversample, pos_weight, label policy —
 ISSUE-0545/0546) and the selection/early-stop shape are shared; only the
 model/build/loss plumbing swaps images for vectors. The exported candidate
-keeps the 0542 convention — BARE backbone keys (byte-copied from the source
-checkpoint) + fresh ``heads.*`` tensors — so ``apply_backbone_init`` and every
-existing consumer reads it unchanged.
+keeps the 0542 convention — BARE backbone keys (byte-copied from a local source
+or exported from the frozen timm trunk) + fresh ``heads.*`` tensors — so
+``apply_backbone_init`` and every existing consumer reads it unchanged.
 
 No backup/resume (runs are minutes; always fresh) and no EMA on the heads.
 """
@@ -93,10 +93,16 @@ class BackboneHeadsTask(BackboneTask):
         self._vectors: dict[str, object] = {}
         self._identity = nn.Identity()
         spec = request.get("backbone_init") or {}
-        if not spec.get("checkpoint_path"):
+        source = spec.get("source")
+        if source == "local_active" and not spec.get("checkpoint_path"):
             raise RuntimeError(
-                "Backbone head-only training requires backbone_init.checkpoint_path "
-                "(an existing backbone checkpoint to freeze)."
+                "Backbone head-only local_active training requires "
+                "backbone_init.checkpoint_path."
+            )
+        if source not in {"local_active", "timm_pretrained"}:
+            raise RuntimeError(
+                "Backbone head-only training requires backbone_init.source to be "
+                "'local_active' or 'timm_pretrained'."
             )
 
     # -- one-time setup ----------------------------------------------------
@@ -107,11 +113,14 @@ class BackboneHeadsTask(BackboneTask):
         ctx.resume_state = None
 
     def create_model(self, ctx: TaskContext, resume_state: dict | None):
-        spec = self.request.get("backbone_init")
+        spec = self.request.get("backbone_init") or {}
         backbone = create_model(
-            model_size=self.model_size, pretrained=False, num_classes=0
+            model_size=self.model_size,
+            pretrained=spec.get("source") == "timm_pretrained",
+            num_classes=0,
         )
-        if not apply_backbone_init(backbone, spec):
+        loaded_local = apply_backbone_init(backbone, spec)
+        if spec.get("source") == "local_active" and not loaded_local:
             raise RuntimeError(
                 f"Could not load the source backbone checkpoint {spec.get('checkpoint_path')!r}"
             )
@@ -300,16 +309,22 @@ class BackboneHeadsTask(BackboneTask):
 
         from safetensors.torch import load_file, save_file
 
-        # Trunk tensors are byte-copied from the source checkpoint (never
-        # retrained here); any heads.* the source carried are replaced.
-        source_path = str(
-            (self.request.get("backbone_init") or {}).get("checkpoint_path")
-        )
-        state = {
-            key: value
-            for key, value in load_file(source_path).items()
-            if not key.startswith("heads.")
-        }
+        # A local trunk is byte-copied from its source checkpoint. A timm trunk
+        # has no local source file, so export the frozen model state directly.
+        spec = self.request.get("backbone_init") or {}
+        source_path = spec.get("checkpoint_path")
+        if source_path:
+            source_path = str(source_path)
+            state = {
+                key: value
+                for key, value in load_file(source_path).items()
+                if not key.startswith("heads.")
+            }
+        else:
+            state = {
+                key: value.detach().to("cpu")
+                for key, value in self.model.backbone.state_dict().items()
+            }
         for key, value in (heads_state or {}).items():
             state[f"heads.{key}"] = value.detach().to("cpu")
 
@@ -317,7 +332,8 @@ class BackboneHeadsTask(BackboneTask):
         candidate_path.parent.mkdir(parents=True, exist_ok=True)
         metadata = self._candidate_metadata(validation_score, validation_metrics)
         metadata["head_only_retrain"] = "1"
-        metadata["source_backbone_checkpoint"] = source_path
+        if source_path:
+            metadata["source_backbone_checkpoint"] = source_path
         save_file(
             state,
             str(candidate_path),
