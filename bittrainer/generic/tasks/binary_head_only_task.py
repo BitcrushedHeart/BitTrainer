@@ -29,7 +29,11 @@ from bittrainer.model import (
     head_tail_logits,
     head_tail_parameters,
 )
-from bittrainer.training_state import BackupCoordinator
+from bittrainer.training_state import (
+    BackupCoordinator,
+    capture_rng_states,
+    restore_rng_states,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -78,6 +82,7 @@ def _sample_negative_pool(
     *,
     positive_count: int,
     neg_pos_ratio: float,
+    ratio_positive_count: int | None = None,
     reserve: int = 0,
     is_cached: Callable[[str], bool] | None = None,
 ) -> list[str]:
@@ -93,7 +98,12 @@ def _sample_negative_pool(
     shortfall, so retrains reuse the transferable embedding cache instead of
     paying backbone forwards for fresh random negatives.
     """
-    ratio = effective_binary_neg_pos_ratio(neg_pos_ratio)
+    ratio = effective_binary_neg_pos_ratio(
+        neg_pos_ratio,
+        positive_count=(
+            positive_count if ratio_positive_count is None else ratio_positive_count
+        ),
+    )
     quota = math.ceil(positive_count * ratio) + max(0, int(reserve))
     if len(paths) <= quota:
         return list(paths)
@@ -119,6 +129,8 @@ def _train_cached_binary_head(
     device: torch.device,
     cb,
     stop_event,
+    progress_stage: str = "training",
+    progress_prefix: str = "Head probe",
 ) -> dict:
     """Train only the classifier tail and select on tuned-threshold binary F1."""
     for parameter in model.parameters():
@@ -191,10 +203,9 @@ def _train_cached_binary_head(
         cb(
             {
                 "type": "training_progress",
-                "stage": "training",
+                "stage": progress_stage,
                 "status_text": (
-                    f"Head probe epoch {epoch + 1}/{config.max_epochs} "
-                    f"(val F1 {score:.3f})"
+                    f"{progress_prefix} epoch {epoch + 1}/{config.max_epochs} (val F1 {score:.3f})"
                 ),
                 "epoch": epoch + 1,
                 "max_epochs": config.max_epochs,
@@ -222,6 +233,217 @@ def _train_cached_binary_head(
         "best_val_f1": best_score,
         "best_metrics": best_metrics,
     }
+
+
+def _normalise_hard_negative_weight_candidates(config: bt.TrainConfig) -> list[int]:
+    candidates: list[int] = []
+    for raw in config.hard_negative_weight_candidates or []:
+        try:
+            weight = int(raw)
+        except (TypeError, ValueError):
+            continue
+        if weight >= 1 and weight not in candidates:
+            candidates.append(weight)
+    if not candidates:
+        candidates.append(max(1, int(config.hard_negative_weight)))
+    return candidates
+
+
+def _weighted_train_tensors(
+    x_base: torch.Tensor,
+    y_base: torch.Tensor,
+    x_explicit: torch.Tensor,
+    y_explicit: torch.Tensor,
+    weight: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if len(x_explicit) == 0:
+        return x_base, y_base
+    repeated_x = torch.cat([x_explicit] * weight, dim=0)
+    repeated_y = torch.cat([y_explicit] * weight, dim=0)
+    return torch.cat((x_base, repeated_x), dim=0), torch.cat(
+        (y_base, repeated_y), dim=0
+    )
+
+
+def _hard_negative_candidate_better(candidate: dict, incumbent: dict | None) -> bool:
+    if incumbent is None:
+        return True
+    candidate_f1 = float(candidate.get("f1") or 0.0)
+    incumbent_f1 = float(incumbent.get("f1") or 0.0)
+    if candidate_f1 != incumbent_f1:
+        return candidate_f1 > incumbent_f1
+    candidate_loss = candidate.get("val_loss")
+    incumbent_loss = incumbent.get("val_loss")
+    if (
+        candidate_loss is not None
+        and incumbent_loss is not None
+        and float(candidate_loss) != float(incumbent_loss)
+    ):
+        return float(candidate_loss) < float(incumbent_loss)
+    return int(candidate["weight"]) < int(incumbent["weight"])
+
+
+def _train_hard_negative_weight_sweep(
+    model: nn.Module,
+    x_base: torch.Tensor,
+    y_base: torch.Tensor,
+    x_explicit: torch.Tensor,
+    y_explicit: torch.Tensor,
+    x_val: torch.Tensor,
+    y_val: torch.Tensor,
+    config: bt.TrainConfig,
+    *,
+    device: torch.device,
+    cb,
+    stop_event,
+) -> dict:
+    """Select explicit-negative repetition strength by tuned-threshold val F1.
+
+    Every candidate starts from the same head and RNG state. Validation tensors
+    are never repeated, so increasing the training strength cannot inflate its
+    own selection metric by changing validation support.
+    """
+    candidates = _normalise_hard_negative_weight_candidates(config)
+    if len(x_explicit) == 0 or len(candidates) == 1:
+        weight = max(1, int(config.hard_negative_weight))
+        if len(x_explicit) > 0:
+            weight = candidates[0]
+            config.hard_negative_weight = weight
+        x_train, y_train = _weighted_train_tensors(
+            x_base, y_base, x_explicit, y_explicit, weight
+        )
+        return _train_cached_binary_head(
+            model,
+            x_train,
+            y_train,
+            x_val,
+            y_val,
+            config,
+            device=device,
+            cb=cb,
+            stop_event=stop_event,
+        )
+
+    original_head_state = copy.deepcopy(model.head.state_dict())
+    original_rng_state = capture_rng_states(device)
+    best_row: dict | None = None
+    best_probe: dict | None = None
+    best_head_state: dict | None = None
+    matrix: list[dict] = []
+    sweep_start = time.monotonic()
+
+    for index, weight in enumerate(candidates, start=1):
+        if stop_event is not None and getattr(stop_event, "is_set", lambda: False)():
+            break
+        model.head.load_state_dict(original_head_state)
+        restore_rng_states(original_rng_state, device)
+        x_train, y_train = _weighted_train_tensors(
+            x_base, y_base, x_explicit, y_explicit, weight
+        )
+        cb(
+            {
+                "type": "training_progress",
+                "stage": "explicit_negative_tuning",
+                "status_text": (
+                    f"Testing explicit-negative strength {weight} ({index}/{len(candidates)})"
+                ),
+                "step": index,
+                "total_steps": len(candidates),
+                "hard_negative_weight": weight,
+            }
+        )
+        candidate_start = time.monotonic()
+        probe = _train_cached_binary_head(
+            model,
+            x_train,
+            y_train,
+            x_val,
+            y_val,
+            config,
+            device=device,
+            cb=cb,
+            stop_event=stop_event,
+            progress_stage="explicit_negative_tuning",
+            progress_prefix=f"Explicit-negative strength {weight}",
+        )
+        if int(probe.get("epochs_completed") or 0) <= 0:
+            break
+        metrics = probe.get("best_metrics") or {}
+        row = {
+            "weight": weight,
+            "f1": float(probe.get("best_val_f1") or metrics.get("f1") or 0.0),
+            "precision": metrics.get("precision"),
+            "recall": metrics.get("recall"),
+            "auprc": metrics.get("auprc"),
+            "val_loss": metrics.get("val_loss"),
+            "best_epoch": probe.get("best_epoch"),
+            "epochs_completed": probe.get("epochs_completed"),
+            "elapsed_ms": int(round((time.monotonic() - candidate_start) * 1000)),
+        }
+        matrix.append(row)
+        cb(
+            {
+                "type": "training_progress",
+                "stage": "explicit_negative_tuning",
+                "status_text": (
+                    f"Tested explicit-negative strength {weight}: F1 {row['f1']:.3f}"
+                ),
+                "step": index,
+                "total_steps": len(candidates),
+                "hard_negative_weight": weight,
+                "val_f1": row["f1"],
+                "val_precision": row["precision"],
+                "val_recall": row["recall"],
+            }
+        )
+        if _hard_negative_candidate_better(row, best_row):
+            best_row = row
+            best_probe = probe
+            best_head_state = copy.deepcopy(model.head.state_dict())
+
+    if best_row is None or best_probe is None or best_head_state is None:
+        model.head.load_state_dict(original_head_state)
+        return {"best_epoch": 0, "epochs_completed": 0, "best_val_f1": -1.0}
+
+    model.head.load_state_dict(best_head_state)
+    selected = int(best_row["weight"])
+    config.hard_negative_weight = selected
+    config.selected_hard_negative_weight = selected
+    config.hard_negative_weight_tuning_results = matrix
+    config.hard_negative_weight_tuning_elapsed_ms = int(
+        round((time.monotonic() - sweep_start) * 1000)
+    )
+    cb(
+        {
+            "type": "training_progress",
+            "stage": "explicit_negative_tuning",
+            "status_text": (
+                f"Selected explicit-negative strength {selected} by validation F1"
+            ),
+            "step": len(matrix),
+            "total_steps": len(candidates),
+            "hard_negative_weight": selected,
+            "best_val_f1": best_row["f1"],
+        }
+    )
+    return best_probe
+
+
+def _partition_explicit_negative_samples(
+    samples: list[dict], hard_negative_paths: list[Path]
+) -> tuple[list[dict], list[dict]]:
+    explicit_paths = {str(path) for path in hard_negative_paths}
+    if not explicit_paths:
+        return samples, []
+    base: list[dict] = []
+    explicit_by_path: dict[str, dict] = {}
+    for sample in samples:
+        path = str(sample["path"])
+        if path in explicit_paths:
+            explicit_by_path.setdefault(path, sample)
+        else:
+            base.append(sample)
+    return base, list(explicit_by_path.values())
 
 
 class BinaryHeadOnlyTask(BinaryTask):
@@ -261,7 +483,16 @@ class BinaryHeadOnlyTask(BinaryTask):
         original_train = config.train_negative_paths
         original_val = config.val_negative_paths
         try:
-            ratio = effective_binary_neg_pos_ratio(config.neg_pos_ratio)
+            ratio_positive_count = (
+                len(config.train_positive_paths) + len(config.val_positive_paths)
+                if config.train_positive_paths is not None
+                and config.val_positive_paths is not None
+                else None
+            )
+            ratio = effective_binary_neg_pos_ratio(
+                config.neg_pos_ratio,
+                positive_count=ratio_positive_count,
+            )
             is_cached = _cached_negative_predicate(config)
             val_shortfall = 0
             if original_val is not None and config.val_positive_paths is not None:
@@ -272,6 +503,7 @@ class BinaryHeadOnlyTask(BinaryTask):
                     original_train,
                     positive_count=len(config.train_positive_paths),
                     neg_pos_ratio=ratio,
+                    ratio_positive_count=ratio_positive_count,
                     reserve=val_shortfall,
                     is_cached=is_cached,
                 )
@@ -280,6 +512,7 @@ class BinaryHeadOnlyTask(BinaryTask):
                     original_val,
                     positive_count=len(config.val_positive_paths),
                     neg_pos_ratio=ratio,
+                    ratio_positive_count=ratio_positive_count,
                     is_cached=is_cached,
                 )
             super().prepare_data(ctx)
@@ -345,12 +578,25 @@ class BinaryHeadOnlyTask(BinaryTask):
             dtype=ctx.dtype,
         )
         load_started = time.monotonic()
+        base_samples, explicit_samples = _partition_explicit_negative_samples(
+            self.train_ds.samples, self.train_ds._hard_negative_paths
+        )
         x_train, y_train = _gather(
-            self.train_ds.samples,
+            base_samples,
             embedding_cache,
             self.smart_cache,
             multi_label=False,
         )
+        if explicit_samples:
+            x_explicit, y_explicit = _gather(
+                explicit_samples,
+                embedding_cache,
+                self.smart_cache,
+                multi_label=False,
+            )
+        else:
+            x_explicit = x_train.new_empty((0, *x_train.shape[1:]))
+            y_explicit = y_train.new_empty((0,))
         x_val, y_val = _gather(
             self.val_ds.samples,
             embedding_cache,
@@ -362,14 +608,16 @@ class BinaryHeadOnlyTask(BinaryTask):
                 "type": "training_progress",
                 "stage": "training",
                 "status_text": "Training binary head on cached features",
-                "cached_features": len(x_train) + len(x_val),
+                "cached_features": len(x_train) + len(x_explicit) + len(x_val),
                 "feature_load_seconds": round(time.monotonic() - load_started, 3),
             }
         )
-        self.probe = _train_cached_binary_head(
+        self.probe = _train_hard_negative_weight_sweep(
             model,
             x_train,
             y_train,
+            x_explicit,
+            y_explicit,
             x_val,
             y_val,
             config,
@@ -408,6 +656,10 @@ class BinaryHeadOnlyTask(BinaryTask):
                 "num_classes": 2,
                 "model_size": config.model_size,
                 "training_mode": "head_only",
+                "selected_hard_negative_weight": config.selected_hard_negative_weight,
+                "hard_negative_weight_tuning_results": (
+                    config.hard_negative_weight_tuning_results
+                ),
             },
             self.candidate_path,
         )
@@ -458,4 +710,13 @@ class BinaryHeadOnlyTask(BinaryTask):
         result["mode"] = "head_only"
         result["backbone_hash"] = self.backbone_hash
         result["embedding_cache_stats"] = self.embedding_cache_stats
+        result["selected_hard_negative_weight"] = (
+            self.config.selected_hard_negative_weight
+        )
+        result["hard_negative_weight_tuning_results"] = (
+            self.config.hard_negative_weight_tuning_results
+        )
+        result["hard_negative_weight_tuning_elapsed_ms"] = (
+            self.config.hard_negative_weight_tuning_elapsed_ms
+        )
         return result

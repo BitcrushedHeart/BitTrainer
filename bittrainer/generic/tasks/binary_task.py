@@ -211,11 +211,18 @@ class BinaryTask(TrainingTask):
             cache_dir = concept_folder / ".resize_cache"
             cache_dir.mkdir(parents=True, exist_ok=True)
             dim_cache = _DimensionCache(cache_dir / "dimensions.json")
+            ratio_positive_count = (
+                len(config.train_positive_paths) + len(config.val_positive_paths)
+                if config.train_positive_paths is not None
+                and config.val_positive_paths is not None
+                else None
+            )
 
             train_ds = ConceptDataset(
                 concept_folder,
                 split="train",
                 neg_pos_ratio=config.neg_pos_ratio,
+                ratio_positive_count=ratio_positive_count,
                 extra_positive_dirs=config.extra_positive_dirs,
                 negative_dirs=config.negative_dirs,
                 positive_paths=config.train_positive_paths,
@@ -235,6 +242,7 @@ class BinaryTask(TrainingTask):
                 concept_folder,
                 split="val",
                 neg_pos_ratio=config.neg_pos_ratio,
+                ratio_positive_count=ratio_positive_count,
                 extra_positive_dirs=config.extra_positive_dirs,
                 negative_dirs=config.negative_dirs,
                 positive_paths=config.val_positive_paths,

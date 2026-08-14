@@ -76,8 +76,8 @@ def test_head_only_samples_negative_quota_before_dataset_dimension_scan() -> Non
         neg_pos_ratio=1.0,
     )
 
-    # The configured 1:1 is clamped to the binary minimum of 3:1. Explicit
-    # negatives are additive and therefore do not consume these 36 slots.
+    # Tiny concepts remain at the binary minimum of 3:1. Explicit negatives
+    # are additive and therefore do not consume these 36 slots.
     assert len(sampled) == 36
     assert set(sampled) <= set(pool)
 
@@ -86,7 +86,14 @@ def test_head_only_samples_negative_quota_before_dataset_dimension_scan() -> Non
         positive_count=12,
         neg_pos_ratio=4.0,
     )
-    assert len(stronger) == 48
+    assert len(stronger) == 36
+
+    mature = _sample_negative_pool(
+        [f"mature-negative-{index}.png" for index in range(1000)],
+        positive_count=100,
+        neg_pos_ratio=10.0,
+    )
+    assert len(mature) == 1000
 
 
 def test_head_only_builds_then_reuses_cached_features(tmp_path) -> None:

@@ -38,9 +38,10 @@ class TrainConfig:
     concept_folder: str
     max_epochs: int = 50
     patience: int = 3
-    # Implied negatives per positive. Binary datasets enforce a 3:1 floor;
-    # explicit/hard negatives are additive and keep their repetition weight.
-    neg_pos_ratio: float = 3.0
+    # Adaptive implied-negative ceiling. Binary datasets scale from 3:1 for
+    # tiny concepts to this 10:1 default at 100 positives; explicit/hard
+    # negatives are additive and keep their repetition weight.
+    neg_pos_ratio: float = 10.0
     # Per-concept training resolution: scales the aspect-bucket table
     # (512 = the canonical ~512px buckets; see bittrainer.dataset.scaled_buckets).
     # SmartCache keys embed bucket dims, so a change simply builds fresh entries.
@@ -69,6 +70,15 @@ class TrainConfig:
     val_hard_negative_paths: list[str] | None = None
     hard_negative_paths: list[str] = field(default_factory=list)
     hard_negative_weight: int = 3
+    # Cached single-concept head training can cheaply try several repetition
+    # strengths because every candidate reuses the same pooled features. An
+    # empty/single-value list keeps fixed-weight behaviour.
+    hard_negative_weight_candidates: list[int] = field(
+        default_factory=lambda: [1, 2, 3, 5]
+    )
+    selected_hard_negative_weight: int | None = None
+    hard_negative_weight_tuning_results: list[dict] = field(default_factory=list)
+    hard_negative_weight_tuning_elapsed_ms: int | None = None
     label_smoothing: float = 0.1
     best_model_name: str = "best.pt"
     checkpoint_dir: str | None = None

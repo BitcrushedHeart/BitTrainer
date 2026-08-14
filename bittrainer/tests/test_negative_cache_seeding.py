@@ -9,6 +9,7 @@ from pathlib import Path
 from PIL import Image
 
 from bittrainer.dataset import (
+    MAX_BINARY_NEG_POS_RATIO,
     MIN_BINARY_NEG_POS_RATIO,
     effective_binary_neg_pos_ratio,
 )
@@ -22,12 +23,15 @@ from bittrainer.smart_cache import CACHE_VERSION
 from bittrainer.trainer import TrainConfig
 
 
-def test_binary_floor_is_three_to_one() -> None:
+def test_binary_ratio_scales_from_three_to_ten_with_positive_evidence() -> None:
     assert MIN_BINARY_NEG_POS_RATIO == 3.0
-    assert effective_binary_neg_pos_ratio(None) == 3.0
-    assert effective_binary_neg_pos_ratio(2.0) == 3.0
-    assert effective_binary_neg_pos_ratio(5.0) == 5.0
-    assert TrainConfig(concept_folder="unused").neg_pos_ratio == 3.0
+    assert MAX_BINARY_NEG_POS_RATIO == 10.0
+    assert effective_binary_neg_pos_ratio(None, positive_count=20) == 3.0
+    assert effective_binary_neg_pos_ratio(None, positive_count=50) == 5.0
+    assert effective_binary_neg_pos_ratio(None, positive_count=100) == 10.0
+    assert effective_binary_neg_pos_ratio(None, positive_count=500) == 10.0
+    assert effective_binary_neg_pos_ratio(5.0, positive_count=100) == 5.0
+    assert TrainConfig(concept_folder="unused").neg_pos_ratio == 10.0
 
 
 def _era(root: Path, name: str, hashes: list[str]) -> None:
@@ -65,14 +69,14 @@ def test_sample_negative_pool_prefers_cached_then_fills() -> None:
 
     # Quota fits inside the cache-hit tier: sample entirely within it.
     sampled = _sample_negative_pool(
-        pool, positive_count=5, neg_pos_ratio=3.0, is_cached=is_cached
+        pool, positive_count=5, neg_pos_ratio=10.0, is_cached=is_cached
     )
     assert len(sampled) == 15
     assert all(is_cached(path) for path in sampled)
 
     # Quota exceeds the tier: every hit is kept, remainder from the fresh tier.
     sampled = _sample_negative_pool(
-        pool, positive_count=20, neg_pos_ratio=3.0, is_cached=is_cached
+        pool, positive_count=20, neg_pos_ratio=10.0, is_cached=is_cached
     )
     assert len(sampled) == 60
     assert sum(is_cached(path) for path in sampled) == 30
@@ -81,7 +85,7 @@ def test_sample_negative_pool_prefers_cached_then_fills() -> None:
     small = pool[:10]
     assert (
         _sample_negative_pool(
-            small, positive_count=20, neg_pos_ratio=3.0, is_cached=is_cached
+            small, positive_count=20, neg_pos_ratio=10.0, is_cached=is_cached
         )
         == small
     )
@@ -172,14 +176,20 @@ def test_head_only_prepare_data_seeds_negatives_through_the_predicate(
     config = TrainConfig(
         concept_folder=str(concept_folder),
         use_cache=False,
-        train_positive_paths=[str(_image(concept_folder / "train-pos.png", (255, 0, 0)))],
+        train_positive_paths=[
+            str(_image(concept_folder / "train-pos.png", (255, 0, 0)))
+        ],
         val_positive_paths=[str(_image(concept_folder / "val-pos.png", (0, 255, 0)))],
         train_negative_paths=[
-            str(_image(tmp_path / "negatives" / f"train-neg-{index}.png", (0, 0, index)))
+            str(
+                _image(tmp_path / "negatives" / f"train-neg-{index}.png", (0, 0, index))
+            )
             for index in range(6)
         ],
         val_negative_paths=[
-            str(_image(tmp_path / "negatives" / f"val-neg-{index}.png", (index, 0, 255)))
+            str(
+                _image(tmp_path / "negatives" / f"val-neg-{index}.png", (index, 0, 255))
+            )
             for index in range(6)
         ],
         train_hard_negative_paths=[],

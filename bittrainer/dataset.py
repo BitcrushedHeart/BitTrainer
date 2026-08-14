@@ -45,11 +45,29 @@ _BUCKET_RATIOS: list[float] = [w / h for w, h in ASPECT_RATIO_BUCKETS]
 
 DEFAULT_TRAIN_RESOLUTION = 512
 MIN_BINARY_NEG_POS_RATIO = 3.0
+MAX_BINARY_NEG_POS_RATIO = 10.0
 
 
-def effective_binary_neg_pos_ratio(value: float | None) -> float:
-    """Return the implied-negative ratio, enforcing the binary 3:1 floor."""
-    return max(MIN_BINARY_NEG_POS_RATIO, float(value or MIN_BINARY_NEG_POS_RATIO))
+def effective_binary_neg_pos_ratio(
+    value: float | None,
+    *,
+    positive_count: int | None = None,
+) -> float:
+    """Return the adaptive implied-negative ratio for a binary concept.
+
+    ``value`` is the user-configured ceiling. Mature concepts scale by one
+    negative per ten positives until that ceiling, while tiny concepts retain
+    the 3:1 coverage floor. With no evidence count, return the bounded ceiling
+    so callers can defer adaptation until their positive population is known.
+    """
+    ceiling = min(
+        MAX_BINARY_NEG_POS_RATIO,
+        max(MIN_BINARY_NEG_POS_RATIO, float(value or MAX_BINARY_NEG_POS_RATIO)),
+    )
+    if positive_count is None:
+        return ceiling
+    evidence_ratio = max(MIN_BINARY_NEG_POS_RATIO, max(0, int(positive_count)) / 10.0)
+    return min(ceiling, evidence_ratio)
 
 
 def scaled_buckets(
@@ -290,7 +308,8 @@ class ConceptDataset(Dataset):
         concept_folder: str | Path,
         split: str = "train",
         *,
-        neg_pos_ratio: float = MIN_BINARY_NEG_POS_RATIO,
+        neg_pos_ratio: float = MAX_BINARY_NEG_POS_RATIO,
+        ratio_positive_count: int | None = None,
         transform: Any | None = None,
         extra_positive_dirs: list[str] | None = None,
         negative_dirs: list[str] | None = None,
@@ -311,7 +330,9 @@ class ConceptDataset(Dataset):
         self.transform = transform
         self._face_bboxes: dict[str, list[int]] = face_bboxes or {}
         self._skin_normalise = skin_normalise
-        self._neg_pos_ratio = effective_binary_neg_pos_ratio(neg_pos_ratio)
+        self._neg_pos_ratio_ceiling = effective_binary_neg_pos_ratio(neg_pos_ratio)
+        self._neg_pos_ratio = self._neg_pos_ratio_ceiling
+        self._ratio_positive_count = ratio_positive_count
         self._hard_negative_weight = hard_negative_weight
         self._concept_name = concept_name or self.concept_folder.name
         self._cache = cache
@@ -342,6 +363,15 @@ class ConceptDataset(Dataset):
                 if not extra_paths:
                     extra_paths = _list_split_images(extra_folder, "positive", split)
                 self._positive_paths.extend(extra_paths)
+
+        self._neg_pos_ratio = effective_binary_neg_pos_ratio(
+            self._neg_pos_ratio_ceiling,
+            positive_count=(
+                self._ratio_positive_count
+                if self._ratio_positive_count is not None
+                else len(self._positive_paths)
+            ),
+        )
 
         self._all_negative_paths: list[Path] = []
         self._has_cross_concept_negatives = negative_paths is not None or bool(
