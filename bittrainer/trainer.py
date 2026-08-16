@@ -72,9 +72,11 @@ class TrainConfig:
     hard_negative_weight: int = 3
     # Cached single-concept head training can cheaply try several repetition
     # strengths because every candidate reuses the same pooled features. An
-    # empty/single-value list keeps fixed-weight behaviour.
+    # empty/single-value list keeps fixed-weight behaviour. Weight 5 was dropped
+    # after 13 live sweeps never showed it clearly winning while it carried the
+    # worst mean F1 deficit (Bitcrush ISSUE-0766).
     hard_negative_weight_candidates: list[int] = field(
-        default_factory=lambda: [1, 2, 3, 5]
+        default_factory=lambda: [1, 2, 3]
     )
     selected_hard_negative_weight: int | None = None
     hard_negative_weight_tuning_results: list[dict] = field(default_factory=list)

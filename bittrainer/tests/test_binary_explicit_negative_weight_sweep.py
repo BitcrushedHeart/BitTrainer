@@ -134,6 +134,15 @@ def test_weight_sweep_tie_prefers_lower_strength(monkeypatch, tmp_path) -> None:
     assert torch.all(model.head.weight == 1.0)
 
 
+def test_default_candidates_are_the_proven_strengths(tmp_path) -> None:
+    # 13 live sweep runs (Engine training_runs 160-172) showed weight 5 was never
+    # a clear winner and had the worst mean/worst-case F1 deficit; keep only the
+    # strengths that actually win so the sweep costs 3 head trainings, not 4
+    # (Bitcrush ISSUE-0766).
+    config = TrainConfig(concept_folder=str(tmp_path))
+    assert config.hard_negative_weight_candidates == [1, 2, 3]
+
+
 def test_weight_sweep_skips_without_explicit_negatives(monkeypatch, tmp_path) -> None:
     model = _TinyModel()
     calls: list[int] = []
