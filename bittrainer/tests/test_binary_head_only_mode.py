@@ -88,12 +88,16 @@ def test_head_only_samples_negative_quota_before_dataset_dimension_scan() -> Non
     )
     assert len(stronger) == 36
 
+    # A mature concept saturates at the 5:1 ceiling, not the 10:1 the caller
+    # asks for: ISSUE-0773 lowered MAX_BINARY_NEG_POS_RATIO because implied
+    # negatives are other concepts' positives, so the extra bulk was
+    # contaminated rather than informative.
     mature = _sample_negative_pool(
         [f"mature-negative-{index}.png" for index in range(1000)],
         positive_count=100,
         neg_pos_ratio=10.0,
     )
-    assert len(mature) == 1000
+    assert len(mature) == 500
 
 
 def test_head_only_builds_then_reuses_cached_features(tmp_path) -> None:

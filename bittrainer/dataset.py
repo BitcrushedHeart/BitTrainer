@@ -45,7 +45,16 @@ _BUCKET_RATIOS: list[float] = [w / h for w, h in ASPECT_RATIO_BUCKETS]
 
 DEFAULT_TRAIN_RESOLUTION = 512
 MIN_BINARY_NEG_POS_RATIO = 3.0
-MAX_BINARY_NEG_POS_RATIO = 10.0
+# Lowered 10.0 -> 5.0 (Bitcrush ISSUE-0773). Implied negatives are other
+# concepts' positives — unlabelled for this concept, not verified negative — so
+# a 10:1 pool buys contaminated bulk rather than coverage. Measured on a live
+# concept, the cap alone lifted served recall 0.455 -> 0.618 on top of
+# mass-normalised weighting, at unchanged precision against hard negatives.
+MAX_BINARY_NEG_POS_RATIO = 5.0
+# Validation prevalence is pinned independently of the training ratio so metrics
+# stay comparable across runs whose train ratio differs (ISSUE-0755 found raw F1
+# is not comparable across neg:pos ratios).
+DEFAULT_VAL_NEG_POS_RATIO = 3.0
 
 
 def effective_binary_neg_pos_ratio(

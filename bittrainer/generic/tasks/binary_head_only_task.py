@@ -118,6 +118,57 @@ def _sample_negative_pool(
     return hits + random.sample(misses, quota - len(hits))
 
 
+def implied_negative_weights(y: torch.Tensor, *, alpha: float) -> torch.Tensor:
+    """Per-sample loss weights that bound the implied pool's total influence.
+
+    ``y`` holds the base training block only — positives and implied negatives,
+    with explicit negatives already partitioned out — so every zero label here
+    is an implied negative.
+
+    Implied negatives are other concepts' positives (``deps._binary_file_splits``),
+    never assessed for *this* concept. They are unlabelled, not verified negative,
+    and on a people-heavy dataset they are densely contaminated with genuine
+    positives. At full weight a 10:1 pool therefore teaches the model that images
+    resembling the rest of the dataset are negative, which is why affected
+    concepts only fired on out-of-domain images. Scaling the pool so it carries
+    ``alpha`` times the positives' total loss mass keeps its coverage while
+    removing its dominance — the standard treatment for unlabelled data.
+
+    ``alpha <= 0`` disables normalisation and restores full weight.
+    """
+    weights = torch.ones_like(y, dtype=torch.float32)
+    if alpha <= 0:
+        return weights
+    positives = int((y == 1).sum())
+    implied = int((y == 0).sum())
+    if positives and implied:
+        weights[y == 0] = alpha * positives / implied
+    return weights
+
+
+def _weighted_cross_entropy(
+    logits: torch.Tensor,
+    labels: torch.Tensor,
+    weights: torch.Tensor | None,
+    smoothing: float,
+) -> torch.Tensor:
+    """Cross entropy under per-sample weights, normalised by total weight.
+
+    Normalising by summed weight rather than sample count keeps the effective
+    step size unchanged: down-weighting the implied pool must alter the
+    *balance* of the gradient, not shrink the whole update.
+    """
+    if weights is None:
+        return nn.functional.cross_entropy(logits, labels, label_smoothing=smoothing)
+    losses = nn.functional.cross_entropy(
+        logits, labels, label_smoothing=smoothing, reduction="none"
+    )
+    total = weights.sum()
+    if float(total) <= 0.0:
+        return losses.mean()
+    return (losses * weights).sum() / total
+
+
 def _train_cached_binary_head(
     model: nn.Module,
     x_train: torch.Tensor,
@@ -129,6 +180,7 @@ def _train_cached_binary_head(
     device: torch.device,
     cb,
     stop_event,
+    w_train: torch.Tensor | None = None,
     progress_stage: str = "training",
     progress_prefix: str = "Head probe",
 ) -> dict:
@@ -149,8 +201,12 @@ def _train_cached_binary_head(
         lr=_PROBE_LEARNING_RATE,
         weight_decay=config.head_weight_decay,
     )
+    # Weights ride the TensorDataset so shuffling keeps each sample with its own
+    # weight; an all-ones tensor reproduces the historical unweighted loss.
+    if w_train is None:
+        w_train = torch.ones_like(y_train, dtype=torch.float32)
     loader = DataLoader(
-        TensorDataset(x_train, y_train),
+        TensorDataset(x_train, y_train, w_train),
         batch_size=min(_PROBE_BATCH_SIZE, len(x_train)),
         shuffle=True,
         drop_last=False,
@@ -168,18 +224,22 @@ def _train_cached_binary_head(
             break
 
         model.head.train()
-        for features, labels in loader:
+        for features, labels, weights in loader:
             features = features.to(device)
             labels = labels.to(device)
             optimizer.zero_grad()
             logits = head_tail_logits(model, features)
-            loss = criterion(logits, labels)
+            loss = _weighted_cross_entropy(
+                logits, labels, weights.to(device), config.label_smoothing
+            )
             loss.backward()
             optimizer.step()
 
         model.head.eval()
         with torch.no_grad():
             val_logits = head_tail_logits(model, x_val.to(device)).float()
+            # Validation loss stays unweighted: it measures the model, not the
+            # run's training-time emphasis, so it remains comparable.
             val_loss = float(criterion(val_logits, y_val.to(device)).item())
         val_probs = torch.softmax(val_logits, dim=1)[:, 1]
         val_result = {
@@ -255,13 +315,26 @@ def _weighted_train_tensors(
     x_explicit: torch.Tensor,
     y_explicit: torch.Tensor,
     weight: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
+    w_base: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    """Append the explicit-negative block, repeated ``weight`` times.
+
+    Explicit negatives are user-verified, so they keep full per-sample weight —
+    only the implied pool inside ``w_base`` is normalised.
+    """
     if len(x_explicit) == 0:
-        return x_base, y_base
+        return x_base, y_base, w_base
     repeated_x = torch.cat([x_explicit] * weight, dim=0)
     repeated_y = torch.cat([y_explicit] * weight, dim=0)
-    return torch.cat((x_base, repeated_x), dim=0), torch.cat(
-        (y_base, repeated_y), dim=0
+    w_out = None
+    if w_base is not None:
+        w_out = torch.cat(
+            (w_base, torch.ones(len(repeated_y), dtype=w_base.dtype)), dim=0
+        )
+    return (
+        torch.cat((x_base, repeated_x), dim=0),
+        torch.cat((y_base, repeated_y), dim=0),
+        w_out,
     )
 
 
@@ -296,6 +369,7 @@ def _train_hard_negative_weight_sweep(
     device: torch.device,
     cb,
     stop_event,
+    w_base: torch.Tensor | None = None,
 ) -> dict:
     """Select explicit-negative repetition strength by tuned-threshold val F1.
 
@@ -309,8 +383,8 @@ def _train_hard_negative_weight_sweep(
         if len(x_explicit) > 0:
             weight = candidates[0]
             config.hard_negative_weight = weight
-        x_train, y_train = _weighted_train_tensors(
-            x_base, y_base, x_explicit, y_explicit, weight
+        x_train, y_train, w_train = _weighted_train_tensors(
+            x_base, y_base, x_explicit, y_explicit, weight, w_base
         )
         return _train_cached_binary_head(
             model,
@@ -322,6 +396,7 @@ def _train_hard_negative_weight_sweep(
             device=device,
             cb=cb,
             stop_event=stop_event,
+            w_train=w_train,
         )
 
     original_head_state = copy.deepcopy(model.head.state_dict())
@@ -337,8 +412,8 @@ def _train_hard_negative_weight_sweep(
             break
         model.head.load_state_dict(original_head_state)
         restore_rng_states(original_rng_state, device)
-        x_train, y_train = _weighted_train_tensors(
-            x_base, y_base, x_explicit, y_explicit, weight
+        x_train, y_train, w_train = _weighted_train_tensors(
+            x_base, y_base, x_explicit, y_explicit, weight, w_base
         )
         cb(
             {
@@ -363,6 +438,7 @@ def _train_hard_negative_weight_sweep(
             device=device,
             cb=cb,
             stop_event=stop_event,
+            w_train=w_train,
             progress_stage="explicit_negative_tuning",
             progress_prefix=f"Explicit-negative strength {weight}",
         )
@@ -493,10 +569,18 @@ class BinaryHeadOnlyTask(BinaryTask):
                 config.neg_pos_ratio,
                 positive_count=ratio_positive_count,
             )
+            # Validation prevalence is pinned independently of the train ratio so
+            # F1/AUPRC stay comparable across runs (ISSUE-0755: raw F1 is not
+            # comparable across neg:pos ratios).
+            val_ratio = (
+                ratio
+                if config.val_neg_pos_ratio is None
+                else float(config.val_neg_pos_ratio)
+            )
             is_cached = _cached_negative_predicate(config)
             val_shortfall = 0
             if original_val is not None and config.val_positive_paths is not None:
-                val_quota = math.ceil(len(config.val_positive_paths) * ratio)
+                val_quota = math.ceil(len(config.val_positive_paths) * val_ratio)
                 val_shortfall = max(0, val_quota - len(original_val))
             if original_train is not None and config.train_positive_paths is not None:
                 config.train_negative_paths = _sample_negative_pool(
@@ -511,8 +595,13 @@ class BinaryHeadOnlyTask(BinaryTask):
                 config.val_negative_paths = _sample_negative_pool(
                     original_val,
                     positive_count=len(config.val_positive_paths),
-                    neg_pos_ratio=ratio,
-                    ratio_positive_count=ratio_positive_count,
+                    neg_pos_ratio=val_ratio,
+                    # A pinned val ratio is a ceiling in its own right, so the
+                    # concept-wide positive count (which drives the adaptive
+                    # train ratio) must not be fed in alongside it.
+                    ratio_positive_count=(
+                        ratio_positive_count if config.val_neg_pos_ratio is None else None
+                    ),
                     is_cached=is_cached,
                 )
             super().prepare_data(ctx)
@@ -612,6 +701,11 @@ class BinaryHeadOnlyTask(BinaryTask):
                 "feature_load_seconds": round(time.monotonic() - load_started, 3),
             }
         )
+        # x_train/y_train are the base block (positives + implied negatives);
+        # explicit negatives were partitioned out above and keep full weight.
+        w_train = implied_negative_weights(
+            y_train, alpha=config.implied_negative_mass_alpha
+        )
         self.probe = _train_hard_negative_weight_sweep(
             model,
             x_train,
@@ -624,6 +718,7 @@ class BinaryHeadOnlyTask(BinaryTask):
             device=ctx.device,
             cb=ctx.cb,
             stop_event=ctx.stop_event,
+            w_base=w_train,
         )
         if self._stop(ctx) or self.probe["epochs_completed"] <= 0:
             self._cancelled = True

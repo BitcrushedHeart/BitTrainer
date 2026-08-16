@@ -23,15 +23,22 @@ from bittrainer.smart_cache import CACHE_VERSION
 from bittrainer.trainer import TrainConfig
 
 
-def test_binary_ratio_scales_from_three_to_ten_with_positive_evidence() -> None:
+def test_binary_ratio_scales_from_three_to_five_with_positive_evidence() -> None:
+    """Bitcrush ISSUE-0773 lowered the implied-negative ceiling from 10:1 to 5:1.
+
+    Implied negatives are other concepts' positives, so the extra bulk above 5:1
+    bought contamination rather than coverage; the cap alone recovered a large
+    share of the lost recall on a live concept.
+    """
     assert MIN_BINARY_NEG_POS_RATIO == 3.0
-    assert MAX_BINARY_NEG_POS_RATIO == 10.0
+    assert MAX_BINARY_NEG_POS_RATIO == 5.0
     assert effective_binary_neg_pos_ratio(None, positive_count=20) == 3.0
     assert effective_binary_neg_pos_ratio(None, positive_count=50) == 5.0
-    assert effective_binary_neg_pos_ratio(None, positive_count=100) == 10.0
-    assert effective_binary_neg_pos_ratio(None, positive_count=500) == 10.0
-    assert effective_binary_neg_pos_ratio(5.0, positive_count=100) == 5.0
-    assert TrainConfig(concept_folder="unused").neg_pos_ratio == 10.0
+    assert effective_binary_neg_pos_ratio(None, positive_count=100) == 5.0
+    assert effective_binary_neg_pos_ratio(None, positive_count=500) == 5.0
+    # A caller asking for the old 10:1 is clamped to the new ceiling.
+    assert effective_binary_neg_pos_ratio(10.0, positive_count=500) == 5.0
+    assert TrainConfig(concept_folder="unused").neg_pos_ratio == 5.0
 
 
 def _era(root: Path, name: str, hashes: list[str]) -> None:

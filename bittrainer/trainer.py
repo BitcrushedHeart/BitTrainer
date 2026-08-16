@@ -14,7 +14,7 @@ import torch.nn as nn
 from adv_optm import Prodigy_adv
 from torch.utils.data import DataLoader
 
-from bittrainer.dataset import ConceptDataset
+from bittrainer.dataset import MAX_BINARY_NEG_POS_RATIO, ConceptDataset
 from bittrainer.backbone_init import apply_backbone_init, wants_timm_pretrained
 from bittrainer.ema import ModelEMA
 from bittrainer.generic.optimizer import make_optimizer
@@ -39,9 +39,10 @@ class TrainConfig:
     max_epochs: int = 50
     patience: int = 3
     # Adaptive implied-negative ceiling. Binary datasets scale from 3:1 for
-    # tiny concepts to this 10:1 default at 100 positives; explicit/hard
-    # negatives are additive and keep their repetition weight.
-    neg_pos_ratio: float = 10.0
+    # tiny concepts to this 5:1 default at 50 positives; explicit/hard
+    # negatives are additive and keep their repetition weight. Lowered from
+    # 10:1 in ISSUE-0773 — see MAX_BINARY_NEG_POS_RATIO for the measurement.
+    neg_pos_ratio: float = MAX_BINARY_NEG_POS_RATIO
     # Per-concept training resolution: scales the aspect-bucket table
     # (512 = the canonical ~512px buckets; see bittrainer.dataset.scaled_buckets).
     # SmartCache keys embed bucket dims, so a change simply builds fresh entries.
@@ -81,6 +82,17 @@ class TrainConfig:
     selected_hard_negative_weight: int | None = None
     hard_negative_weight_tuning_results: list[dict] = field(default_factory=list)
     hard_negative_weight_tuning_elapsed_ms: int | None = None
+    # Total loss mass the implied-negative pool carries, as a multiple of the
+    # positives' mass (Bitcrush ISSUE-0773). Implied negatives are other
+    # concepts' positives — unlabelled for this concept — so at full weight a
+    # 10:1 pool taught the model to suppress the concept (24.7% served recall
+    # on a live concept; 74% of positives fell below the served threshold).
+    # 1.0 keeps their coverage while removing their dominance; 0 disables the
+    # normalisation and restores the historical full-weight behaviour.
+    implied_negative_mass_alpha: float = 1.0
+    # Validation implied-negative ratio, pinned independently of the training
+    # ratio so metrics stay comparable across runs. None follows neg_pos_ratio.
+    val_neg_pos_ratio: float | None = None
     label_smoothing: float = 0.1
     best_model_name: str = "best.pt"
     checkpoint_dir: str | None = None

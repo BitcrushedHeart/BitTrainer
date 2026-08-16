@@ -241,8 +241,16 @@ class BinaryTask(TrainingTask):
             val_ds = ConceptDataset(
                 concept_folder,
                 split="val",
-                neg_pos_ratio=config.neg_pos_ratio,
-                ratio_positive_count=ratio_positive_count,
+                # Validation prevalence is pinned independently of the train
+                # ratio so metrics stay comparable across runs (ISSUE-0773).
+                neg_pos_ratio=(
+                    config.val_neg_pos_ratio
+                    if config.val_neg_pos_ratio is not None
+                    else config.neg_pos_ratio
+                ),
+                ratio_positive_count=(
+                    ratio_positive_count if config.val_neg_pos_ratio is None else None
+                ),
                 extra_positive_dirs=config.extra_positive_dirs,
                 negative_dirs=config.negative_dirs,
                 positive_paths=config.val_positive_paths,
