@@ -70,15 +70,26 @@ class TrainConfig:
     train_hard_negative_paths: list[str] | None = None
     val_hard_negative_paths: list[str] | None = None
     hard_negative_paths: list[str] = field(default_factory=list)
+    # Explicit-negative repetition for the FULL-image path (ConceptDataset
+    # repeats those samples this many times per epoch). The cached head-only
+    # path overrides it from hard_negative_weight_candidates below, which now
+    # defaults to no repetition — so the two paths diverge here until Bitcrush
+    # ISSUE-0774 closes the gap, and this 3 stays unmeasured rather than
+    # silently changed.
     hard_negative_weight: int = 3
     # Cached single-concept head training can cheaply try several repetition
     # strengths because every candidate reuses the same pooled features. An
-    # empty/single-value list keeps fixed-weight behaviour. Weight 5 was dropped
-    # after 13 live sweeps never showed it clearly winning while it carried the
-    # worst mean F1 deficit (Bitcrush ISSUE-0766).
-    hard_negative_weight_candidates: list[int] = field(
-        default_factory=lambda: [1, 2, 3]
-    )
+    # empty/single-value list keeps fixed-weight behaviour.
+    #
+    # Narrowed to [1] in Bitcrush ISSUE-0773. Weight 5 had already gone in
+    # ISSUE-0766; a holdout A/B over 8 seeds then showed the surviving [1,2,3]
+    # sweep was selecting seed noise — its picks moved run to run while the
+    # val-score spread between candidates stayed below the seed-to-seed
+    # variance, and dropping it *improved* held-out recall (0.624 -> 0.643) at
+    # identical precision, for a third of the probe cost. Repeating hard
+    # lookalike negatives pushes the boundary into the positive cluster, and
+    # tuned-threshold F1 cannot see that clearly enough to reject it.
+    hard_negative_weight_candidates: list[int] = field(default_factory=lambda: [1])
     selected_hard_negative_weight: int | None = None
     hard_negative_weight_tuning_results: list[dict] = field(default_factory=list)
     hard_negative_weight_tuning_elapsed_ms: int | None = None

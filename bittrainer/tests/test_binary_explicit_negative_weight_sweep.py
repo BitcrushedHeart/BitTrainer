@@ -134,13 +134,20 @@ def test_weight_sweep_tie_prefers_lower_strength(monkeypatch, tmp_path) -> None:
     assert torch.all(model.head.weight == 1.0)
 
 
-def test_default_candidates_are_the_proven_strengths(tmp_path) -> None:
-    # 13 live sweep runs (Engine training_runs 160-172) showed weight 5 was never
-    # a clear winner and had the worst mean/worst-case F1 deficit; keep only the
-    # strengths that actually win so the sweep costs 3 head trainings, not 4
-    # (Bitcrush ISSUE-0766).
+def test_default_candidates_are_a_single_unrepeated_strength(tmp_path) -> None:
+    """The sweep is off by default (Bitcrush ISSUE-0773).
+
+    Weight 5 went first (ISSUE-0766, 13 live sweeps). A holdout A/B over 8 seeds
+    then showed the surviving [1,2,3] sweep was selecting seed noise: its picks
+    moved run to run while the val-score spread between candidates stayed under
+    the seed-to-seed variance, and removing it *improved* held-out recall
+    (0.624 -> 0.643) at identical precision for a third of the probe cost.
+
+    The machinery stays — a caller can still pass several candidates — but the
+    default no longer pays for three head trainings to pick between them.
+    """
     config = TrainConfig(concept_folder=str(tmp_path))
-    assert config.hard_negative_weight_candidates == [1, 2, 3]
+    assert config.hard_negative_weight_candidates == [1]
 
 
 def test_weight_sweep_skips_without_explicit_negatives(monkeypatch, tmp_path) -> None:
