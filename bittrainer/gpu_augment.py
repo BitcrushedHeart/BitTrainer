@@ -6,6 +6,8 @@ CPU-side torchvision transforms pipeline used by DataLoader workers.
 
 from __future__ import annotations
 
+import math
+
 import torch
 
 _IMAGENET_MEAN = torch.tensor([0.485, 0.456, 0.406])
@@ -141,6 +143,90 @@ def gpu_color_jitter(
     return batch
 
 
+def gpu_gaussian_blur(
+    batch: torch.Tensor, p: float = 0.0, sigma_max: float = 1.5,
+) -> torch.Tensor:
+    """Per-sample Gaussian blur on a uint8 CHW batch.
+
+    Forensic augmentation (ISSUE-0847): a realism ranker must not be able to
+    read "sharp high-frequency detail = photograph". Sigma is drawn per sample
+    from U(0.1, ``sigma_max``); the kernel is the odd size 2*ceil(3*sigma)+1.
+    Samples whose Bernoulli draw fails are returned untouched.
+    """
+    if p <= 0.0:
+        return batch
+    from torchvision.transforms.v2 import functional as TVF
+
+    mask = torch.rand(batch.shape[0], device=batch.device) < p
+    if not bool(mask.any()):
+        return batch
+    for i in range(batch.shape[0]):
+        if not bool(mask[i]):
+            continue
+        sigma = float(torch.empty(1).uniform_(0.1, max(0.1, sigma_max)).item())
+        k = 2 * int(math.ceil(3.0 * sigma)) + 1
+        batch[i] = TVF.gaussian_blur(batch[i], kernel_size=[k, k], sigma=[sigma, sigma])
+    return batch
+
+
+def gpu_gaussian_noise(
+    batch: torch.Tensor, p: float = 0.0, std: float = 0.03,
+) -> torch.Tensor:
+    """Per-sample additive Gaussian noise on a uint8 CHW batch.
+
+    ``std`` is a fraction of the 0-1 range and is applied as ``std * 255`` on
+    the uint8 scale, then clamped and rounded back to uint8. Sensor noise is
+    the other half of the shortcut a realism ranker would otherwise learn
+    ("grain = photograph"), so both classes get it.
+    """
+    if p <= 0.0 or std <= 0.0:
+        return batch
+    mask = torch.rand(batch.shape[0], device=batch.device) < p
+    if not bool(mask.any()):
+        return batch
+    sel = batch[mask].float()
+    noise = torch.randn(sel.shape, device=batch.device, dtype=torch.float32) * (std * 255.0)
+    batch[mask] = sel.add_(noise).clamp_(0.0, 255.0).round_().to(torch.uint8)
+    return batch
+
+
+def gpu_jpeg_roundtrip(
+    batch: torch.Tensor, p: float = 0.0, quality: tuple[int, int] = (50, 95),
+) -> torch.Tensor:
+    """Per-sample JPEG encode/decode round-trip on a uint8 CHW batch.
+
+    Quality is drawn per sample from U[quality[0], quality[1]]. Runs after the
+    noise so JPEG *quantises* the grain rather than sitting under it — the same
+    order a camera produces. Tries the batched on-device torchvision path and
+    falls back to per-sample CPU encode/decode when the device rejects it.
+    """
+    if p <= 0.0:
+        return batch
+    from torchvision.io import decode_jpeg, encode_jpeg
+
+    mask = torch.rand(batch.shape[0], device=batch.device) < p
+    idx = [i for i in range(batch.shape[0]) if bool(mask[i])]
+    if not idx:
+        return batch
+    q_lo, q_hi = int(quality[0]), int(quality[1])
+    if q_hi < q_lo:
+        q_lo, q_hi = q_hi, q_lo
+    qualities = [int(torch.randint(q_lo, q_hi + 1, (1,)).item()) for _ in idx]
+
+    imgs = [batch[i] for i in idx]
+    try:
+        encoded = [encode_jpeg(img, quality=q) for img, q in zip(imgs, qualities)]
+        decoded = decode_jpeg(encoded, device=batch.device)
+    except (RuntimeError, TypeError, NotImplementedError):
+        decoded = []
+        for img, q in zip(imgs, qualities):
+            cpu_img = img.cpu()
+            decoded.append(decode_jpeg(encode_jpeg(cpu_img, quality=q)).to(batch.device))
+    for i, out in zip(idx, decoded):
+        batch[i] = out
+    return batch
+
+
 def apply_train_augment(
     batch: torch.Tensor,
     dtype: torch.dtype = torch.float32,
@@ -151,6 +237,12 @@ def apply_train_augment(
     memory_format: torch.memory_format | None = None,
     hflip: bool = True,
     photometric_only: bool = False,
+    noise_p: float = 0.0,
+    noise_std: float = 0.03,
+    blur_p: float = 0.0,
+    blur_sigma_max: float = 1.5,
+    jpeg_p: float = 0.0,
+    jpeg_quality: tuple[int, int] = (50, 95),
 ) -> torch.Tensor:
     """Normalize uint8 batch and apply training augmentation on GPU.
 
@@ -162,11 +254,22 @@ def apply_train_augment(
     Spatial groups pass ``hflip=False`` (the trainer flips label-aware via
     ``spatial_hflip_batch`` instead) and ``photometric_only=True`` (geometric
     RandAugment ops would move the subject relative to the frame).
+
+    The forensic knobs (``blur_p``/``noise_p``/``jpeg_p``, all off by default)
+    run on the uint8 batch after RandAugment in the order blur -> noise ->
+    JPEG: a camera adds sensor noise and *then* compresses, so JPEG must
+    quantise the noise rather than sit under it. Each op draws an independent
+    Bernoulli per sample. They exist so a realism ranker cannot learn
+    "high-frequency noise" or "JPEG artifact" as a stand-in for "photograph" —
+    both classes see the same augmentation.
     """
     if randaugment_m > 0 and randaugment_n > 0:
         batch = gpu_randaugment(
             batch, randaugment_n, randaugment_m, photometric_only=photometric_only,
         )
+    batch = gpu_gaussian_blur(batch, p=blur_p, sigma_max=blur_sigma_max)
+    batch = gpu_gaussian_noise(batch, p=noise_p, std=noise_std)
+    batch = gpu_jpeg_roundtrip(batch, p=jpeg_p, quality=jpeg_quality)
     out = gpu_normalize(batch)
     if hflip:
         out = gpu_random_flip(out)

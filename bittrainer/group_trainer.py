@@ -337,6 +337,25 @@ class GroupTrainConfig:
     randaugment_n: int = 2
     randaugment_m: int = 9
     random_erasing_p: float = 0.25
+    # --- Forensic augmentation (ISSUE-0847). All OFF by default so every
+    # existing group trains identically. Turn these on for realism rankers
+    # (AI-vs-photo), where the model would otherwise learn "high-frequency
+    # noise = photograph" or "JPEG artifact = photograph" as a shortcut. Both
+    # classes get the same augmentation, so the cue carries no signal. ---
+    # Drop the geometric RandAugment ops even for non-spatial groups: the
+    # resampling from a shear/rotate leaves its own interpolation signature.
+    randaugment_photometric_only: bool = False
+    # Per-sample probability of additive Gaussian noise; std is a fraction of
+    # the 0-1 range (applied as std*255 on the uint8 scale).
+    aug_noise_p: float = 0.0
+    aug_noise_std: float = 0.03
+    # Per-sample probability of Gaussian blur, sigma ~ U(0.1, sigma_max).
+    aug_blur_p: float = 0.0
+    aug_blur_sigma_max: float = 1.5
+    # Per-sample probability of a JPEG round-trip at quality ~ U[min, max].
+    aug_jpeg_p: float = 0.0
+    aug_jpeg_quality_min: int = 50
+    aug_jpeg_quality_max: int = 95
     # Per-class threshold tuning for multi-label
     per_class_thresholds_enabled: bool = True
     # Manual batch size override â€” skips the auto-batch probe/heuristic when set
@@ -869,7 +888,15 @@ def _train_one_epoch(
             random_erasing_p=config.random_erasing_p,
             memory_format=memory_format,
             hflip=spatial_flip_map is None,
-            photometric_only=spatial_flip_map is not None,
+            photometric_only=(
+                spatial_flip_map is not None or config.randaugment_photometric_only
+            ),
+            noise_p=config.aug_noise_p,
+            noise_std=config.aug_noise_std,
+            blur_p=config.aug_blur_p,
+            blur_sigma_max=config.aug_blur_sigma_max,
+            jpeg_p=config.aug_jpeg_p,
+            jpeg_quality=(config.aug_jpeg_quality_min, config.aug_jpeg_quality_max),
         )
 
         # MixUp/CutMix: smooth targets first (preserving ordinal/label smoothing),
