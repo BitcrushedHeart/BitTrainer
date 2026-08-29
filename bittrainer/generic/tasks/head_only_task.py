@@ -182,9 +182,12 @@ class HeadOnlyTask(TrainingTask):
         cb({"type": "training_progress", "stage": "training",
             "status_text": f"Training head probe ({config.probe_head})"})
         none_index = gt._resolve_none_index(config.class_names)
+        # Epoch-shaped (replication-expanded) train rows: ``samples`` is the
+        # stable, de-replicated base list since ISSUE-0859.
+        train_epoch_samples = self.train_ds.epoch_samples()
         probe = gt._run_auto_softness_probe(
             model, config, embed_cache, self.smart_cache,
-            self.train_ds.samples, self.val_ds.samples,
+            train_epoch_samples, self.val_ds.samples,
             device=device, none_index=none_index, cb=cb, stop_event=ctx.stop_event,
         )
         # Second pre-training sweep: __none__ oversample off vs 1.5x. When it runs
@@ -192,7 +195,7 @@ class HeadOnlyTask(TrainingTask):
         # as the candidate to evaluate.
         oversample_probe = gt._run_auto_oversample_probe(
             model, config, embed_cache, self.smart_cache,
-            self.train_ds.samples, self.val_ds.samples,
+            train_epoch_samples, self.val_ds.samples,
             device=device, none_index=none_index, cb=cb, stop_event=ctx.stop_event,
         )
         if oversample_probe:

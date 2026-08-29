@@ -23,10 +23,9 @@ def _base_samples() -> list[dict]:
 
 
 def _counts(ds: GroupDataset) -> dict[int, int]:
-    c: dict[int, int] = {}
-    for s in ds.samples:
-        c[s["label"]] = c.get(s["label"], 0) + 1
-    return c
+    # Per-epoch exposure: the oversample repeats live in the epoch index
+    # schedule over the stable base list (ISSUE-0859).
+    return ds.get_effective_class_counts()
 
 
 def test_rare_group_none_target_formula():

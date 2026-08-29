@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import math
 import random
-from collections import Counter
 
 import numpy as np
 import torch
@@ -48,7 +47,7 @@ def test_effective_reflects_oversample_natural_reflects_raw(tmp_path):
     ds = GroupDataset(root, ["a", "b", "c"], split="train", group_name="g")
 
     natural = {int(k): int(v) for k, v in ds.get_class_counts().items()}
-    effective = dict(Counter(s["label"] for s in ds.samples))
+    effective = ds.get_effective_class_counts()
 
     # Natural = raw disk counts, un-oversampled.
     assert natural[0] == 60

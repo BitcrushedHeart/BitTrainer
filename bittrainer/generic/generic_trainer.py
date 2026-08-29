@@ -20,6 +20,7 @@ from bittrainer.training_state import (
     collect_epoch_state,
     paused_result,
     restore_rng_states,
+    resume_schedule_from_state,
 )
 
 logger = logging.getLogger(__name__)
@@ -100,10 +101,12 @@ class GenericTrainer:
             # boundary backup stores epoch+1, so it never re-runs a finished epoch).
             start_epoch = int(resume_state["epoch"])
             resume_bs_changed = bool(resume_state.get("_resume_bs_changed"))
-            if resume_batch_in_epoch > 0 and not resume_bs_changed:
-                resume_schedule = resume_state.get("batch_schedule")
-            else:
-                resume_batch_in_epoch = 0
+            # A stored schedule only replays when the batch size is unchanged AND
+            # the backup uses the current schedule indexing; otherwise the epoch
+            # restarts from its boundary (see resume_schedule_from_state).
+            resume_schedule, resume_batch_in_epoch = resume_schedule_from_state(
+                resume_state, bs_changed=resume_bs_changed
+            )
             msg = task.resumed_message(ctx, best, global_step, start_epoch)
             if msg is not None:
                 cb(msg)

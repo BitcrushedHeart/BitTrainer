@@ -76,6 +76,16 @@ def _list_class_images(group_folder: Path, class_name: str, split: str) -> list[
 class GroupDataset(Dataset):
     """Dataset for multi-class group training/validation.
 
+    ``samples`` is a STABLE base list — one row per unique (path, class), built
+    once at construction and never mutated afterwards. Class balancing (the
+    ``_MAX_OVERSAMPLE_FACTOR`` cap, natural sampling, the rare-group ``__none__``
+    top-up) and per-epoch shuffling are expressed as an INDEX SCHEDULE over that
+    list (:meth:`epoch_indices`, redrawn by :meth:`reshuffle`). Two things depend
+    on that split (Bitcrush ISSUE-0859/0860): image sizes are read exactly once
+    per instance, and persistent dataloader workers — which hold a copy of the
+    dataset pickled at first iteration — keep indexing the same rows the parent's
+    schedule refers to, so the loaders can be built once and reused for the run.
+
     When a :class:`bittrainer.smart_cache.SmartCache` is attached, images are
     loaded as pre-resized CHW uint8 tensors directly from the cache. Cache
     misses fall back to on-the-fly PIL decode via the build function.
@@ -144,6 +154,21 @@ class GroupDataset(Dataset):
             else None
         )
 
+        # ISSUE-0859: (w, h) per unique path, read ONCE. ``reshuffle()`` used to
+        # rebuild a LOCAL size cache by re-opening every image (~13.6k PIL opens
+        # per epoch on the main thread); sizes never change between epochs.
+        self._size_memo: dict[str, tuple[int, int]] = {}
+        # ``samples`` is the STABLE base list: each unique (path, class) once,
+        # built at construction and never mutated afterwards. Per-epoch
+        # replication (oversample cap / rare-group __none__) and shuffling live
+        # in ``_epoch_indices``, an index schedule OVER that list. Persistent
+        # dataloader workers hold a pickled copy of the dataset taken at first
+        # iteration, so mutating ``samples`` per epoch would silently
+        # desynchronise the parent's schedule from the workers' rows.
+        self.samples: list[dict] = []
+        self._class_base_indices: list[list[int]] = []
+        self._epoch_indices: list[int] = []
+
         if sourceless:
             self._init_sourceless()
             return
@@ -173,7 +198,6 @@ class GroupDataset(Dataset):
 
         self._cache_dir = self.group_folder / ".resize_cache"
 
-        self.samples: list[dict] = []
         self._build_samples()
 
     def _init_sourceless(self) -> None:
@@ -184,47 +208,46 @@ class GroupDataset(Dataset):
         # auto-oversample sweep can re-derive __none__ oversampling on the pod.
         self._sourceless_base = [s for s in entries if s.get("split") == self.split]
         self.samples = list(self._sourceless_base)
-        if self.split == "train" and self._oversample_none:
-            self._apply_sourceless_none_oversample()
+        self._class_base_indices = [[] for _ in self.class_names]
+        self._build_epoch_indices()
         self._class_paths = [[] for _ in self.class_names]
 
-    def _apply_sourceless_none_oversample(self) -> None:
+    def _sourceless_none_extra_indices(self) -> list[int]:
         """Rare-group ``__none__`` oversample for the sourceless (cloud-pod)
-        path: duplicates cached ``__none__`` sample dicts up to the same target
-        used by :meth:`_apply_rare_group_oversample`. No-op for multi-label or
-        when there is no ``__none__`` class/data."""
+        path: the EXTRA base indices that lift cached ``__none__`` rows to the
+        same target :meth:`_rare_group_extra_indices` uses. Empty for
+        multi-label or when there is no ``__none__`` class/data."""
         try:
             none_idx = self.class_names.index(_NONE_CLASS_NAME)
         except ValueError:
-            return
+            return []
         counts: dict[int, int] = {}
-        none_samples: list[dict] = []
-        for s in self._sourceless_base:
+        none_indices: list[int] = []
+        for i, s in enumerate(self.samples):
             lbl = s.get("label")
             if not isinstance(lbl, int):
-                return  # multi-label targets: rare-group oversample doesn't apply
+                return []  # multi-label targets: rare-group oversample doesn't apply
             counts[lbl] = counts.get(lbl, 0) + 1
             if lbl == none_idx:
-                none_samples.append(s)
+                none_indices.append(i)
         none_count = counts.get(none_idx, 0)
         if none_count == 0:
-            return
+            return []
         max_count = max(counts.values())
         non_none_class_count = sum(1 for k, v in counts.items() if k != none_idx and v)
         if non_none_class_count == 0:
-            return
+            return []
         target = rare_group_none_target(max_count, non_none_class_count)
         extra_needed = target - none_count
         if extra_needed <= 0:
-            return
-        pool = none_samples * (extra_needed // none_count + 1)
+            return []
+        pool = none_indices * (extra_needed // none_count + 1)
         random.shuffle(pool)
-        self.samples.extend(pool[:extra_needed])
-        random.shuffle(self.samples)
         logger.info(
             "Rare-group oversample (sourceless): __none__ %d → %d",
             none_count, target,
         )
+        return pool[:extra_needed]
 
     def set_cache(self, cache: Any) -> None:
         self._cache = cache
@@ -240,8 +263,8 @@ class GroupDataset(Dataset):
         Region-crop training with ``region_fallback="drop"``: a train image
         where the detector found nothing would otherwise fall back to a
         centre crop of mostly-irrelevant pixels. Filtering happens at the
-        per-class path-list level so the exclusion survives ``reshuffle()``'s
-        sample rebuild. Returns the number of images dropped.
+        per-class path-list level, so every later epoch schedule is drawn from
+        the filtered base list. Returns the number of images dropped.
         """
         if self._sourceless:
             return 0
@@ -257,115 +280,141 @@ class GroupDataset(Dataset):
         return dropped
 
     def _build_samples(self) -> None:
+        """Full rebuild: the stable base list, then this epoch's schedule."""
+        self._build_base_samples()
+        self._build_epoch_indices()
+
+    # -- base list (built once; never mutated per epoch) --------------------
+
+    def _build_base_samples(self) -> None:
         self.samples = []
+        self._class_base_indices = [[] for _ in self.class_names]
 
         if self.multi_label:
             self._build_multilabel_samples()
             return
 
-        size_cache: dict[str, tuple[int, int]] = {}
         bad_paths: set[str] = set()
         all_unique = {str(p) for paths in self._class_paths for p in paths}
         for ps in all_unique:
-            size = self._get_image_size(ps)
-            if size is None:
+            if self._size_for(ps) is None:
                 bad_paths.add(ps)
-            else:
-                size_cache[ps] = size
         if bad_paths:
             logger.warning("Skipping %d unreadable images", len(bad_paths))
 
-        if self.split == "val":
-            for class_idx, paths in enumerate(self._class_paths):
-                for p in paths:
-                    sp = str(p)
-                    if sp in bad_paths:
-                        continue
-                    bucket = find_nearest_bucket(*size_cache[sp], self._train_resolution)
-                    self.samples.append(self._make_sample(sp, class_idx, bucket))
-        else:
-            clean_class_paths = [
-                [p for p in paths if str(p) not in bad_paths]
-                for paths in self._class_paths
-            ]
-            max_count = max((len(p) for p in clean_class_paths if len(p) > 0), default=0)
-            if max_count == 0:
-                return
-
-            for class_idx, paths in enumerate(clean_class_paths):
-                if not paths:
+        for class_idx, paths in enumerate(self._class_paths):
+            for p in paths:
+                sp = str(p)
+                if sp in bad_paths:
                     continue
-                if self._natural_sampling:
-                    # Natural distribution: every image once, no equalisation.
-                    expanded = list(paths)
-                    random.shuffle(expanded)
-                elif len(paths) < max_count:
-                    # Cap replication at _MAX_OVERSAMPLE_FACTOR x the class's natural
-                    # size (still <= max_count) to bound memorisation of sparse classes.
-                    target = min(max_count, math.ceil(_MAX_OVERSAMPLE_FACTOR * len(paths)))
-                    expanded = paths * (target // len(paths) + 1)
-                    random.shuffle(expanded)
-                    expanded = expanded[:target]
-                else:
-                    expanded = list(paths)
-                    random.shuffle(expanded)
+                bucket = find_nearest_bucket(*self._size_memo[sp], self._train_resolution)
+                self._class_base_indices[class_idx].append(len(self.samples))
+                self.samples.append(self._make_sample(sp, class_idx, bucket))
 
-                for p in expanded:
-                    sp = str(p)
-                    bucket = find_nearest_bucket(*size_cache[sp], self._train_resolution)
-                    self.samples.append(self._make_sample(sp, class_idx, bucket))
+    # -- epoch schedule (redrawn every reshuffle) ---------------------------
 
-            if self._oversample_none:
-                self._apply_rare_group_oversample(clean_class_paths, size_cache, max_count)
+    def _build_epoch_indices(self) -> None:
+        """Draw this epoch's index schedule over the stable base list.
 
-        random.shuffle(self.samples)
+        Single-label train: per-class replication under ``_MAX_OVERSAMPLE_FACTOR``
+        (or natural sampling), the rare-group ``__none__`` top-up, then a global
+        shuffle — the exact composition ``_build_samples`` used to bake into
+        ``self.samples``, now expressed as base indices with repeats.
+        """
+        if self._sourceless:
+            indices = list(range(len(self.samples)))
+            if self.split == "train" and self._oversample_none:
+                extra = self._sourceless_none_extra_indices()
+                if extra:
+                    indices.extend(extra)
+                    random.shuffle(indices)
+            self._epoch_indices = indices
+            return
 
-    def _apply_rare_group_oversample(
-        self,
-        clean_class_paths: list[list[Path]],
-        size_cache: dict[str, tuple[int, int]],
-        max_count: int,
-    ) -> None:
-        """Append extra ``__none__`` samples so the rare-group target dominates.
+        if self.multi_label:
+            indices = list(range(len(self.samples)))
+            if self.split == "train" and indices:
+                random.shuffle(indices)
+            self._epoch_indices = indices
+            return
+
+        if self.split == "val":
+            indices = list(range(len(self.samples)))
+            random.shuffle(indices)
+            self._epoch_indices = indices
+            return
+
+        max_count = max(
+            (len(b) for b in self._class_base_indices if len(b) > 0), default=0
+        )
+        if max_count == 0:
+            self._epoch_indices = []
+            return
+
+        indices = []
+        for base in self._class_base_indices:
+            if not base:
+                continue
+            n = len(base)
+            if self._natural_sampling:
+                # Natural distribution: every image once, no equalisation.
+                expanded = list(base)
+                random.shuffle(expanded)
+            elif n < max_count:
+                # Cap replication at _MAX_OVERSAMPLE_FACTOR x the class's natural
+                # size (still <= max_count) to bound memorisation of sparse classes.
+                target = min(max_count, math.ceil(_MAX_OVERSAMPLE_FACTOR * n))
+                expanded = base * (target // n + 1)
+                random.shuffle(expanded)
+                expanded = expanded[:target]
+            else:
+                expanded = list(base)
+                random.shuffle(expanded)
+            indices.extend(expanded)
+
+        if self._oversample_none:
+            indices.extend(self._rare_group_extra_indices(max_count))
+
+        random.shuffle(indices)
+        self._epoch_indices = indices
+
+    def _rare_group_extra_indices(self, max_count: int) -> list[int]:
+        """EXTRA ``__none__`` base indices so the rare-group target dominates.
 
         Target count for ``__none__`` is ``ceil(1.5 * sum_of_non_none_counts)``
         where each non-empty non-``__none__`` class contributes ``max_count``
-        after the baseline equalisation. Already-added ``max_count`` __none__
-        samples stay in place; only the *extra* needed to reach the target
-        are appended here.
+        after the baseline equalisation. The ``max_count`` __none__ entries the
+        baseline pass already added stay in place; only the *extra* needed to
+        reach the target are returned here.
         """
         try:
             none_idx = self.class_names.index(_NONE_CLASS_NAME)
         except ValueError:
-            return
-        if none_idx >= len(clean_class_paths):
-            return
-        none_paths = clean_class_paths[none_idx]
-        if not none_paths:
-            return
+            return []
+        if none_idx >= len(self._class_base_indices):
+            return []
+        none_base = self._class_base_indices[none_idx]
+        if not none_base:
+            return []
 
         non_none_class_count = sum(
-            1 for i, p in enumerate(clean_class_paths) if i != none_idx and p
+            1 for i, b in enumerate(self._class_base_indices) if i != none_idx and b
         )
         if non_none_class_count == 0:
-            return
+            return []
         target = rare_group_none_target(max_count, non_none_class_count)
         non_none_total = max_count * non_none_class_count
         extra_needed = target - max_count
         if extra_needed <= 0:
-            return
+            return []
 
-        extra = list(none_paths) * (extra_needed // len(none_paths) + 1)
+        extra = list(none_base) * (extra_needed // len(none_base) + 1)
         random.shuffle(extra)
-        extra = extra[:extra_needed]
-        for p in extra:
-            sp = str(p)
-            bucket = find_nearest_bucket(*size_cache[sp], self._train_resolution)
-            self.samples.append(self._make_sample(sp, none_idx, bucket))
         logger.info(
             "Rare-group oversample: __none__ %d → %d (non-none total %d)",
             max_count, target, non_none_total,
         )
+        return extra[:extra_needed]
 
     def _make_sample(self, path: str, label: int | torch.Tensor, bucket: tuple[int, int]) -> dict:
         return {
@@ -391,9 +440,6 @@ class GroupDataset(Dataset):
 
         entries = list(image_map.values())
 
-        if self.split == "train" and entries:
-            random.shuffle(entries)
-
         try:
             none_idx = self.class_names.index(_NONE_CLASS_NAME)
         except ValueError:
@@ -401,7 +447,7 @@ class GroupDataset(Dataset):
 
         for entry in entries:
             p = entry["path"]
-            size = self._get_image_size(p)
+            size = self._size_for(p)
             if size is None:
                 continue
 
@@ -417,25 +463,40 @@ class GroupDataset(Dataset):
             self.samples.append(self._make_sample(str(p), label, bucket))
 
     def reshuffle(self) -> None:
+        """Redraw the epoch schedule. The base list (and every image size) is
+        untouched, so this never re-opens a file (ISSUE-0859) and the pickled
+        dataset copies inside persistent dataloader workers stay valid."""
         if self.split == "train" and not self._sourceless:
-            self._build_samples()
+            self._build_epoch_indices()
+
+    def epoch_indices(self) -> list[int]:
+        """This epoch's base-list indices, WITH replication repeats, in order."""
+        return self._epoch_indices
+
+    def epoch_samples(self) -> list[dict]:
+        """The epoch schedule expanded to sample dicts (replicated rows repeat).
+
+        This is what the model actually sees in one epoch — the shape the
+        pre-``samples``-stabilisation code baked into ``self.samples``.
+        """
+        return [self.samples[i] for i in self._epoch_indices]
 
     def set_natural_sampling(self, flag: bool) -> None:
         """Switch between natural-distribution and replication-equalised train
-        sampling, rebuilding the sample list. No-op for val/sourceless."""
+        sampling, redrawing the epoch schedule. No-op for val/sourceless."""
         if self._natural_sampling == flag:
             return
         self._natural_sampling = flag
         if self.split == "train" and not self._sourceless:
-            self._build_samples()
+            self._build_epoch_indices()
 
     @property
     def oversample_none(self) -> bool:
         return self._oversample_none
 
     def set_oversample_none(self, flag: bool) -> None:
-        """Toggle rare-group ``__none__`` oversampling, rebuilding the sample
-        list. No-op for val/sourceless or when unchanged.
+        """Toggle rare-group ``__none__`` oversampling, redrawing the epoch
+        schedule. No-op for val or when unchanged.
 
         Mirrors :meth:`set_natural_sampling` so the auto-oversample sweep can
         apply its selection to the full fine-tune dataset after the warmup
@@ -446,12 +507,18 @@ class GroupDataset(Dataset):
         self._oversample_none = flag
         if self.split != "train":
             return
-        if self._sourceless:
-            self.samples = list(self._sourceless_base)
-            if flag:
-                self._apply_sourceless_none_oversample()
-        else:
-            self._build_samples()
+        self._build_epoch_indices()
+
+    def _size_for(self, path: Path | str) -> tuple[int, int] | None:
+        """Memoised ``(w, h)``: each unique path is opened at most once per
+        dataset instance, so schedule redraws and bbox-driven rebuilds are free."""
+        key = str(path)
+        if key in self._size_memo:
+            return self._size_memo[key]
+        size = self._get_image_size(key)
+        if size is not None:
+            self._size_memo[key] = size
+        return size
 
     @staticmethod
     def _get_image_size(path: Path | str) -> tuple[int, int] | None:
@@ -546,22 +613,38 @@ class GroupDataset(Dataset):
         effective train prior that inference-time prior correction divides out
         (ISSUE-0490 A)."""
         counts: dict[int, int] = {}
-        for s in self.samples:
-            lbl = s["label"]
+        for i in self._epoch_indices:
+            lbl = self.samples[i]["label"]
             if isinstance(lbl, int):
                 counts[lbl] = counts.get(lbl, 0) + 1
         return counts
 
 
 class GroupBucketBatchSampler(Sampler):
+    """Buckets the dataset's CURRENT epoch schedule into same-shape batches.
+
+    The schedule is a multiset of base-list indices (replicated rows appear more
+    than once), re-read on every ``__iter__`` so a ``reshuffle()`` between epochs
+    is picked up without rebuilding the sampler or the DataLoader around it.
+    Datasets without an ``epoch_indices()`` (the binary/stub datasets) fall back
+    to one pass over ``samples``.
+    """
+
     def __init__(self, dataset: GroupDataset, batch_size: int):
         self.dataset = dataset
         self.batch_size = batch_size
 
+    def _indices(self) -> list[int]:
+        fn = getattr(self.dataset, "epoch_indices", None)
+        if callable(fn):
+            return list(fn())
+        return list(range(len(self.dataset.samples)))
+
     def __iter__(self):
+        samples = self.dataset.samples
         bucket_indices: dict[tuple[int, int], list[int]] = {}
-        for i, sample in enumerate(self.dataset.samples):
-            bucket = sample["bucket"]
+        for i in self._indices():
+            bucket = samples[i]["bucket"]
             bucket_indices.setdefault(bucket, []).append(i)
 
         batches = []
@@ -574,9 +657,10 @@ class GroupBucketBatchSampler(Sampler):
         yield from batches
 
     def __len__(self):
+        samples = self.dataset.samples
         bucket_counts: dict[tuple[int, int], int] = {}
-        for sample in self.dataset.samples:
-            b = sample["bucket"]
+        for i in self._indices():
+            b = samples[i]["bucket"]
             bucket_counts[b] = bucket_counts.get(b, 0) + 1
         return sum(math.ceil(c / self.batch_size) for c in bucket_counts.values())
 

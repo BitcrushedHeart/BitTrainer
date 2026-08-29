@@ -258,7 +258,7 @@ def _build_oversampled_tensors(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Append extra ``__none__`` feature rows up to the rare-group target.
 
-    Mirrors ``GroupDataset._apply_rare_group_oversample`` at the cached-feature
+    Mirrors ``GroupDataset._rare_group_extra_indices`` at the cached-feature
     level: the ``__none__`` images are already embedded, so reaching the 1.5x
     target only duplicates existing rows â€” no re-embed. Returns the inputs
     unchanged when there is nothing to oversample.

@@ -1485,8 +1485,10 @@ def _prepare_datasets_and_cache(
         )
 
     # --- Count samples per bucket ---
+    # Over the EPOCH schedule (replication included): this histogram sizes the
+    # autobatch probe and the compile prewarm, which see the expanded epoch.
     bucket_counts: dict[tuple[int, int], int] = {}
-    for s in train_ds.samples:
+    for s in train_ds.epoch_samples():
         b = s["bucket"]
         bucket_counts[b] = bucket_counts.get(b, 0) + 1
 
@@ -1693,12 +1695,15 @@ def _warmup_head_probe(
         }
     )
     none_index = _resolve_none_index(config.class_names)
+    # The probes train a head on the epoch-shaped (replication-expanded) train
+    # set, exactly as they did when ``samples`` itself carried the replication.
+    train_epoch_samples = train_ds.epoch_samples()
     _run_auto_softness_probe(
         model,
         config,
         embed_cache,
         smart_cache,
-        train_ds.samples,
+        train_epoch_samples,
         val_ds.samples,
         device=device,
         none_index=none_index,
@@ -1715,7 +1720,7 @@ def _warmup_head_probe(
         config,
         embed_cache,
         smart_cache,
-        train_ds.samples,
+        train_epoch_samples,
         val_ds.samples,
         device=device,
         none_index=none_index,

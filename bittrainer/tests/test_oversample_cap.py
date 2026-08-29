@@ -7,7 +7,6 @@ CUDA hidden alongside a running GPU train.
 from __future__ import annotations
 
 import random
-from collections import Counter
 
 import numpy as np
 from PIL import Image
@@ -27,7 +26,9 @@ def _build(root, counts):
 
 
 def _counts(ds):
-    return dict(Counter(s["label"] for s in ds.samples))
+    # Per-epoch class exposure. Replication lives in the epoch index schedule,
+    # not in ``ds.samples`` (the stable base list) — see ISSUE-0859.
+    return ds.get_effective_class_counts()
 
 
 def test_cap_is_four():

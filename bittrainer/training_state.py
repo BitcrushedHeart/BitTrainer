@@ -55,6 +55,14 @@ logger = logging.getLogger(__name__)
 
 BACKUP_FORMAT_VERSION = 1
 
+# How the indices in a backup's ``batch_schedule`` are to be read. Since
+# ISSUE-0859 a GroupDataset's ``samples`` is a STABLE base list and the epoch's
+# replication/shuffle is an index schedule OVER it, so a schedule written by the
+# older code (indices into a per-epoch, replication-expanded list) no longer maps
+# to the same rows. Backups without this marker are therefore unusable for a
+# MID-epoch resume and fall back to an epoch-boundary restart.
+SCHEDULE_INDEXING = "base_v2"
+
 # backup_{global_step:08d}_{seq:04d}.pt — step orders backups coarsely; seq is a
 # monotonic disambiguator so two saves at the same optimizer step never collide
 # and always sort by save order.
@@ -233,9 +241,18 @@ class _FixedBatchSampler:
     inspectable: ``list(train_sampler)`` is materialised once per epoch, stored
     in the backup, and on resume the loader runs over ``schedule[batch_in_epoch:]``
     so no already-consumed image is loaded twice.
+
+    The batch list is MUTABLE (``set_batches``): the group trainer builds its
+    DataLoaders once per run and swaps the schedule in per epoch, so
+    ``persistent_workers=True`` actually keeps the workers alive instead of
+    respawning them every epoch (ISSUE-0860).
     """
 
     def __init__(self, batches: list[list[int]]) -> None:
+        self._batches = [list(b) for b in batches]
+
+    def set_batches(self, batches: list[list[int]]) -> None:
+        """Replace the schedule in place, for the next ``iter()`` of the loader."""
         self._batches = [list(b) for b in batches]
 
     def __iter__(self) -> Iterator[list[int]]:
@@ -670,6 +687,7 @@ def collect_epoch_state(
     best["best_metrics"] = sanitize_for_backup(best.get("best_metrics") or {})
     return {
         "fingerprint": fingerprint,
+        "schedule_indexing": SCHEDULE_INDEXING,
         "trainer": trainer,
         "epoch": epoch,
         "batch_in_epoch": batch_in_epoch,
@@ -683,6 +701,36 @@ def collect_epoch_state(
         "best": best,
         **extra,
     }
+
+
+def resume_schedule_from_state(
+    resume_state: dict, *, bs_changed: bool
+) -> tuple[list[list[int]] | None, int]:
+    """``(batch_schedule, batch_in_epoch)`` for a mid-epoch resume, or ``(None, 0)``.
+
+    A stored schedule is only replayable when (a) the run is actually mid-epoch,
+    (b) the batch size did not change (the batches no longer map otherwise), and
+    (c) the backup was written with the current schedule indexing. A pre-
+    ISSUE-0859 backup indexes a per-epoch expanded sample list, so replaying it
+    against today's stable base list would train on the WRONG image/label pairs;
+    those resume from the epoch boundary instead (the same safe fallback the
+    batch-size-change path already used).
+    """
+    batch_in_epoch = int(resume_state.get("batch_in_epoch", 0) or 0)
+    if batch_in_epoch <= 0 or bs_changed:
+        return None, 0
+    if resume_state.get("schedule_indexing") != SCHEDULE_INDEXING:
+        logger.warning(
+            "Backup predates the stable-sample-list schedule (%r); resuming from "
+            "the epoch boundary instead of mid-epoch batch %d",
+            resume_state.get("schedule_indexing"),
+            batch_in_epoch,
+        )
+        return None, 0
+    schedule = resume_state.get("batch_schedule")
+    if not schedule:
+        return None, 0
+    return [list(b) for b in schedule], batch_in_epoch
 
 
 def restore_optimizer_state(resume_state: dict, optimizer, scheduler, device) -> None:

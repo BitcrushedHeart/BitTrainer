@@ -421,6 +421,9 @@ def warm_group_cache(
 
     refs: list[SampleRef] = []
     for ds, split in ((train_ds, "train"), (val_ds, "val")):
+        # ``samples`` is the stable, de-replicated base list (ISSUE-0859); the
+        # refs are deduped by normpath downstream anyway, and the pod's
+        # sourceless loader reads its (path-keyed) entries from the cache index.
         for s in ds.samples:
             refs.append(
                 SampleRef(

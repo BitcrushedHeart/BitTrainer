@@ -82,6 +82,13 @@ class GroupTask(TrainingTask):
         self._val_sampler = None
         self._collate_fn = None
         self._epoch_start_mono = 0.0
+        # ISSUE-0860: the train/val loaders are built ONCE per run and reused
+        # every epoch; only the train batch sampler's schedule is swapped. Under
+        # Windows spawn each rebuild cost 6 train + 6 val worker spawns per epoch,
+        # so persistent_workers=True never actually persisted.
+        self._train_loader = None
+        self._train_batch_sampler = None
+        self._train_bucket_sampler = None
         # Per-sample loss / val-prob export (Bitcrush ISSUE-0850). The train
         # schedule is the materialised batch->index list the loader runs over,
         # so a batch index from the loop maps back to dataset rows (and paths);
@@ -252,7 +259,7 @@ class GroupTask(TrainingTask):
         if config.oversample_none != train_ds.oversample_none:
             train_ds.set_oversample_none(config.oversample_none)
             self.bucket_counts = {}
-            for s in train_ds.samples:
+            for s in train_ds.epoch_samples():
                 b = s["bucket"]
                 self.bucket_counts[b] = self.bucket_counts.get(b, 0) + 1
 
@@ -465,14 +472,20 @@ class GroupTask(TrainingTask):
     def build_loaders(
         self, ctx: TaskContext, epoch: int, eff_bs: int, resume_info: ResumeInfo
     ):
-        config = self.config
+        """Return ``(train_loader, schedule, start_batch)`` for ``epoch``.
+
+        The loaders themselves are created on the FIRST call and reused for the
+        rest of the run; each subsequent epoch only swaps the train batch
+        sampler's schedule (ISSUE-0860). That is safe because the dataset's
+        ``samples`` is a stable base list, so the copy of the dataset pickled
+        into each persistent worker at first iteration keeps indexing the same
+        rows the parent's schedule refers to.
+        """
         device = ctx.device
-        collate_fn = (
-            gt._collate_multilabel_batch
-            if config.multi_label
-            else gt._collate_bucket_batch
-        )
-        train_sampler = build_group_bucket_sampler(self.train_ds, batch_size=eff_bs)
+        if self._train_bucket_sampler is None:
+            self._train_bucket_sampler = build_group_bucket_sampler(
+                self.train_ds, batch_size=eff_bs
+            )
         if resume_info.mid_resume:
             schedule = [list(b) for b in resume_info.resume_schedule]
             loader_batches = schedule[resume_info.resume_batch_in_epoch :]
@@ -480,41 +493,66 @@ class GroupTask(TrainingTask):
             # Jump the augmentation/mixup RNG to the mid-epoch backup point.
             restore_rng_states(resume_info.resume_rng_now, device)
         else:
-            schedule = [list(b) for b in train_sampler]
+            # Re-iterating the bucket sampler re-reads the dataset's freshly
+            # drawn epoch schedule (task.reshuffle ran just before this).
+            schedule = [list(b) for b in self._train_bucket_sampler]
             loader_batches = schedule
             start_batch = 0
+
+        if self._train_loader is None:
+            self._create_loaders(eff_bs, loader_batches)
+        else:
+            self._train_batch_sampler.set_batches(loader_batches)
+
+        self._train_schedule = schedule
+        self._current_epoch = epoch
+        return self._train_loader, schedule, start_batch
+
+    def _create_loaders(self, eff_bs: int, initial_batches: list[list[int]]) -> None:
+        """One-time train + val DataLoader construction (workers spawn once)."""
+        config = self.config
+        collate_fn = (
+            gt._collate_multilabel_batch
+            if config.multi_label
+            else gt._collate_bucket_batch
+        )
         lk = loader_kwargs(config.dataloader_workers)
         if lk["num_workers"] == 0:
             # workers=0 (bit-exact resume mode): keep the DataLoader base-seed draw
             # off the global torch RNG so it stays purely augmentation-driven.
             lk["generator"] = torch.Generator().manual_seed(0)
-        train_loader = DataLoader(
+        self._train_batch_sampler = _FixedBatchSampler(initial_batches)
+        self._train_loader = DataLoader(
             self.train_ds,
-            batch_sampler=_FixedBatchSampler(loader_batches),
+            batch_sampler=self._train_batch_sampler,
             collate_fn=collate_fn,
             **lk,
         )
         # Materialise the val order too: the bucket sampler reshuffles on every
         # iteration, which is fine for metrics but makes the logits unmappable
         # to images. A fixed schedule keeps every consumer (metrics, the skin-
-        # tone view loader, per-sample export) on the identical order.
+        # tone view loader, per-sample export) on the identical order. Val never
+        # reshuffles, so this schedule is drawn once and reused for the run.
         val_schedule = [
             list(b) for b in build_group_bucket_sampler(self.val_ds, batch_size=eff_bs)
         ]
         val_sampler = _FixedBatchSampler(val_schedule)
-        val_loader = DataLoader(
+        self._val_loader = DataLoader(
             self.val_ds,
             batch_sampler=val_sampler,
             collate_fn=collate_fn,
             **lk,
         )
         self._collate_fn = collate_fn
-        self._val_loader = val_loader
         self._val_sampler = val_sampler
-        self._train_schedule = schedule
         self._val_schedule = val_schedule
-        self._current_epoch = epoch
-        return train_loader, schedule, start_batch
+
+    def _release_loaders(self) -> None:
+        """Drop the run's loaders so their persistent workers are reaped."""
+        self._train_loader = None
+        self._train_batch_sampler = None
+        self._train_bucket_sampler = None
+        self._val_loader = None
 
     # -- per-sample export (ISSUE-0850) -------------------------------------
     def _make_sample_loss_sink(self):
@@ -1054,4 +1092,7 @@ class GroupTask(TrainingTask):
         stats_path = self._write_sample_stats(ctx.checkpoint_dir)
         if stats_path is not None and isinstance(result, dict):
             result["sample_stats_path"] = str(stats_path)
+        # The run-long loaders are done: drop them so their persistent workers
+        # shut down instead of lingering for the life of the task object.
+        self._release_loaders()
         return result
