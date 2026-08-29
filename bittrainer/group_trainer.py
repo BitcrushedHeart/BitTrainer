@@ -324,6 +324,11 @@ class GroupTrainConfig:
     # follow-up). When set, the deployable state_dict is written to
     # {snapshot_dir}/epoch_NNN.pt after every epoch. Off by default.
     snapshot_dir: str | None = None
+    # Per-sample loss / val-probability export (Bitcrush ISSUE-0850): after every
+    # epoch, {checkpoint_dir}/sample_stats.json holds each image's train-loss
+    # trajectory (train split) or per-epoch probs + loss (val split). Engine's
+    # Dataset Hygiene ranks label issues from it. Cheap (values already exist).
+    record_sample_stats: bool = True
     # --- Greedy weight soup (ISSUE-0392): ON by default. After training, average
     # the weights of the strongest epochs into ONE model, greedily accepting an
     # epoch only when it does not lower the val selection score, and adopt the
@@ -806,7 +811,15 @@ def _train_one_epoch(
     pause_event: object | None = None,
     boundary_hook: Callable[[int], str | None] | None = None,
     start_batch: int = 0,
+    sample_loss_sink: Callable[[int, torch.Tensor], None] | None = None,
 ) -> tuple[float, dict[str, float]]:
+    """One training epoch.
+
+    ``sample_loss_sink(batch_index, per_example_loss)`` receives the hard-label
+    per-example CE (CPU tensor, batch order) for every non-MixUp batch, keyed by
+    the ABSOLUTE batch position in the epoch schedule (so a mid-epoch resume
+    still maps to ``schedule[batch_index]``). Bitcrush ISSUE-0850.
+    """
     model.train()
     total_loss = 0.0
     # ``num_batches`` is the ABSOLUTE position within the epoch: it starts at
@@ -974,6 +987,9 @@ def _train_one_epoch(
                 )
             per_class_loss_sum.index_add_(0, labels.long(), per_ex)
             per_class_loss_count.index_add_(0, labels.long(), torch.ones_like(per_ex))
+            if sample_loss_sink is not None:
+                # ``num_batches`` was already advanced for this batch.
+                sample_loss_sink(num_batches - 1, per_ex.detach().cpu())
 
         if step_callback is not None:
             now = time.monotonic()

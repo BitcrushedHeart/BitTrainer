@@ -36,6 +36,7 @@ from bittrainer.model import create_model, unfreeze_backbone
 from bittrainer.model_soup import greedy_soup
 from bittrainer.progress import ProgressEmitter, Stage
 from bittrainer.runtime import configure_cuda_backend, maybe_compile, prewarm_compile
+from bittrainer.sample_stats import SampleStatsRecorder
 from bittrainer.smart_cache import _noop_callback
 from bittrainer.training_state import (
     _FixedBatchSampler,
@@ -81,6 +82,19 @@ class GroupTask(TrainingTask):
         self._val_sampler = None
         self._collate_fn = None
         self._epoch_start_mono = 0.0
+        # Per-sample loss / val-prob export (Bitcrush ISSUE-0850). The train
+        # schedule is the materialised batch->index list the loader runs over,
+        # so a batch index from the loop maps back to dataset rows (and paths);
+        # the val schedule pins the val loader order the same way.
+        self.sample_stats: SampleStatsRecorder | None = (
+            SampleStatsRecorder(config.class_names)
+            if config.record_sample_stats and not config.multi_label
+            else None
+        )
+        self._train_schedule: list[list[int]] = []
+        self._val_schedule: list[list[int]] = []
+        self._current_epoch = 0
+        self._sample_stats_path: Path | None = None
 
     # -- one-time setup ----------------------------------------------------
     def make_context(
@@ -480,7 +494,14 @@ class GroupTask(TrainingTask):
             collate_fn=collate_fn,
             **lk,
         )
-        val_sampler = build_group_bucket_sampler(self.val_ds, batch_size=eff_bs)
+        # Materialise the val order too: the bucket sampler reshuffles on every
+        # iteration, which is fine for metrics but makes the logits unmappable
+        # to images. A fixed schedule keeps every consumer (metrics, the skin-
+        # tone view loader, per-sample export) on the identical order.
+        val_schedule = [
+            list(b) for b in build_group_bucket_sampler(self.val_ds, batch_size=eff_bs)
+        ]
+        val_sampler = _FixedBatchSampler(val_schedule)
         val_loader = DataLoader(
             self.val_ds,
             batch_sampler=val_sampler,
@@ -490,7 +511,73 @@ class GroupTask(TrainingTask):
         self._collate_fn = collate_fn
         self._val_loader = val_loader
         self._val_sampler = val_sampler
+        self._train_schedule = schedule
+        self._val_schedule = val_schedule
+        self._current_epoch = epoch
         return train_loader, schedule, start_batch
+
+    # -- per-sample export (ISSUE-0850) -------------------------------------
+    def _make_sample_loss_sink(self):
+        """Map ``(batch_index, per_example_loss)`` from the loop to train paths."""
+        if self.sample_stats is None:
+            return None
+        recorder = self.sample_stats
+        schedule = self._train_schedule
+        samples = self.train_ds.samples
+        epoch = self._current_epoch
+
+        def _sink(batch_index: int, losses: torch.Tensor) -> None:
+            if batch_index < 0 or batch_index >= len(schedule):
+                return
+            idxs = schedule[batch_index]
+            if len(idxs) != losses.numel():
+                return
+            rows = [samples[i] for i in idxs]
+            recorder.record_train(
+                epoch,
+                [r["path"] for r in rows],
+                [int(r["label"]) for r in rows],
+                losses.tolist(),
+            )
+
+        return _sink
+
+    def _record_val_epoch(
+        self, epoch: int, logits: torch.Tensor, labels: torch.Tensor
+    ) -> None:
+        """Record softmax probs for every val image in ``_val_schedule`` order.
+
+        The labels that came back through the loader must equal the dataset's
+        own labels in schedule order -- a mismatch means the order assumption
+        broke and the export would be silently mis-keyed, so fail loud.
+        """
+        if self.sample_stats is None:
+            return
+        idxs = [i for b in self._val_schedule for i in b]
+        if len(idxs) != labels.numel():
+            raise RuntimeError(
+                f"sample_stats: val schedule has {len(idxs)} rows, "
+                f"loader returned {labels.numel()}"
+            )
+        rows = [self.val_ds.samples[i] for i in idxs]
+        expected = torch.tensor([int(r["label"]) for r in rows], dtype=torch.long)
+        if not torch.equal(expected, labels.long().cpu()):
+            raise RuntimeError("sample_stats: val labels do not match schedule order")
+        probs = torch.softmax(logits.float(), dim=1)
+        self.sample_stats.record_val(
+            epoch, [r["path"] for r in rows], expected.tolist(), probs
+        )
+
+    def _write_sample_stats(self, checkpoint_dir: Path | None) -> Path | None:
+        if self.sample_stats is None or checkpoint_dir is None:
+            return None
+        try:
+            self._sample_stats_path = self.sample_stats.write(
+                Path(checkpoint_dir) / "sample_stats.json"
+            )
+        except OSError as exc:  # diagnostics must never kill a run
+            logger.warning("sample_stats write failed: %s", exc)
+        return self._sample_stats_path
 
     def make_step_callback(
         self,
@@ -577,6 +664,7 @@ class GroupTask(TrainingTask):
             pause_event=ctx.pause_event,
             boundary_hook=boundary_hook,
             start_batch=start_batch,
+            sample_loss_sink=self._make_sample_loss_sink(),
         )
 
     def on_after_train(self, ctx: TaskContext, model, epoch: int) -> None:
@@ -617,6 +705,7 @@ class GroupTask(TrainingTask):
             val_metrics = gt._shipped_decode_metrics(
                 epoch_logits, epoch_labels, config, none_index
             )
+            self._record_val_epoch(epoch, epoch_logits, epoch_labels)
             # Skin Tone V2 dual-view (ISSUE-0217, spec §8): score the
             # colour-normalised view and the averaged-logit combination as separate
             # tracks. Selection stays on the ORIGINAL view.
@@ -701,6 +790,9 @@ class GroupTask(TrainingTask):
         best: BestTracker,
     ) -> None:
         config = self.config
+        # Per-sample export is rewritten every epoch so a crash/stop still
+        # leaves a usable (partial) trajectory file.
+        self._write_sample_stats(ctx.checkpoint_dir)
         # Dynamic per-class loss weighting: fold this epoch's per-class val signal
         # into the controller and reassign class_weights for the NEXT epoch.
         if self.dcw_controller is not None:
@@ -942,7 +1034,7 @@ class GroupTask(TrainingTask):
                 except OSError:
                     pass
 
-        return gt._compare_promote_finalize(
+        result = gt._compare_promote_finalize(
             config,
             candidate_path=best.best_checkpoint_path,
             best_metrics=best.best_metrics,
@@ -959,3 +1051,7 @@ class GroupTask(TrainingTask):
             total_raw=self.total_raw,
             cb=cb,
         )
+        stats_path = self._write_sample_stats(ctx.checkpoint_dir)
+        if stats_path is not None and isinstance(result, dict):
+            result["sample_stats_path"] = str(stats_path)
+        return result
