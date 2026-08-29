@@ -174,14 +174,47 @@ def convert_cache_dir(
                 print(f"  {done}/{len(files)} ({time.monotonic() - start:.0f}s)", file=out)
         return report
 
+    # Bounded in-flight window: submitting every file up front keeps 160k+
+    # futures (and their pending results) alive for the whole run. Only
+    # ``2 * workers`` files are ever queued or loaded at once, and the payloads
+    # are dropped as soon as each is recorded.
+    import gc
+
+    window = max(2, 2 * workers)
+    pending: dict[concurrent.futures.Future, Path] = {}
+    queue = iter(files)
     with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
-        futures = {pool.submit(_convert_one, p, dry_run=dry_run): p for p in files}
-        for fut in concurrent.futures.as_completed(futures):
-            _record(futures[fut], fut.result())
-            done += 1
-            if out is not None and progress_every and done % progress_every == 0:
-                print(f"  {done}/{len(files)} ({time.monotonic() - start:.0f}s)", file=out)
+        while pending or True:
+            while len(pending) < window:
+                nxt = next(queue, None)
+                if nxt is None:
+                    break
+                pending[pool.submit(_convert_one, nxt, dry_run=dry_run)] = nxt
+            if not pending:
+                break
+            finished, _ = concurrent.futures.wait(
+                pending, return_when=concurrent.futures.FIRST_COMPLETED
+            )
+            for fut in finished:
+                _record(pending.pop(fut), fut.result())
+                done += 1
+                if out is not None and progress_every and done % progress_every == 0:
+                    gc.collect()
+                    print(
+                        f"  {done}/{len(files)} ({time.monotonic() - start:.0f}s, "
+                        f"rss {_rss_mb():.0f} MB)",
+                        file=out,
+                    )
     return report
+
+
+def _rss_mb() -> float:
+    try:
+        import psutil
+
+        return psutil.Process().memory_info().rss / 1e6
+    except Exception:  # noqa: BLE001
+        return float("nan")
 
 
 def main(argv: list[str] | None = None) -> int:
