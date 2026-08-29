@@ -22,6 +22,14 @@ On-disk layout::
 Each ``.pt`` stores a dict with ``tensor`` (CHW uint8) plus ``__*`` metadata
 fields (modeltype, resolution, bucket, label, split, source_path, source_hash,
 skin_normalise, face_bbox, concept_name) enabling sourceless training.
+
+Payload format (Bitcrush ISSUE-0847 cache audit): ``tensor`` is written as a
+contiguous ``torch.Tensor`` so ``torch.save`` streams the raw storage. Older
+files hold a ``np.ndarray`` instead, which torch's default pickle protocol 2
+encoded as a latin-1 ``str`` (~1.44x larger, ~5x slower to load). Readers
+accept both via :func:`payload_tensor`; ``CACHE_VERSION`` is deliberately
+unchanged so the formats coexist — ``bittrainer.tools.convert_cache_payloads``
+upgrades legacy files in place.
 """
 
 from __future__ import annotations
@@ -59,6 +67,21 @@ _HASH_CHUNK = 65536
 _FLUSH_INTERVAL_SECONDS = 30.0
 _FLUSH_INTERVAL_ITEMS = 250
 _PROGRESS_MIN_INTERVAL = 0.25
+
+
+def payload_tensor(cached: dict) -> torch.Tensor | None:
+    """Return the CHW uint8 tensor from a loaded ``.pt`` payload, or ``None``.
+
+    Accepts both the current ``torch.Tensor`` payload (returned as-is) and the
+    legacy ``np.ndarray`` payload (wrapped zero-copy). Every reader of a cache
+    file must go through this so the two on-disk formats stay interchangeable.
+    """
+    tensor = cached.get("tensor")
+    if tensor is None:
+        return None
+    if isinstance(tensor, np.ndarray):
+        return torch.from_numpy(tensor)
+    return tensor
 
 
 def _label_to_storage(label) -> Any:
@@ -353,11 +376,9 @@ class SmartCache:
         except (OSError, RuntimeError, EOFError) as exc:
             logger.warning("SmartCache: failed to load %s: %s", pt_path, exc)
             return None
-        tensor = cached.get("tensor")
+        tensor = payload_tensor(cached)
         if tensor is None:
             return None
-        if isinstance(tensor, np.ndarray):
-            tensor = torch.from_numpy(tensor)
         metadata = {k: v for k, v in cached.items() if k != "tensor"}
         return tensor, metadata
 
@@ -914,8 +935,11 @@ class SmartCache:
         # .pt payload carries the tensor plus image-identity metadata. Usage fields
         # (label/split/concept_name) live in cache.json so dedup entries can each
         # carry their own view without rewriting the shared .pt.
+        # Store a torch.Tensor, not the ndarray: torch.save pickles ndarrays
+        # with protocol 2 (no BINBYTES -> latin-1 str -> UTF-8, ~1.44x bigger
+        # and ~5x slower to load), whereas a tensor's storage is written raw.
         payload = {
-            "tensor": arr,
+            "tensor": torch.from_numpy(np.ascontiguousarray(arr)),
             "__cache_version": CACHE_VERSION,
             "__modeltype": self.modeltype,
             "__resolution": resolution,
