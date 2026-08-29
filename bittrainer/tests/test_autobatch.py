@@ -5,9 +5,11 @@ import torch.nn as nn
 
 import bittrainer.autobatch as autobatch
 from bittrainer.autobatch import (
+    _allocator_cap_bytes,
     _apply_trust_bound,
     _linear_fit,
     _make_default_inputs,
+    _probe_budget_bytes,
     determine_batch_size,
     profile_vram_batch_size,
 )
@@ -110,3 +112,58 @@ class TestLinearFit:
     def test_degenerate_returns_none(self):
         assert _linear_fit([4], [9.0]) is None
         assert _linear_fit([4, 4], [9.0, 9.0]) is None
+
+
+class TestAllocatorCapBudget:
+    """Bitcrush ISSUE-0870: the probe must size the batch against the allocator
+    cap the host set (``set_per_process_memory_fraction``), not against "85% of
+    whatever is free" — otherwise a batch that fits the probe still walks the
+    caching allocator to the cap and OOMs (or, uncapped on Windows, spills into
+    shared RAM at PCIe speed)."""
+
+    GB = 1024 ** 3
+
+    def test_uncapped_budget_is_fraction_of_free(self):
+        budget = _probe_budget_bytes(
+            free_vram=20 * self.GB, fraction=0.85, param_overhead_bytes=self.GB,
+            cap_bytes=None, resident_bytes=0,
+        )
+        assert budget == 20 * self.GB * 0.85 - self.GB
+
+    def test_cap_below_free_wins(self):
+        # 24 GB card, 23 GB free, allocator capped at 19 GB with 1 GB of model
+        # already resident: the batch may only use 0.85 * 19 - 1 - overhead.
+        budget = _probe_budget_bytes(
+            free_vram=23 * self.GB, fraction=0.85, param_overhead_bytes=0.5 * self.GB,
+            cap_bytes=19 * self.GB, resident_bytes=1 * self.GB,
+        )
+        assert budget == 19 * self.GB * 0.85 - 1 * self.GB - 0.5 * self.GB
+        assert budget < 23 * self.GB * 0.85 - 0.5 * self.GB
+
+    def test_cap_above_free_is_inert(self):
+        budget = _probe_budget_bytes(
+            free_vram=8 * self.GB, fraction=0.85, param_overhead_bytes=0,
+            cap_bytes=19 * self.GB, resident_bytes=0,
+        )
+        assert budget == 8 * self.GB * 0.85
+
+    def test_no_cap_when_fraction_unset(self, monkeypatch):
+        monkeypatch.setattr(
+            torch.cuda, "get_per_process_memory_fraction", lambda device: 1.0, raising=False
+        )
+        assert _allocator_cap_bytes(torch.device("cpu"), 24 * self.GB) is None
+
+    def test_cap_reads_allocator_fraction(self, monkeypatch):
+        monkeypatch.setattr(
+            torch.cuda, "get_per_process_memory_fraction", lambda device: 0.5, raising=False
+        )
+        assert _allocator_cap_bytes(torch.device("cpu"), 24 * self.GB) == 12 * self.GB
+
+    def test_cap_getter_missing_or_broken_is_none(self, monkeypatch):
+        def boom(device):
+            raise RuntimeError("no cuda")
+
+        monkeypatch.setattr(torch.cuda, "get_per_process_memory_fraction", boom, raising=False)
+        assert _allocator_cap_bytes(torch.device("cpu"), 24 * self.GB) is None
+        monkeypatch.delattr(torch.cuda, "get_per_process_memory_fraction", raising=False)
+        assert _allocator_cap_bytes(torch.device("cpu"), 24 * self.GB) is None

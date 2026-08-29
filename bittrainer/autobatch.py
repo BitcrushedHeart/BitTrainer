@@ -8,6 +8,13 @@ within a fraction of free VRAM. The large batch is solved for, never allocated,
 so the probe can't trip NVIDIA's Windows sysmem-fallback stall and runs in
 seconds on any card. Extrapolation is trusted up to 2x the largest rung that
 actually fit; the only data-derived cap is the total training-set size.
+
+When the host has capped the caching allocator (``torch.cuda.
+set_per_process_memory_fraction``, which Bitcrush Engine sets to the user's
+VRAM target minus the CUDA baseline — ISSUE-0870), the budget is also bounded
+by that cap: ``fraction`` of the cap, minus what is already resident, minus the
+optimizer overhead. Without it a batch that fit the free-VRAM budget still
+walked the allocator to its cap and OOMed mid-run.
 """
 
 from __future__ import annotations
@@ -53,6 +60,41 @@ def _apply_trust_bound(vram_limit: int, max_fitted_rung: int, oomed: bool) -> tu
     """
     trust_cap = max_fitted_rung if oomed else 2 * max_fitted_rung
     return min(vram_limit, trust_cap), trust_cap
+
+
+def _allocator_cap_bytes(device: torch.device, total_vram: int) -> int | None:
+    """Bytes the caching allocator may reserve on ``device``, or None if uncapped.
+
+    Reads the per-process fraction the host set. A fraction of 1.0 (torch's
+    default), a missing getter (older torch) or any error means "no cap".
+    """
+    getter = getattr(torch.cuda, "get_per_process_memory_fraction", None)
+    if getter is None:
+        return None
+    try:
+        fraction = float(getter(device))
+    except Exception:
+        return None
+    if not (0.0 < fraction < 1.0):
+        return None
+    return int(total_vram * fraction)
+
+
+def _probe_budget_bytes(
+    *,
+    free_vram: int,
+    fraction: float,
+    param_overhead_bytes: int,
+    cap_bytes: int | None,
+    resident_bytes: int,
+) -> float:
+    """Incremental bytes the batch may add: ``fraction`` of free VRAM, further
+    bounded by ``fraction`` of the allocator cap net of what is already
+    resident (the model); both net of the deferred optimizer/EMA overhead."""
+    budget = free_vram * fraction - param_overhead_bytes
+    if cap_bytes is not None:
+        budget = min(budget, cap_bytes * fraction - resident_bytes - param_overhead_bytes)
+    return budget
 
 
 def _linear_fit(xs: list[int], ys: list[float]) -> tuple[float, float] | None:
@@ -103,10 +145,13 @@ def profile_vram_batch_size(
         return {
             "vram_limit": 32, "max_fitted_rung": None, "trust_cap": None,
             "fit_slope": None, "fit_intercept": None, "predicted_fraction": None,
+            "allocator_cap_bytes": None,
         }
 
     torch.cuda.empty_cache()
     free_vram, total_vram = torch.cuda.mem_get_info(device)
+    cap_bytes = _allocator_cap_bytes(device, total_vram)
+    resident_bytes = torch.cuda.memory_allocated(device)
 
     ladder = _PROBE_LADDER_BIG if total_vram >= _BIG_CARD_BYTES else _PROBE_LADDER
     if max_batch is not None:
@@ -167,7 +212,10 @@ def profile_vram_batch_size(
     model.train(was_training)
 
     fit = _linear_fit(xs, ys)
-    budget = free_vram * fraction - param_overhead_bytes
+    budget = _probe_budget_bytes(
+        free_vram=free_vram, fraction=fraction, param_overhead_bytes=param_overhead_bytes,
+        cap_bytes=cap_bytes, resident_bytes=resident_bytes,
+    )
     if fit is None or fit[0] <= 0 or budget <= 0:
         logger.warning(
             "VRAM probe: degenerate fit (%d valid points, budget=%.2f GB) — falling back to batch %d",
@@ -180,6 +228,7 @@ def profile_vram_batch_size(
             "fit_slope": fit[0] if fit else None,
             "fit_intercept": fit[1] if fit else None,
             "predicted_fraction": None,
+            "allocator_cap_bytes": cap_bytes,
         }
 
     slope, intercept = fit
@@ -192,10 +241,12 @@ def profile_vram_batch_size(
     predicted_fraction = (predicted + used_now) / total_vram
 
     logger.info(
-        "VRAM probe: batch=%d at %.1f GB free / %.1f GB total "
-        "(slope=%.1f MB/img, intercept=%.2f GB, overhead=%.2f GB, ~%.0f%% of total)",
+        "VRAM probe: batch=%d at %.1f GB free / %.1f GB total, allocator cap %s "
+        "(slope=%.1f MB/img, intercept=%.2f GB, resident=%.2f GB, overhead=%.2f GB, "
+        "~%.0f%% of total)",
         vram_limit, free_vram / 1e9, total_vram / 1e9,
-        slope / 1e6, intercept / 1e9, param_overhead_bytes / 1e9,
+        "none" if cap_bytes is None else f"{cap_bytes / 1e9:.2f} GB",
+        slope / 1e6, intercept / 1e9, resident_bytes / 1e9, param_overhead_bytes / 1e9,
         predicted_fraction * 100,
     )
     return {
@@ -205,6 +256,7 @@ def profile_vram_batch_size(
         "fit_slope": slope,
         "fit_intercept": intercept,
         "predicted_fraction": predicted_fraction,
+        "allocator_cap_bytes": cap_bytes,
     }
 
 
@@ -289,4 +341,8 @@ def determine_batch_size(
         "fit_slope": probe["fit_slope"],
         "fit_intercept": probe["fit_intercept"],
         "predicted_fraction": probe["predicted_fraction"],
+        "allocator_cap_gb": (
+            None if probe.get("allocator_cap_bytes") is None
+            else probe["allocator_cap_bytes"] / 1e9
+        ),
     }
