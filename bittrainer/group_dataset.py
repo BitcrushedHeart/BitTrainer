@@ -98,6 +98,7 @@ class GroupDataset(Dataset):
         extra_paths: dict[str, list[str]] | None = None,
         natural_sampling: bool = False,
         train_resolution: int = DEFAULT_TRAIN_RESOLUTION,
+        forensic: Any | None = None,        # ForensicAugment instance
     ):
         self.group_folder = Path(group_folder)
         self.class_names = class_names
@@ -132,6 +133,16 @@ class GroupDataset(Dataset):
         self.skin_tone_views = None
         self.skin_tone_view_prob = 0.0
         self.skin_tone_force_view = False
+        # Forensic augmentation (blur -> noise -> JPEG) runs HERE, in the
+        # DataLoader worker, not on the trainer's main thread (ISSUE-0861).
+        # Train split only: val must stay clean, and the SmartCache is filled
+        # by cache_builders.build_image_tensor via SmartCache.prepare — never
+        # through __getitem__ — so cached tensors stay unaugmented.
+        self._forensic = (
+            forensic
+            if (forensic is not None and split == "train" and forensic.is_active)
+            else None
+        )
 
         if sourceless:
             self._init_sourceless()
@@ -464,6 +475,7 @@ class GroupDataset(Dataset):
                 tensor, _ = result
                 if tuple(tensor.shape[-2:]) == (bh, bw):
                     tensor = self._maybe_skin_tone_view(tensor, sample)
+                    tensor = self._maybe_forensic(tensor)
                     return tensor, sample["label"], tuple(bucket)
                 # Cached tensor was built under a different aspect-ratio bucket
                 # table (e.g. a prior training resolution). Its size no longer
@@ -490,7 +502,15 @@ class GroupDataset(Dataset):
             return self.transform(pil_img), sample["label"], tuple(bucket)
 
         img_tensor = self._maybe_skin_tone_view(img_tensor, sample)
+        img_tensor = self._maybe_forensic(img_tensor)
         return img_tensor, sample["label"], tuple(bucket)
+
+    def _maybe_forensic(self, tensor: torch.Tensor) -> torch.Tensor:
+        """Worker-side forensic chain — identity unless an active
+        :class:`~bittrainer.forensic_augment.ForensicAugment` is attached."""
+        if self._forensic is None:
+            return tensor
+        return self._forensic(tensor)
 
     def _maybe_skin_tone_view(self, tensor: torch.Tensor, sample: dict) -> torch.Tensor:
         """Skin Tone V2 dual-view hook — identity unless a view bank is

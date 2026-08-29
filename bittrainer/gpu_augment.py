@@ -157,12 +157,14 @@ def gpu_gaussian_blur(
         return batch
     from torchvision.transforms.v2 import functional as TVF
 
-    mask = torch.rand(batch.shape[0], device=batch.device) < p
-    if not bool(mask.any()):
+    # One host sync for the whole selection (``nonzero`` + a single ``tolist``)
+    # instead of a ``bool(mask[i])`` sync per sample.
+    idx = torch.nonzero(
+        torch.rand(batch.shape[0], device=batch.device) < p, as_tuple=False
+    ).flatten().tolist()
+    if not idx:
         return batch
-    for i in range(batch.shape[0]):
-        if not bool(mask[i]):
-            continue
+    for i in idx:
         sigma = float(torch.empty(1).uniform_(0.1, max(0.1, sigma_max)).item())
         k = 2 * int(math.ceil(3.0 * sigma)) + 1
         batch[i] = TVF.gaussian_blur(batch[i], kernel_size=[k, k], sigma=[sigma, sigma])
@@ -204,8 +206,9 @@ def gpu_jpeg_roundtrip(
         return batch
     from torchvision.io import decode_jpeg, encode_jpeg
 
-    mask = torch.rand(batch.shape[0], device=batch.device) < p
-    idx = [i for i in range(batch.shape[0]) if bool(mask[i])]
+    idx = torch.nonzero(
+        torch.rand(batch.shape[0], device=batch.device) < p, as_tuple=False
+    ).flatten().tolist()
     if not idx:
         return batch
     q_lo, q_hi = int(quality[0]), int(quality[1])
@@ -264,6 +267,13 @@ def apply_train_augment(
     Bernoulli per sample. They exist so a realism ranker cannot learn
     "high-frequency noise" or "JPEG artifact" as a stand-in for "photograph" —
     both classes see the same augmentation.
+
+    Group training no longer uses those knobs here: the same chain runs per
+    sample in the DataLoader workers via
+    :class:`bittrainer.forensic_augment.ForensicAugment`, because the JPEG leg
+    is a CPU codec and encoding it on the trainer's main thread starved the
+    GPU (Bitcrush ISSUE-0861). The GPU implementations stay for other callers
+    and for A/B parity; passing both would double-augment.
     """
     if randaugment_m > 0 and randaugment_n > 0:
         batch = gpu_randaugment(

@@ -15,6 +15,7 @@ from adv_optm import Prodigy_adv
 from torch.utils.data import DataLoader
 
 from bittrainer.ema import ModelEMA
+from bittrainer.forensic_augment import forensic_from_config
 from bittrainer.group_dataset import GroupDataset
 from bittrainer.dynamic_class_weights import DynamicClassWeightController
 from bittrainer.losses import AsymmetricLoss, FocalLoss
@@ -893,6 +894,10 @@ def _train_one_epoch(
             from bittrainer.spatial import spatial_hflip_batch
 
             images, labels = spatial_hflip_batch(images, labels, spatial_flip_map)
+        # NOTE: the forensic chain (blur/noise/JPEG) is NOT applied here — it
+        # runs per sample in the DataLoader workers via GroupDataset's
+        # ForensicAugment (ISSUE-0861). Encoding JPEG on this thread stalled
+        # the GPU between fetch and forward.
         images = apply_train_augment(
             images,
             dtype=dtype,
@@ -904,12 +909,6 @@ def _train_one_epoch(
             photometric_only=(
                 spatial_flip_map is not None or config.randaugment_photometric_only
             ),
-            noise_p=config.aug_noise_p,
-            noise_std=config.aug_noise_std,
-            blur_p=config.aug_blur_p,
-            blur_sigma_max=config.aug_blur_sigma_max,
-            jpeg_p=config.aug_jpeg_p,
-            jpeg_quality=(config.aug_jpeg_quality_min, config.aug_jpeg_quality_max),
         )
 
         # MixUp/CutMix: smooth targets first (preserving ordinal/label smoothing),
@@ -1086,6 +1085,11 @@ def _prepare_datasets_and_cache(
         _resolve_none_index(config.class_names),
     )
 
+    # Forensic augmentation runs in the DataLoader workers on the TRAIN split
+    # only (ISSUE-0861). Inactive (all probabilities 0) unless the group opts
+    # in, and never handed to the val dataset.
+    forensic = forensic_from_config(config)
+
     if config.sourceless:
         if smart_cache is None:
             raise RuntimeError(
@@ -1110,6 +1114,7 @@ def _prepare_datasets_and_cache(
             group_name=group_name,
             oversample_none=initial_oversample_none,
             extra_paths=config.extra_paths_train,
+            forensic=forensic,
         )
         val_ds = GroupDataset(
             group_folder,
@@ -1132,6 +1137,7 @@ def _prepare_datasets_and_cache(
             oversample_none=initial_oversample_none,
             extra_paths=config.extra_paths_train,
             train_resolution=config.train_resolution,
+            forensic=forensic,
         )
         val_ds = GroupDataset(
             group_folder,
