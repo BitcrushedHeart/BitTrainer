@@ -213,15 +213,17 @@ def gpu_jpeg_roundtrip(
         q_lo, q_hi = q_hi, q_lo
     qualities = [int(torch.randint(q_lo, q_hi + 1, (1,)).item()) for _ in idx]
 
-    imgs = [batch[i] for i in idx]
+    # Encode on CPU: the batched ``decode_jpeg(list, device=cuda)`` path
+    # requires CPU-resident encoded bytes (torchvision raises ValueError
+    # "Input list must contain tensors on CPU" otherwise — which is exactly
+    # what a CUDA-encoded list produced in the first live run, Bitcrush
+    # ISSUE-0847). Decoding lands on the batch's device.
+    imgs = [batch[i].cpu() for i in idx]
+    encoded = [encode_jpeg(img, quality=q) for img, q in zip(imgs, qualities)]
     try:
-        encoded = [encode_jpeg(img, quality=q) for img, q in zip(imgs, qualities)]
         decoded = decode_jpeg(encoded, device=batch.device)
-    except (RuntimeError, TypeError, NotImplementedError):
-        decoded = []
-        for img, q in zip(imgs, qualities):
-            cpu_img = img.cpu()
-            decoded.append(decode_jpeg(encode_jpeg(cpu_img, quality=q)).to(batch.device))
+    except Exception:  # noqa: BLE001 — any device-path failure falls back to CPU decode
+        decoded = [decode_jpeg(e).to(batch.device) for e in encoded]
     for i, out in zip(idx, decoded):
         batch[i] = out
     return batch

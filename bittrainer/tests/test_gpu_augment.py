@@ -302,3 +302,28 @@ class TestGroupTrainConfigForensicDefaults:
         assert cfg.aug_jpeg_p == 0.0
         assert cfg.aug_jpeg_quality_min == 50
         assert cfg.aug_jpeg_quality_max == 95
+
+
+class TestJpegDevicePath:
+    def test_encoded_list_is_cpu_resident_and_device_failure_falls_back(self, monkeypatch):
+        """Bitcrush ISSUE-0847 live failure: encoding on CUDA fed CUDA tensors to
+        the batched decode, which raises ValueError (not RuntimeError), and the
+        fallback never ran. Encoded bytes must be CPU tensors, and ANY failure of
+        the device decode must fall back to per-sample CPU decode."""
+        import bittrainer.gpu_augment as ga
+        from torchvision.io import decode_jpeg as real_decode
+
+        seen = {}
+
+        def fake_decode(x, device=None, **kw):
+            if device is not None:
+                seen["devices"] = [t.device.type for t in x]
+                raise ValueError("Input list must contain tensors on CPU.")
+            return real_decode(x, **kw)
+
+        monkeypatch.setattr("torchvision.io.decode_jpeg", fake_decode)
+        monkeypatch.setattr(ga, "decode_jpeg", fake_decode, raising=False)
+        batch = torch.randint(0, 256, (3, 3, 32, 32), dtype=torch.uint8)
+        out = ga.gpu_jpeg_roundtrip(batch.clone(), p=1.0, quality=(60, 60))
+        assert out.shape == batch.shape and out.dtype == torch.uint8
+        assert seen["devices"] and set(seen["devices"]) == {"cpu"}
