@@ -30,7 +30,7 @@ from bittrainer.backbone_init import apply_backbone_init, wants_timm_pretrained
 from bittrainer.dataset import get_train_transform, get_val_transform
 from bittrainer.generic.optimizer import make_optimizer
 from bittrainer.generic.task import BestTracker, LoopSpec, ResumeInfo, TaskContext, TrainingTask
-from bittrainer.group_dataset import GroupDataset
+from bittrainer.group_dataset import EpochIndexSampler, GroupDataset
 from bittrainer.multihead_losses import (
     BandConsistencyLoss,
     BandOrdinalSoftLabelLoss,
@@ -255,8 +255,11 @@ class MultiHeadTask(TrainingTask):
         # build once, on the first epoch of the run.
         if self._train_loader is None:
             lk = loader_kwargs(config.dataloader_workers, pin_memory=(ctx.device.type == "cuda"))
+            # Walk the epoch schedule (replication included) rather than
+            # shuffle=True over the de-replicated base list (ISSUE-0859).
             self._train_loader = DataLoader(
-                self.train_ds, batch_size=eff_bs, shuffle=True, collate_fn=mh._collate, **lk,
+                self.train_ds, batch_size=eff_bs,
+                sampler=EpochIndexSampler(self.train_ds), collate_fn=mh._collate, **lk,
             )
             self._val_loader = DataLoader(
                 self.val_ds, batch_size=eff_bs, shuffle=False, collate_fn=mh._collate, **lk,

@@ -29,7 +29,11 @@ import torch
 from PIL import Image
 from torch.utils.data import DataLoader
 
-from bittrainer.group_dataset import GroupDataset, build_group_bucket_sampler
+from bittrainer.group_dataset import (
+    EpochIndexSampler,
+    GroupDataset,
+    build_group_bucket_sampler,
+)
 from bittrainer.training_state import SCHEDULE_INDEXING, _FixedBatchSampler
 
 
@@ -111,6 +115,32 @@ class TestSizeMemo:
 # ---------------------------------------------------------------------------
 # Stable base list + epoch schedule
 # ---------------------------------------------------------------------------
+
+
+class TestEpochIndexSampler:
+    """Plain loaders (multihead task) must keep replication + a fresh order."""
+
+    def test_walks_the_replicated_schedule_and_reshuffles_per_iter(self, tmp_path):
+        root = tmp_path / "g"
+        _build_group(root, {"a": 2, "b": 8})
+        random.seed(0)
+        ds = GroupDataset(root, ["a", "b"], split="train", group_name="g")
+        sampler = EpochIndexSampler(ds)
+        first = list(sampler)
+        second = list(sampler)
+        assert len(sampler) == len(ds.epoch_indices()) > len(ds)
+        assert Counter(first) == Counter(ds.epoch_indices())
+        assert first != second  # re-shuffled on every __iter__
+        assert Counter(second) == Counter(first)
+
+    def test_multihead_loader_sees_replication(self, tmp_path):
+        root = tmp_path / "g"
+        _build_group(root, {"a": 2, "b": 8})
+        random.seed(0)
+        ds = GroupDataset(root, ["a", "b"], split="train", group_name="g")
+        loader = DataLoader(ds, batch_size=4, sampler=EpochIndexSampler(ds), num_workers=0)
+        seen = sum(int(lbls.numel()) for _imgs, lbls, _b in loader)
+        assert seen == len(ds.epoch_indices())
 
 
 class TestStableBaseList:

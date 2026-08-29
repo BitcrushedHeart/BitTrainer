@@ -665,6 +665,35 @@ class GroupBucketBatchSampler(Sampler):
         return sum(math.ceil(c / self.batch_size) for c in bucket_counts.values())
 
 
+class EpochIndexSampler(Sampler):
+    """Plain (non-bucketed) sampler over the dataset's CURRENT epoch schedule.
+
+    For loaders that used ``DataLoader(dataset, shuffle=True)``: since
+    ISSUE-0859 ``samples`` is the de-replicated base list, so ``shuffle=True``
+    (which walks ``range(len(dataset))``) would drop the oversample cap / rare-
+    group ``__none__`` replication. This walks ``epoch_indices()`` (replication
+    included), re-read and re-shuffled on every ``__iter__`` so a loader built
+    once per run still sees a fresh order each epoch.
+    """
+
+    def __init__(self, dataset: GroupDataset):
+        self.dataset = dataset
+
+    def _indices(self) -> list[int]:
+        fn = getattr(self.dataset, "epoch_indices", None)
+        if callable(fn):
+            return list(fn())
+        return list(range(len(self.dataset.samples)))
+
+    def __iter__(self):
+        indices = self._indices()
+        random.shuffle(indices)
+        yield from indices
+
+    def __len__(self):
+        return len(self._indices())
+
+
 def build_group_bucket_sampler(
     dataset: GroupDataset, batch_size: int
 ) -> GroupBucketBatchSampler:
