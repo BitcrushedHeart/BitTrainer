@@ -407,6 +407,20 @@ class GroupTrainConfig:
     channels_last: bool = True
     # Gradient accumulation escape hatch: optimizer steps every N batches.
     grad_accum_steps: int = 1
+    # Fused back pass (Bitcrush ISSUE-0862): run the optimizer's per-parameter
+    # update from a post-accumulate-grad hook so it overlaps the rest of
+    # backward() instead of running as a separate serial phase (29.6 % of the
+    # trainer main thread on a live pico fine-tune profile). Requires an
+    # optimizer advertising ``supports_fused_back_pass`` (Prodigy_adv does) and
+    # ``grad_accum_steps == 1``; otherwise the loop logs a reason and falls back.
+    #
+    # TRADE-OFF: a hook only ever sees ONE tensor, so fused mode clips
+    # per-tensor rather than on the global norm. Each tensor's norm is <= the
+    # global norm, so per-tensor clipping NEVER clips more than global clipping:
+    # whenever the global norm <= clip_grad_norm the two are identical, and when
+    # it exceeds, fused mode clips LESS (a strictly weaker guard). Set False to
+    # force the exact global-norm path back.
+    fused_back_pass: bool = True
     # --- Backup / Pause / Resume (Bitcrush ISSUE-0405) ---
     # backup_dir=None => NO backups written and NO resume attempted (exact
     # legacy behaviour). backup_every_steps=0 => epoch-boundary backups only.
@@ -791,6 +805,163 @@ class _SWA:
 
 
 # ---------------------------------------------------------------------------
+# Fused back pass (Bitcrush ISSUE-0862)
+# ---------------------------------------------------------------------------
+#
+# ``Prodigy_adv.step()`` is ``for group: for i, p: step_parameter(p, group, i)``
+# followed by ``calculate_d(); init_step()`` — a Python loop over every
+# parameter tensor issuing tiny kernels while the GPU sits idle, plus a
+# ``.item()`` per layer (Kourkoutas-β) and two in ``calculate_d``, each of which
+# drains the CUDA queue. The optimizer advertises ``supports_fused_back_pass``,
+# so ``step_parameter`` may instead be called for each parameter the moment its
+# gradient finishes accumulating — from a post-accumulate-grad hook, i.e. inside
+# ``backward()``. The per-parameter work then overlaps the remaining backward
+# and the separate optimizer phase disappears.
+#
+# ORDERING. Hooks fire in BACKWARD order (the reverse of ``step()``'s forward
+# walk over ``param_groups``). That is safe because nothing in a Prodigy step is
+# order-dependent:
+#   * ``step_parameter`` reads ``group['d']`` / ``dlr``, which ``init_step()``
+#     (called by the constructor and by ``load_state_dict``, so already primed
+#     before the first backward of a run) and ``calculate_d()`` prepare BETWEEN
+#     steps — never during one.
+#   * Prodigy's ``d_numerator`` / ``d_denom`` are pure ``add_`` accumulators
+#     consumed only by ``calculate_d()`` after the last parameter.
+#   * Kourkoutas' ``maybe_prepare_step`` is guarded on the per-parameter step
+#     counter, which is equal across parameters within a step, so whichever
+#     parameter arrives first runs ``prepare_step`` for the whole model; its
+#     ``sum_sq_accumulator`` is likewise an order-independent sum consumed by
+#     the NEXT step. (``prepare_step`` takes the device of the first-arriving
+#     parameter — identical on single-device training, which is all this trainer
+#     supports.)
+# Only floating-point summation order differs, so fused and standard results
+# agree to fp32 round-off rather than bit-exactly.
+#
+# COMPILE. The model may be regionally ``torch.compile``d (``bittrainer.runtime``
+# compiles individual ConvNeXt blocks in place via ``nn.Module.compile``). The
+# assumption here is that aot_autograd still routes the accumulated gradient
+# through the leaf ``AccumulateGrad`` node, so post-accumulate-grad hooks on
+# leaf parameters fire exactly once per backward. UNVERIFIED on GPU (this test
+# suite is CPU-only); ``fused_back_pass=False`` restores the old path if not.
+
+
+def _fused_back_pass_plan(
+    optimizer: torch.optim.Optimizer, config: GroupTrainConfig
+) -> tuple[bool, str]:
+    """Decide whether this epoch runs the optimizer inside ``backward()``.
+
+    Returns ``(enabled, reason)``; ``reason`` is the human-readable "why" the
+    loop reports once per run.
+    """
+    if not getattr(config, "fused_back_pass", True):
+        return False, "fused back pass disabled by config (exact global-norm clipping)"
+    if not getattr(optimizer, "supports_fused_back_pass", False):
+        return (
+            False,
+            f"{type(optimizer).__name__} does not support a fused back pass",
+        )
+    missing = [
+        name
+        for name in ("step_parameter", "calculate_d", "init_step")
+        if not callable(getattr(optimizer, name, None))
+    ]
+    if missing:
+        return False, f"{type(optimizer).__name__} has no {'/'.join(missing)}"
+    accum = max(1, int(config.grad_accum_steps))
+    if accum > 1:
+        return (
+            False,
+            f"gradient accumulation ({accum} batches per step) cannot fuse — a hook "
+            "fires per batch, never on the summed window",
+        )
+    return True, "fused back pass"
+
+
+def _fused_step_hook(
+    optimizer: torch.optim.Optimizer,
+    group: dict,
+    index: int,
+    max_norm: float,
+    param: torch.Tensor,
+) -> None:
+    """Clip, step and free ONE parameter, from inside ``backward()``.
+
+    ``group`` / ``index`` are this parameter's own entry in
+    ``optimizer.param_groups`` — the ``{p: (group, i)}`` mapping materialised
+    into the closure at registration time, so the hook does no lookup and passes
+    ``step_parameter`` exactly the arguments ``step()`` would have.
+
+    Clipping is PER TENSOR: a hook sees one gradient, never the global norm.
+    See ``GroupTrainConfig.fused_back_pass`` for why that is a strictly weaker
+    (never stronger) guard than ``clip_gradients``.
+    """
+    if max_norm > 0.0:
+        torch.nn.utils.clip_grad_norm_([param], max_norm)
+    optimizer.step_parameter(param, group, index)
+    # The hooks own gradient lifetime in fused mode; the loop never calls
+    # optimizer.zero_grad() at a step boundary.
+    param.grad = None
+
+
+def _register_fused_hooks(
+    optimizer: torch.optim.Optimizer, clip_grad_norm: float | None
+) -> list:
+    """Register one post-accumulate-grad hook per trainable optimizer parameter.
+
+    Returns the handles; the caller MUST remove them at the end of the epoch (a
+    leaked handle would step a second time on the next epoch's backward).
+    """
+    max_norm = (
+        float(clip_grad_norm) if clip_grad_norm and float(clip_grad_norm) > 0 else 0.0
+    )
+    handles: list = []
+    for group in optimizer.param_groups:
+        for index, param in enumerate(group["params"]):
+            if not param.requires_grad:
+                continue
+            handles.append(
+                param.register_post_accumulate_grad_hook(
+                    partial(_fused_step_hook, optimizer, group, index, max_norm)
+                )
+            )
+    return handles
+
+
+_BACK_PASS_ANNOUNCED = "_bittrainer_back_pass_announced"
+
+
+def _announce_back_pass_mode(
+    optimizer: torch.optim.Optimizer,
+    config: GroupTrainConfig,
+    fused: bool,
+    reason: str,
+) -> None:
+    """Log which optimizer-step mode is live, and surface it ONCE per run.
+
+    ``_train_one_epoch`` runs once per epoch, so the progress message is stamped
+    onto the optimizer (which lives for the whole run) rather than emitted every
+    epoch. The log line is per-epoch and cheap.
+    """
+    if fused:
+        text = (
+            "Fused back pass ON — optimizer steps inside backward() "
+            "(gradients clipped per tensor)"
+        )
+    else:
+        text = f"Fused back pass OFF — {reason}"
+    logger.info("%s", text)
+    if getattr(optimizer, _BACK_PASS_ANNOUNCED, False):
+        return
+    try:
+        setattr(optimizer, _BACK_PASS_ANNOUNCED, True)
+    except AttributeError:  # pragma: no cover - exotic optimizer with __slots__
+        pass
+    cb = config.progress_callback
+    if cb is not None:
+        cb({"type": "training_progress", "stage": "training", "status_text": text})
+
+
+# ---------------------------------------------------------------------------
 # Training loop
 # ---------------------------------------------------------------------------
 
@@ -878,132 +1049,156 @@ def _train_one_epoch(
         )
 
     memory_format = torch.channels_last if config.channels_last else None
+    fused, fused_reason = _fused_back_pass_plan(optimizer, config)
+    _announce_back_pass_mode(optimizer, config, fused, fused_reason)
+
+    # Clears anything a previous phase left behind. In fused mode this is the
+    # ONLY zero_grad of the epoch: the hooks free each gradient as they consume
+    # it, so there is never an accumulated set to clear at a step boundary.
     optimizer.zero_grad()
-    for images, labels in dataloader:
-        if stop_now_event is not None and stop_now_event.is_set():
-            break
-        # Pause between clean boundaries (accum==1 only, where every top-of-loop
-        # is a boundary): the boundary_hook below owns the pause save at true
-        # gradient-accumulation boundaries, so this is a secondary early-out when
-        # no boundary_hook is wired.
-        if boundary_hook is None and pause_event is not None and pause_event.is_set():
-            break
-        images = images.to(device, non_blocking=True)
-        labels = labels.to(device)
-        if spatial_flip_map is not None:
-            from bittrainer.spatial import spatial_hflip_batch
+    fused_hooks = _register_fused_hooks(optimizer, config.clip_grad_norm) if fused else []
+    try:
+        for images, labels in dataloader:
+            if stop_now_event is not None and stop_now_event.is_set():
+                break
+            # Pause between clean boundaries (accum==1 only, where every top-of-loop
+            # is a boundary): the boundary_hook below owns the pause save at true
+            # gradient-accumulation boundaries, so this is a secondary early-out when
+            # no boundary_hook is wired.
+            if boundary_hook is None and pause_event is not None and pause_event.is_set():
+                break
+            images = images.to(device, non_blocking=True)
+            labels = labels.to(device)
+            if spatial_flip_map is not None:
+                from bittrainer.spatial import spatial_hflip_batch
 
-            images, labels = spatial_hflip_batch(images, labels, spatial_flip_map)
-        # NOTE: the forensic chain (blur/noise/JPEG) is NOT applied here — it
-        # runs per sample in the DataLoader workers via GroupDataset's
-        # ForensicAugment (ISSUE-0861). Encoding JPEG on this thread stalled
-        # the GPU between fetch and forward.
-        images = apply_train_augment(
-            images,
-            dtype=dtype,
-            randaugment_n=config.randaugment_n,
-            randaugment_m=config.randaugment_m,
-            random_erasing_p=config.random_erasing_p,
-            memory_format=memory_format,
-            hflip=spatial_flip_map is None,
-            photometric_only=(
-                spatial_flip_map is not None or config.randaugment_photometric_only
-            ),
-        )
-
-        # MixUp/CutMix: smooth targets first (preserving ordinal/label smoothing),
-        # then interpolate, so mixing composes with the soft-target loss.
-        mix_soft = None
-        if mixup_enabled and torch.rand(1).item() < config.mixup_prob:
-            mix_soft = _build_soft_targets(
-                labels,
-                config.num_classes,
-                ordinal=config.ordinal,
-                ordinal_sigma=config.ordinal_sigma,
-                label_smoothing=config.label_smoothing,
-                soft_aliases=config.soft_aliases or None,
-                none_index=none_index,
-                device=device,
-                perceptual_kernel=_build_perceptual_kernel(
-                    list(config.class_names),
-                    config.class_similarity_centroids or {},
-                    config.perceptual_sigma,
-                    none_index=none_index,
+                images, labels = spatial_hflip_batch(images, labels, spatial_flip_map)
+            # NOTE: the forensic chain (blur/noise/JPEG) is NOT applied here — it
+            # runs per sample in the DataLoader workers via GroupDataset's
+            # ForensicAugment (ISSUE-0861). Encoding JPEG on this thread stalled
+            # the GPU between fetch and forward.
+            images = apply_train_augment(
+                images,
+                dtype=dtype,
+                randaugment_n=config.randaugment_n,
+                randaugment_m=config.randaugment_m,
+                random_erasing_p=config.random_erasing_p,
+                memory_format=memory_format,
+                hflip=spatial_flip_map is None,
+                photometric_only=(
+                    spatial_flip_map is not None or config.randaugment_photometric_only
                 ),
             )
-            images, mix_soft = apply_mixing(
-                images,
-                mix_soft,
-                config.num_classes,
-                mixup_alpha=config.mixup_alpha,
-                cutmix_alpha=config.cutmix_alpha,
-                label_smoothing=0.0,
-            )
 
-        with torch.amp.autocast(
-            device_type=device.type, dtype=dtype, enabled=(dtype != torch.float32)
-        ):
-            logits = model(images)
-            if mix_soft is not None:
-                loss = _soft_ce_loss(
-                    torch.log_softmax(logits.float(), dim=1),
+            # MixUp/CutMix: smooth targets first (preserving ordinal/label smoothing),
+            # then interpolate, so mixing composes with the soft-target loss.
+            mix_soft = None
+            if mixup_enabled and torch.rand(1).item() < config.mixup_prob:
+                mix_soft = _build_soft_targets(
+                    labels,
+                    config.num_classes,
+                    ordinal=config.ordinal,
+                    ordinal_sigma=config.ordinal_sigma,
+                    label_smoothing=config.label_smoothing,
+                    soft_aliases=config.soft_aliases or None,
+                    none_index=none_index,
+                    device=device,
+                    perceptual_kernel=_build_perceptual_kernel(
+                        list(config.class_names),
+                        config.class_similarity_centroids or {},
+                        config.perceptual_sigma,
+                        none_index=none_index,
+                    ),
+                )
+                images, mix_soft = apply_mixing(
+                    images,
                     mix_soft,
-                    class_weights=class_weights,
-                    focal_gamma=focal_gamma,
+                    config.num_classes,
+                    mixup_alpha=config.mixup_alpha,
+                    cutmix_alpha=config.cutmix_alpha,
+                    label_smoothing=0.0,
                 )
-            else:
-                loss = loss_fn(logits, labels)
 
-        scaled = loss / accum if accum > 1 else loss
-        scaled.backward()
-        num_batches += 1
-        ran += 1
-        boundary_signal = None
-        if num_batches % accum == 0 or num_batches == total_steps:
-            # Clip on the SUMMED gradients at the real accumulation boundary (never
-            # mid-window, where the grads are only half-accumulated). Called through
-            # the module global so tests can monkeypatch the seam.
-            if config.clip_grad_norm and config.clip_grad_norm > 0:
-                clip_gradients(model, config.clip_grad_norm)
-            optimizer.step()
-            optimizer.zero_grad()
-            if ema is not None:
-                ema.update(model)
-            # Backups fire ONLY here — at a real gradient-accumulation boundary,
-            # with no in-flight grads — so a restored optimizer state is coherent.
-            if boundary_hook is not None:
-                boundary_signal = boundary_hook(num_batches)
-
-        total_loss += loss.item()
-
-        # Per-class train-loss telemetry — hard-label CE, diagnostic only, no
-        # grad. Skipped for MixUp batches where `labels` no longer matches the
-        # optimised (interpolated soft) target.
-        if mix_soft is None:
-            with torch.no_grad():
-                per_ex = nn.functional.cross_entropy(
-                    logits.float(), labels.long(), reduction="none"
-                )
-            per_class_loss_sum.index_add_(0, labels.long(), per_ex)
-            per_class_loss_count.index_add_(0, labels.long(), torch.ones_like(per_ex))
-            if sample_loss_sink is not None:
-                # ``num_batches`` was already advanced for this batch.
-                sample_loss_sink(num_batches - 1, per_ex.detach().cpu())
-
-        if step_callback is not None:
-            now = time.monotonic()
-            if (
-                now - _last_report >= _STEP_REPORT_INTERVAL
-                or num_batches == total_steps
+            with torch.amp.autocast(
+                device_type=device.type, dtype=dtype, enabled=(dtype != torch.float32)
             ):
-                _last_report = now
-                step_callback(num_batches, total_steps, total_loss / max(ran, 1))
+                logits = model(images)
+                if mix_soft is not None:
+                    loss = _soft_ce_loss(
+                        torch.log_softmax(logits.float(), dim=1),
+                        mix_soft,
+                        class_weights=class_weights,
+                        focal_gamma=focal_gamma,
+                    )
+                else:
+                    loss = loss_fn(logits, labels)
 
-        # Pause requested at this boundary: the boundary_hook already saved the
-        # backup; stop consuming batches.
-        if boundary_signal == "stop":
-            break
+            scaled = loss / accum if accum > 1 else loss
+            scaled.backward()
+            num_batches += 1
+            ran += 1
+            boundary_signal = None
+            if num_batches % accum == 0 or num_batches == total_steps:
+                if fused:
+                    # Every parameter was already clipped, stepped and freed by
+                    # its hook during backward() (fused mode implies accum == 1,
+                    # so every batch is a boundary). All that remains is the tail
+                    # of Prodigy_adv.step(): the d-adaptation reduction over the
+                    # accumulators, then the reset that primes the next step.
+                    # Same call ORDER as step(): step_parameter x N ->
+                    # calculate_d -> init_step.
+                    optimizer.calculate_d()
+                    optimizer.init_step()
+                else:
+                    # Clip on the SUMMED gradients at the real accumulation boundary
+                    # (never mid-window, where the grads are only half-accumulated).
+                    # Called through the module global so tests can monkeypatch the seam.
+                    if config.clip_grad_norm and config.clip_grad_norm > 0:
+                        clip_gradients(model, config.clip_grad_norm)
+                    optimizer.step()
+                    optimizer.zero_grad()
+                if ema is not None:
+                    ema.update(model)
+                # Backups fire ONLY here — at a real gradient-accumulation boundary,
+                # with no in-flight grads — so a restored optimizer state is coherent.
+                if boundary_hook is not None:
+                    boundary_signal = boundary_hook(num_batches)
 
+            total_loss += loss.item()
+
+            # Per-class train-loss telemetry — hard-label CE, diagnostic only, no
+            # grad. Skipped for MixUp batches where `labels` no longer matches the
+            # optimised (interpolated soft) target.
+            if mix_soft is None:
+                with torch.no_grad():
+                    per_ex = nn.functional.cross_entropy(
+                        logits.float(), labels.long(), reduction="none"
+                    )
+                per_class_loss_sum.index_add_(0, labels.long(), per_ex)
+                per_class_loss_count.index_add_(0, labels.long(), torch.ones_like(per_ex))
+                if sample_loss_sink is not None:
+                    # ``num_batches`` was already advanced for this batch.
+                    sample_loss_sink(num_batches - 1, per_ex.detach().cpu())
+
+            if step_callback is not None:
+                now = time.monotonic()
+                if (
+                    now - _last_report >= _STEP_REPORT_INTERVAL
+                    or num_batches == total_steps
+                ):
+                    _last_report = now
+                    step_callback(num_batches, total_steps, total_loss / max(ran, 1))
+
+            # Pause requested at this boundary: the boundary_hook already saved the
+            # backup; stop consuming batches.
+            if boundary_signal == "stop":
+                break
+
+    finally:
+        # Hook handles must never outlive the epoch: a leaked handle would step
+        # the parameter a second time during the next epoch's backward.
+        for _handle in fused_hooks:
+            _handle.remove()
     counts = per_class_loss_count.cpu()
     sums = per_class_loss_sum.cpu()
     per_class_train_loss = {
