@@ -19,7 +19,11 @@ from bittrainer.backbone_init import apply_backbone_init, wants_timm_pretrained
 from bittrainer.ema import ModelEMA
 from bittrainer.generic.optimizer import make_optimizer
 from bittrainer.model import create_model
-from bittrainer.validation import compute_metrics, find_optimal_threshold
+from bittrainer.validation import (
+    compute_metrics,
+    find_optimal_threshold,
+    negative_kind_metrics,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -101,6 +105,14 @@ class TrainConfig:
     # 1.0 keeps their coverage while removing their dominance; 0 disables the
     # normalisation and restores the historical full-weight behaviour.
     implied_negative_mass_alpha: float = 1.0
+    # Bitcrush ISSUE-0898: bound the explicit-negative block's TOTAL loss mass
+    # to this multiple of the positives' mass. Explicit negatives are verified,
+    # so a scarce block keeps full weight per row; only an abundance (more
+    # explicit negatives than positives, e.g. Sideboob 784 vs 238) is bounded,
+    # which is what collapsed served recall to 3% on the harness holdout. The
+    # head-only path scales per-row weights; the image path subsamples the
+    # block per epoch. <= 0 disables.
+    explicit_negative_mass_cap: float = 1.0
     # Validation implied-negative ratio, pinned independently of the training
     # ratio so metrics stay comparable across runs. None follows neg_pos_ratio.
     val_neg_pos_ratio: float | None = None
@@ -302,7 +314,30 @@ def evaluate(
         "val_loss": total_loss / max(num_batches, 1),
         "probs": all_probs,
         "labels": all_labels,
+        "kinds": _sample_kinds_in_loader_order(dataloader, len(all_labels)),
     }
+
+
+def _sample_kinds_in_loader_order(
+    dataloader: DataLoader, expected: int
+) -> list[str] | None:
+    """Per-prediction provenance for the pass that just ran, or None.
+
+    ``BucketBatchSampler`` records the shuffled batch order it fed the loader
+    (``last_epoch_batches``); mapping those indices onto ``dataset.samples``
+    gives each prediction its ``kind``. Loaders without that sampler, or a
+    length mismatch, report no provenance rather than a misaligned one.
+    """
+    batches = getattr(
+        getattr(dataloader, "batch_sampler", None), "last_epoch_batches", None
+    )
+    samples = getattr(getattr(dataloader, "dataset", None), "samples", None)
+    if not batches or samples is None:
+        return None
+    kinds = [samples[i].get("kind") for batch in batches for i in batch]
+    if len(kinds) != expected or any(k is None for k in kinds):
+        return None
+    return kinds
 
 
 def _tuned_val_metrics(val_result: dict) -> tuple[dict, float]:
@@ -319,6 +354,13 @@ def _tuned_val_metrics(val_result: dict) -> tuple[dict, float]:
     metrics = compute_metrics(
         val_result["labels"], val_result["probs"], threshold=threshold
     )
+    kinds = val_result.get("kinds")
+    if kinds:
+        metrics.update(
+            negative_kind_metrics(
+                val_result["labels"], val_result["probs"], kinds, threshold=threshold
+            )
+        )
     return metrics, threshold
 
 
@@ -576,4 +618,21 @@ def _binary_compare_promote(
         "positive_count": num_positives,
         "negative_count": len(train_ds._all_negative_paths),
         "confusion_matrix": best_metrics.get("confusion_matrix"),
+        # Bitcrush ISSUE-0898: negatives by kind. ``negative_count`` above is
+        # the whole implied pool available, not what was trained on.
+        **_negative_kind_result(train_ds, best_metrics),
+    }
+
+
+def _negative_kind_result(train_ds, best_metrics: dict) -> dict:
+    counts = getattr(train_ds, "negative_kind_counts", lambda: {})()
+    return {
+        "explicit_negative_count": counts.get("explicit"),
+        "implied_negative_count": counts.get("implied"),
+        "val_explicit_negative_count": best_metrics.get("val_explicit_negative_count"),
+        "val_implied_negative_count": best_metrics.get("val_implied_negative_count"),
+        "final_val_f1_explicit": best_metrics.get("f1_explicit"),
+        "final_val_f1_implied": best_metrics.get("f1_implied"),
+        "final_val_fpr_explicit": best_metrics.get("fpr_explicit"),
+        "final_val_fpr_implied": best_metrics.get("fpr_implied"),
     }

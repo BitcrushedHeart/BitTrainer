@@ -56,6 +56,14 @@ MAX_BINARY_NEG_POS_RATIO = 5.0
 # is not comparable across neg:pos ratios).
 DEFAULT_VAL_NEG_POS_RATIO = 3.0
 
+# Sample provenance (Bitcrush ISSUE-0898). Explicit negatives are user-verified
+# near-misses; implied negatives are other concepts' positives, unlabelled for
+# the concept being trained. Validation reports them separately because a
+# single F1 falls as explicit negatives are added and is inflated without them.
+KIND_POSITIVE = "positive"
+KIND_EXPLICIT_NEGATIVE = "explicit_negative"
+KIND_IMPLIED_NEGATIVE = "implied_negative"
+
 
 def effective_binary_neg_pos_ratio(
     value: float | None,
@@ -326,6 +334,7 @@ class ConceptDataset(Dataset):
         negative_paths: list[str] | None = None,
         hard_negative_paths: list[str] | None = None,
         hard_negative_weight: int = 3,
+        explicit_negative_mass_cap: float = 0.0,
         dim_cache: _DimensionCache | None = None,
         face_bboxes: dict[str, list[int]] | None = None,
         skin_normalise: bool = False,
@@ -343,6 +352,9 @@ class ConceptDataset(Dataset):
         self._neg_pos_ratio = self._neg_pos_ratio_ceiling
         self._ratio_positive_count = ratio_positive_count
         self._hard_negative_weight = hard_negative_weight
+        # Bitcrush ISSUE-0898: bound the repeated explicit block at this
+        # multiple of the positive count per epoch (0 = unbounded).
+        self._explicit_negative_mass_cap = explicit_negative_mass_cap
         self._concept_name = concept_name or self.concept_folder.name
         self._cache = cache
         self._sourceless = sourceless
@@ -408,9 +420,13 @@ class ConceptDataset(Dataset):
         )
 
         self._path_info: dict[str, dict] = {}
-        self._precompute_path_info(self._positive_paths, label=1)
-        self._precompute_path_info(self._all_negative_paths, label=0)
-        self._precompute_path_info(self._hard_negative_paths, label=0)
+        self._precompute_path_info(self._positive_paths, label=1, kind=KIND_POSITIVE)
+        self._precompute_path_info(
+            self._all_negative_paths, label=0, kind=KIND_IMPLIED_NEGATIVE
+        )
+        self._precompute_path_info(
+            self._hard_negative_paths, label=0, kind=KIND_EXPLICIT_NEGATIVE
+        )
         self._dim_cache.flush()
 
         self.samples: list[dict] = []
@@ -421,6 +437,10 @@ class ConceptDataset(Dataset):
             raise RuntimeError("sourceless=True requires a SmartCache instance")
         entries = self._cache.iter_sourceless()
         self.samples = [s for s in entries if s.get("split") == self.split]
+        for sample in self.samples:
+            sample.setdefault(
+                "kind", KIND_POSITIVE if sample["label"] == 1 else KIND_IMPLIED_NEGATIVE
+            )
         self._positive_paths = [
             Path(s["path"]) for s in self.samples if s["label"] == 1
         ]
@@ -430,7 +450,9 @@ class ConceptDataset(Dataset):
         self._hard_negative_paths = []
         self._has_cross_concept_negatives = False
 
-    def _precompute_path_info(self, paths: list[Path], label: int) -> None:
+    def _precompute_path_info(
+        self, paths: list[Path], label: int, kind: str = KIND_IMPLIED_NEGATIVE
+    ) -> None:
         for p in paths:
             key = str(p)
             if key in self._path_info:
@@ -443,6 +465,7 @@ class ConceptDataset(Dataset):
             self._path_info[key] = {
                 "path": key,
                 "label": label,
+                "kind": kind,
                 "bucket": bucket,
                 "concept_name": self._concept_name,
                 "split": self.split,
@@ -454,10 +477,17 @@ class ConceptDataset(Dataset):
         self.samples = [self._path_info[str(p)] for p in self._positive_paths]
 
         hard_neg_samples = [self._path_info[str(p)] for p in self._hard_negative_paths]
+        explicit_rows: list[dict] = []
         for _ in range(self._hard_negative_weight):
-            self.samples.extend(hard_neg_samples)
-
+            explicit_rows.extend(hard_neg_samples)
         num_pos = len(self._positive_paths)
+        cap_rows = math.ceil(num_pos * self._explicit_negative_mass_cap)
+        if self._explicit_negative_mass_cap > 0 and len(explicit_rows) > cap_rows:
+            # An abundance of explicit negatives is drawn fresh each epoch so
+            # the block's loss mass stays bounded without losing any evidence.
+            explicit_rows = random.sample(explicit_rows, cap_rows)
+        self.samples.extend(explicit_rows)
+
         # Implied negatives have their own ratio quota. Explicit negatives are
         # additive (and retain their hard-negative repetition weight) rather
         # than consuming slots from the implied pool.
@@ -470,9 +500,35 @@ class ConceptDataset(Dataset):
         self.samples.extend(neg_samples)
 
     def resample_negatives(self) -> None:
-        if self._sourceless or not self._has_cross_concept_negatives:
+        if self._sourceless:
+            return
+        if (
+            not self._has_cross_concept_negatives
+            and not self._explicit_block_is_capped()
+        ):
             return
         self._build_samples()
+
+    def _explicit_block_is_capped(self) -> bool:
+        if self._explicit_negative_mass_cap <= 0:
+            return False
+        rows = len(self._hard_negative_paths) * self._hard_negative_weight
+        return rows > math.ceil(
+            len(self._positive_paths) * self._explicit_negative_mass_cap
+        )
+
+    def negative_kind_counts(self) -> dict[str, int]:
+        """Distinct explicit negatives and sampled implied negatives in play.
+
+        Explicit negatives are counted once each (repetition is a loss weight,
+        not evidence); implied is the quota actually drawn into ``samples``.
+        """
+        return {
+            "explicit": len(self._hard_negative_paths),
+            "implied": sum(
+                s.get("kind") == KIND_IMPLIED_NEGATIVE for s in self.samples
+            ),
+        }
 
     def set_cache(self, cache: Any) -> None:
         """Attach a SmartCache after construction (used by trainer warm phase)."""
@@ -548,6 +604,7 @@ class BucketBatchSampler(Sampler):
         self.batch_size = batch_size
         self.drop_last = drop_last
         self.undersized_policy = undersized_policy
+        self.last_epoch_batches: list[list[int]] | None = None
 
     def __iter__(self):
         bucket_indices: dict[tuple[int, int], list[int]] = {}
@@ -569,6 +626,9 @@ class BucketBatchSampler(Sampler):
                 batches.append(batch)
 
         random.shuffle(batches)
+        # The order actually fed to the DataLoader, so evaluate() can map each
+        # prediction back to its sample's provenance after a shuffled pass.
+        self.last_epoch_batches = batches
         yield from batches
 
     def __len__(self):

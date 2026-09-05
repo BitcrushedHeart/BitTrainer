@@ -52,7 +52,12 @@ def compute_metrics(
         "precision": prec,
         "recall": rec,
         "auprc": auprc,
-        "confusion_matrix": {"tp": int(tp), "fp": int(fp), "fn": int(fn), "tn": int(tn)},
+        "confusion_matrix": {
+            "tp": int(tp),
+            "fp": int(fp),
+            "fn": int(fn),
+            "tn": int(tn),
+        },
     }
 
 
@@ -71,8 +76,57 @@ def find_optimal_threshold(
 
     # F1 = 2 * (precision * recall) / (precision + recall)
     with np.errstate(divide="ignore", invalid="ignore"):
-        f1_scores = 2 * (precision_arr[:-1] * recall_arr[:-1]) / (precision_arr[:-1] + recall_arr[:-1])
+        f1_scores = (
+            2
+            * (precision_arr[:-1] * recall_arr[:-1])
+            / (precision_arr[:-1] + recall_arr[:-1])
+        )
         f1_scores = np.nan_to_num(f1_scores, 0.0)
 
     best_idx = int(np.argmax(f1_scores))
     return float(thresholds[best_idx])
+
+
+def negative_kind_metrics(
+    labels: list[int],
+    probs: list[float],
+    kinds: list[str],
+    *,
+    threshold: float,
+) -> dict:
+    """Metrics for positives against each negative kind separately.
+
+    Bitcrush ISSUE-0898: explicit negatives are hard near-misses and implied
+    negatives are the rest of the dataset, so one pooled F1 conflates "confused
+    by look-alikes" with "fires on everything". ``f1_*`` / ``precision_*`` score
+    positives against only that kind; ``fpr_*`` is the share of that kind
+    firing at ``threshold``. A kind with no samples reports ``None`` rather
+    than a flattering zero.
+    """
+    from bittrainer.dataset import KIND_EXPLICIT_NEGATIVE, KIND_IMPLIED_NEGATIVE
+
+    y_true = np.array(labels)
+    y_prob = np.array(probs)
+    kind_arr = np.array(kinds)
+    positive = y_true == 1
+    out: dict = {}
+    for key, kind in (
+        ("explicit", KIND_EXPLICIT_NEGATIVE),
+        ("implied", KIND_IMPLIED_NEGATIVE),
+    ):
+        mask = kind_arr == kind
+        count = int(mask.sum())
+        out[f"val_{key}_negative_count"] = count
+        if count == 0:
+            out[f"f1_{key}"] = None
+            out[f"precision_{key}"] = None
+            out[f"fpr_{key}"] = None
+            continue
+        keep = positive | mask
+        scored = compute_metrics(
+            y_true[keep].tolist(), y_prob[keep].tolist(), threshold=threshold
+        )
+        out[f"f1_{key}"] = scored["f1"]
+        out[f"precision_{key}"] = scored["precision"]
+        out[f"fpr_{key}"] = float((y_prob[mask] >= threshold).mean())
+    return out

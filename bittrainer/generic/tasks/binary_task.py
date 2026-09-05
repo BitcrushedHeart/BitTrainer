@@ -233,6 +233,7 @@ class BinaryTask(TrainingTask):
                     else config.hard_negative_paths
                 ),
                 hard_negative_weight=config.hard_negative_weight,
+                explicit_negative_mass_cap=config.explicit_negative_mass_cap,
                 dim_cache=dim_cache,
                 skin_normalise=config.skin_normalise,
                 concept_name=self.concept_name,

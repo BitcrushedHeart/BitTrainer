@@ -309,6 +309,20 @@ def _normalise_hard_negative_weight_candidates(config: bt.TrainConfig) -> list[i
     return candidates
 
 
+def explicit_block_row_weight(
+    *, positives: int, explicit_rows: int, mass_cap: float
+) -> float:
+    """Per-row weight that bounds the explicit block at ``mass_cap`` x positives.
+
+    Bitcrush ISSUE-0898. A scarce block (rows <= cap x positives) keeps full
+    weight; an abundant one is scaled so its total mass equals the cap.
+    ``mass_cap <= 0`` disables the bound.
+    """
+    if mass_cap <= 0 or positives <= 0 or explicit_rows <= 0:
+        return 1.0
+    return min(1.0, mass_cap * positives / explicit_rows)
+
+
 def _weighted_train_tensors(
     x_base: torch.Tensor,
     y_base: torch.Tensor,
@@ -316,11 +330,13 @@ def _weighted_train_tensors(
     y_explicit: torch.Tensor,
     weight: int,
     w_base: torch.Tensor | None = None,
+    mass_cap: float = 0.0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
     """Append the explicit-negative block, repeated ``weight`` times.
 
-    Explicit negatives are user-verified, so they keep full per-sample weight —
-    only the implied pool inside ``w_base`` is normalised.
+    Explicit negatives are user-verified, so each keeps full weight until the
+    repeated block would carry more than ``mass_cap`` x the positives' mass
+    (ISSUE-0898); the implied pool inside ``w_base`` is normalised separately.
     """
     if len(x_explicit) == 0:
         return x_base, y_base, w_base
@@ -328,8 +344,14 @@ def _weighted_train_tensors(
     repeated_y = torch.cat([y_explicit] * weight, dim=0)
     w_out = None
     if w_base is not None:
+        row_weight = explicit_block_row_weight(
+            positives=int((y_base == 1).sum()),
+            explicit_rows=len(repeated_y),
+            mass_cap=mass_cap,
+        )
         w_out = torch.cat(
-            (w_base, torch.ones(len(repeated_y), dtype=w_base.dtype)), dim=0
+            (w_base, torch.full((len(repeated_y),), row_weight, dtype=w_base.dtype)),
+            dim=0,
         )
     return (
         torch.cat((x_base, repeated_x), dim=0),
@@ -384,7 +406,13 @@ def _train_hard_negative_weight_sweep(
             weight = candidates[0]
             config.hard_negative_weight = weight
         x_train, y_train, w_train = _weighted_train_tensors(
-            x_base, y_base, x_explicit, y_explicit, weight, w_base
+            x_base,
+            y_base,
+            x_explicit,
+            y_explicit,
+            weight,
+            w_base,
+            mass_cap=config.explicit_negative_mass_cap,
         )
         return _train_cached_binary_head(
             model,
@@ -413,7 +441,13 @@ def _train_hard_negative_weight_sweep(
         model.head.load_state_dict(original_head_state)
         restore_rng_states(original_rng_state, device)
         x_train, y_train, w_train = _weighted_train_tensors(
-            x_base, y_base, x_explicit, y_explicit, weight, w_base
+            x_base,
+            y_base,
+            x_explicit,
+            y_explicit,
+            weight,
+            w_base,
+            mass_cap=config.explicit_negative_mass_cap,
         )
         cb(
             {
@@ -600,7 +634,9 @@ class BinaryHeadOnlyTask(BinaryTask):
                     # concept-wide positive count (which drives the adaptive
                     # train ratio) must not be fed in alongside it.
                     ratio_positive_count=(
-                        ratio_positive_count if config.val_neg_pos_ratio is None else None
+                        ratio_positive_count
+                        if config.val_neg_pos_ratio is None
+                        else None
                     ),
                     is_cached=is_cached,
                 )
