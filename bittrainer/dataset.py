@@ -87,6 +87,16 @@ def effective_binary_neg_pos_ratio(
     return min(ceiling, evidence_ratio)
 
 
+def resolution_ckpt_meta(train_resolution: int | None) -> dict:
+    """Checkpoint metadata recording the bucket scale the model was trained at.
+
+    Serving must bucket at this same scale. The checkpoint is the source of
+    truth because a batch-train resolution pin can differ from the group or
+    concept's own setting (Bitcrush ISSUE-0992).
+    """
+    return {"train_resolution": int(train_resolution or DEFAULT_TRAIN_RESOLUTION)}
+
+
 def scaled_buckets(
     train_resolution: int = DEFAULT_TRAIN_RESOLUTION,
 ) -> list[tuple[int, int]]:

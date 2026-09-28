@@ -30,6 +30,7 @@ import torch
 from torch.utils.data import DataLoader
 
 import bittrainer.group_trainer as gt
+from bittrainer.dataset import resolution_ckpt_meta
 from bittrainer.embedding_cache import EmbeddingCache
 from bittrainer.generic.task import BestTracker, LoopSpec, TaskContext, TrainingTask
 from bittrainer.group_dataset import build_group_bucket_sampler
@@ -230,6 +231,7 @@ class HeadOnlyTask(TrainingTask):
             "class_names": list(config.class_names),
             "validation_metric": gt._primary_validation_metric(config),
             **gt._spatial_ckpt_meta(config),
+            **resolution_ckpt_meta(config.train_resolution),
         }
         if self.head_hidden is not None:
             ckpt_meta["head_hidden_size"] = self.head_hidden

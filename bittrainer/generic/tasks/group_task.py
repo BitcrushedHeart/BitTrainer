@@ -21,6 +21,7 @@ from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader
 
 import bittrainer.group_trainer as gt
+from bittrainer.dataset import resolution_ckpt_meta
 from bittrainer.dynamic_class_weights import DynamicClassWeightController
 from bittrainer.ema import ModelEMA
 from bittrainer.generic.optimizer import optimizer_identity
@@ -807,6 +808,7 @@ class GroupTask(TrainingTask):
             "class_names": list(config.class_names),
             "validation_metric": gt._primary_validation_metric(config),
             **gt._spatial_ckpt_meta(config),
+            **resolution_ckpt_meta(config.train_resolution),
         }
         if self.head_hidden_size is not None:
             ckpt_meta["head_hidden_size"] = self.head_hidden_size
@@ -852,6 +854,7 @@ class GroupTask(TrainingTask):
                 "model_size": config.backbone_variant,
                 "class_names": list(config.class_names),
                 **gt._spatial_ckpt_meta(config),
+                **resolution_ckpt_meta(config.train_resolution),
             }
             if self.head_hidden_size is not None:
                 snap_meta["head_hidden_size"] = self.head_hidden_size
@@ -964,6 +967,7 @@ class GroupTask(TrainingTask):
                         "class_names": list(config.class_names),
                         "validation_metric": gt._primary_validation_metric(config),
                         **gt._spatial_ckpt_meta(config),
+                        **resolution_ckpt_meta(config.train_resolution),
                     }
                     if self.head_hidden_size is not None:
                         ckpt_meta["head_hidden_size"] = self.head_hidden_size
@@ -1037,6 +1041,7 @@ class GroupTask(TrainingTask):
                         "class_names": list(config.class_names),
                         "validation_metric": gt._primary_validation_metric(config),
                         **gt._spatial_ckpt_meta(config),
+                        **resolution_ckpt_meta(config.train_resolution),
                     }
                     if self.head_hidden_size is not None:
                         ckpt_meta["head_hidden_size"] = self.head_hidden_size

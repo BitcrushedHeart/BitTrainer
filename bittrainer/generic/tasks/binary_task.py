@@ -36,6 +36,7 @@ from bittrainer.dataset import (
     ConceptDataset,
     _DimensionCache,
     build_bucket_batch_sampler,
+    resolution_ckpt_meta,
 )
 from bittrainer.ema import ModelEMA
 from bittrainer.generic.task import (
@@ -655,6 +656,7 @@ class BinaryTask(TrainingTask):
             "num_classes": 2,
             "model_size": config.model_size,
             "training_mode": config.training_mode,
+            **resolution_ckpt_meta(config.train_resolution),
         }
         if self.ema is not None:
             ckpt_meta["model_state_dict"] = model.state_dict()

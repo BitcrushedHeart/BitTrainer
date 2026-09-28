@@ -19,6 +19,7 @@ from bittrainer.dataset import (
     DEFAULT_TRAIN_RESOLUTION,
     build_bucket_batch_sampler,
     effective_binary_neg_pos_ratio,
+    resolution_ckpt_meta,
 )
 from bittrainer.embedding_cache import EmbeddingCache, cached_hashes_for_sig
 from bittrainer.generic.task import BestTracker, LoopSpec, TaskContext
@@ -787,6 +788,7 @@ class BinaryHeadOnlyTask(BinaryTask):
                 "num_classes": 2,
                 "model_size": config.model_size,
                 "training_mode": "head_only",
+                **resolution_ckpt_meta(config.train_resolution),
                 "selected_hard_negative_weight": config.selected_hard_negative_weight,
                 "hard_negative_weight_tuning_results": (
                     config.hard_negative_weight_tuning_results
