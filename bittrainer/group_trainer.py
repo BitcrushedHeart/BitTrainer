@@ -16,7 +16,7 @@ from torch.utils.data import DataLoader
 
 from bittrainer.ema import ModelEMA
 from bittrainer.forensic_augment import forensic_from_config
-from bittrainer.group_dataset import GroupDataset
+from bittrainer.group_dataset import GroupDataset, labelled_samples
 from bittrainer.dynamic_class_weights import DynamicClassWeightController
 from bittrainer.losses import AsymmetricLoss, FocalLoss
 from bittrainer.embedding_cache import EmbeddingCache
@@ -447,6 +447,40 @@ class GroupTrainConfig:
     backup_every_steps: int = 500
     resume_from: str | None = None
     dataloader_workers: int = 6
+
+
+def resolve_region_manifest(config: GroupTrainConfig):
+    """The run's :class:`~bittrainer.region_manifest.RegionManifest`, or ``None``.
+
+    ``None`` — the group trains as an ordinary classifier — when no manifest is
+    configured, the file is unreadable, or the run cannot honour boxes:
+    sourceless (cloud) runs have no source frames to map them onto, and a
+    label-aware flip (spatial / gaze groups) owns the horizontal flip.
+    """
+    path = getattr(config, "region_manifest", "")
+    if not path:
+        return None
+    if config.sourceless:
+        logger.warning("Region training skipped: not supported for sourceless runs")
+        return None
+    if config.cell_masks or config.flip_class_map:
+        logger.warning("Region training skipped: not supported with a label-aware flip")
+        return None
+    from bittrainer.region_manifest import load_region_manifest
+
+    return load_region_manifest(path)
+
+
+def region_type_names(config: GroupTrainConfig) -> list[str] | None:
+    """Region type names when this run trains a region head, else ``None``.
+
+    A head is only built when some TRAIN image was actually reviewed for
+    regions; crop files alone train the classifier and need no detector.
+    """
+    manifest = resolve_region_manifest(config)
+    if manifest is None or not manifest.has_detector_data("train"):
+        return None
+    return list(manifest.type_names)
 
 
 def _spatial_ckpt_meta(config: GroupTrainConfig) -> dict:
@@ -1403,6 +1437,24 @@ def _prepare_datasets_and_cache(
             extra_paths=config.extra_paths_val,
         )
     else:
+        # Crop-assisted groups (ISSUE-0993): only the TRAIN set is region-aware.
+        # The validation set stays the full view of the labelled images, so
+        # every existing consumer of it (selection, promotion, calibration)
+        # sees what it always did; the crop view is validated at finalisation.
+        region_kwargs: dict = {}
+        region_manifest = resolve_region_manifest(config)
+        if region_manifest is not None:
+            region_kwargs["region_manifest"] = region_manifest
+            cb(
+                {
+                    "type": "training_progress",
+                    "stage": "preparing",
+                    "status_text": (
+                        f"Crop-assisted: {len(region_manifest.crops_in('train'))} crops, "
+                        f"{len(region_manifest.images_in('train'))} drawn images"
+                    ),
+                }
+            )
         train_ds = GroupDataset(
             group_folder,
             config.class_names,
@@ -1414,6 +1466,7 @@ def _prepare_datasets_and_cache(
             extra_paths=config.extra_paths_train,
             train_resolution=config.train_resolution,
             forensic=forensic,
+            **region_kwargs,
         )
         val_ds = GroupDataset(
             group_folder,
@@ -1646,6 +1699,14 @@ def _create_or_warmstart_model(
                 config.cell_masks,
                 config.grid_rows * config.grid_cols,
             )
+        # Crop-assisted groups: attach the region head, also before warm-start
+        # matching, so an incumbent's region_head.* carries over and a
+        # head-less incumbent simply leaves the new head at its fresh init.
+        region_types = region_type_names(config)
+        if region_types:
+            from bittrainer.regions import install_region_head
+
+            install_region_head(model, len(region_types))
         return model
 
     existing_best = checkpoint_dir / config.best_model_name
@@ -1729,7 +1790,10 @@ def _warmup_head_probe(
         int(getattr(model, "num_features", 0)),
         preproc_sig=_embedding_preproc_sig(config.train_resolution),
     )
-    all_samples = train_ds.samples + val_ds.samples
+    # The probe is a classifier: detection-only rows (crop-assisted groups)
+    # have no class to learn from. ``labelled_samples`` is the identity for
+    # every other group.
+    all_samples = labelled_samples(train_ds.samples) + val_ds.samples
 
     def _stop() -> bool:
         return bool(
@@ -1778,7 +1842,7 @@ def _warmup_head_probe(
     none_index = _resolve_none_index(config.class_names)
     # The probes train a head on the epoch-shaped (replication-expanded) train
     # set, exactly as they did when ``samples`` itself carried the replication.
-    train_epoch_samples = train_ds.epoch_samples()
+    train_epoch_samples = labelled_samples(train_ds.epoch_samples())
     _run_auto_softness_probe(
         model,
         config,

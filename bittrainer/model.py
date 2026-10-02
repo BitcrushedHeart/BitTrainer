@@ -51,6 +51,19 @@ def _infer_head_hidden_size(state_dict: dict[str, torch.Tensor]) -> int | None:
     return None
 
 
+def _infer_region_head(state_dict: dict[str, torch.Tensor]) -> tuple[int, int] | None:
+    """``(num_types, channels)`` of a saved region head, or ``None``.
+
+    Read off the heatmap projection (``[num_types, channels, 1, 1]``), the same
+    way the classifier's shape is read off its own weights, so a checkpoint
+    whose ``region_head`` metadata is missing still loads (Bitcrush ISSUE-0993).
+    """
+    weight = state_dict.get("region_head.heatmap.weight")
+    if weight is None:
+        return None
+    return int(weight.shape[0]), int(weight.shape[1])
+
+
 # Stochastic-depth (drop-path) maxima scaled by trunk size, following the
 # ConvNeXt recipe: the shallow atto..nano trunks tolerate only light regularisation
 # (0.1), tiny sits mid (0.2) and the deep base/large/huge trunks want the full 0.3.
@@ -186,21 +199,20 @@ def head_tail_parameters(model: nn.Module) -> list[nn.Parameter]:
     return params
 
 
-def backbone_feature_hash(model: nn.Module) -> str:
-    """Stable hash of every weight that affects the cached pooled vector.
+# The region head (Bitcrush ISSUE-0993) branches off the trunk's stage maps and
+# never feeds the pooled vector, so it is not backbone identity either: training
+# or attaching one must not invalidate the embedding cache.
+_NON_BACKBONE_PREFIXES = (*_HEAD_TAIL_PREFIXES, "region_head.")
 
-    Covers stem, stages, ``norm_pre`` and ``head.norm`` (the cache point), but
-    excludes ``head.pre_logits``/``head.fc`` (which sit after the cache and are
-    retrained by the probe). A full fine-tune moves the included weights, so the
-    hash changes and the embedding cache rebuilds against the adapted backbone.
-    Returned as a 16-char hex digest.
-    """
+
+def backbone_state_hash(state: dict[str, torch.Tensor]) -> str:
+    """:func:`backbone_feature_hash` of a bare ``state_dict`` — lets a saved
+    checkpoint be compared with a live model without rebuilding it."""
     import xxhash
 
     h = xxhash.xxh64()
-    state = model.state_dict()
     for key in sorted(state):
-        if any(key.startswith(p) for p in _HEAD_TAIL_PREFIXES):
+        if any(key.startswith(p) for p in _NON_BACKBONE_PREFIXES):
             continue
         t = state[key].detach().cpu().contiguous()
         if t.is_floating_point():
@@ -208,6 +220,18 @@ def backbone_feature_hash(model: nn.Module) -> str:
         h.update(key.encode("utf-8"))
         h.update(t.numpy().tobytes())
     return h.hexdigest()[:16]
+
+
+def backbone_feature_hash(model: nn.Module) -> str:
+    """Stable hash of every weight that affects the cached pooled vector.
+
+    Covers stem, stages, ``norm_pre`` and ``head.norm`` (the cache point), but
+    excludes ``head.pre_logits``/``head.fc`` (which sit after the cache and are
+    retrained by the probe) and the region head (which sits beside it). A full
+    fine-tune moves the included weights, so the hash changes and the embedding
+    cache rebuilds against the adapted backbone. Returned as a 16-char hex digest.
+    """
+    return backbone_state_hash(model.state_dict())
 
 
 _LLRD_DEPTH = {
@@ -322,6 +346,14 @@ def load_checkpoint(
             [list(m) for m in cell_masks],
             grid_rows * grid_cols,
         )
+    region_shape = _infer_region_head(state_dict)
+    if region_shape is not None:
+        # Crop-assisted checkpoint: attach the region head before loading so
+        # its region_head.* weights have somewhere to land. model.forward is
+        # unchanged; only forward_with_regions runs the head.
+        from bittrainer.regions import install_region_head
+
+        install_region_head(model, region_shape[0], region_shape[1])
     model.load_state_dict(state_dict)
     model = model.to(device)
     return model

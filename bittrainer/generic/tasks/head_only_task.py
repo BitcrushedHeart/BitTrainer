@@ -33,13 +33,44 @@ import bittrainer.group_trainer as gt
 from bittrainer.dataset import resolution_ckpt_meta
 from bittrainer.embedding_cache import EmbeddingCache
 from bittrainer.generic.task import BestTracker, LoopSpec, TaskContext, TrainingTask
-from bittrainer.group_dataset import build_group_bucket_sampler
-from bittrainer.model import backbone_feature_hash
+from bittrainer.group_dataset import build_group_bucket_sampler, labelled_samples
+from bittrainer.model import backbone_feature_hash, backbone_state_hash
+from bittrainer.regions import REGION_HEAD_PREFIX, has_region_head, region_head_ckpt_meta
 from bittrainer.training_state import BackupCoordinator
 
 logger = logging.getLogger(__name__)
 
 _THIN_CLASS_THRESHOLD = 20
+
+
+def settle_head_only_region_head(model: torch.nn.Module, incumbent_path: str | Path) -> str:
+    """Decide whether a head-only candidate may ship a region head.
+
+    Head-only training never trains the region head, so the only head worth
+    shipping is the incumbent's own, and only while it still sits on the trunk
+    it was trained with (Bitcrush ISSUE-0993). Returns:
+
+    * ``"none"`` — the model has no region head (an ordinary group);
+    * ``"kept"`` — the incumbent's head was warm-started onto the same trunk;
+    * ``"needs_full_train"`` — no usable incumbent head; the head is removed
+      from *model* so a random or mismatched proposer is never deployed.
+    """
+    if not has_region_head(model):
+        return "none"
+    try:
+        data = torch.load(str(incumbent_path), map_location="cpu", weights_only=True)
+        state = data["state_dict"] if isinstance(data, dict) and "state_dict" in data else data
+        own = model.state_dict()
+        head_keys = [k for k in state if k.startswith(REGION_HEAD_PREFIX)]
+        same_head = bool(head_keys) and all(
+            k in own and own[k].shape == state[k].shape for k in head_keys
+        )
+        if same_head and backbone_state_hash(state) == backbone_feature_hash(model):
+            return "kept"
+    except (OSError, RuntimeError, KeyError, EOFError, AttributeError, TypeError):
+        logger.info("Head-only: no usable incumbent region head at %s", incumbent_path)
+    del model.region_head
+    return "needs_full_train"
 
 
 def _thin_class_warnings(class_counts: dict[int, int], class_names: list[str]) -> list[dict]:
@@ -75,6 +106,14 @@ class HeadOnlyTask(TrainingTask):
         self.candidate_path: Path | None = None
         self._val_loader = None
         self._cancelled = False
+        # Crop-assisted groups (Bitcrush ISSUE-0993).
+        self.region_manifest = None
+        self.region_proposer = "none"
+
+    def _region_meta(self, model) -> dict:
+        """Checkpoint metadata for the model's region head; empty without one."""
+        names = self.region_manifest.type_names if self.region_manifest is not None else None
+        return region_head_ckpt_meta(model, names)
 
     def _stop(self, ctx: TaskContext) -> bool:
         """A stop / stop-now / pause all cancel head-only (no backup/resume)."""
@@ -120,15 +159,27 @@ class HeadOnlyTask(TrainingTask):
         self.train_ds, self.val_ds, self.smart_cache, _bucket_counts = (
             gt._prepare_datasets_and_cache(self.config, cb=ctx.cb, stop_event=ctx.stop_event)
         )
+        self.region_manifest = gt.resolve_region_manifest(self.config)
 
     def create_model(self, ctx: TaskContext, resume_state: dict | None):
         config = self.config
         self.head_hidden = config.probe_mlp_hidden if config.probe_head == "mlp" else None
         ctx.cb({"type": "training_progress", "stage": "preparing", "status_text": "Loading model"})
-        return gt._create_or_warmstart_model(
+        model = gt._create_or_warmstart_model(
             config, device=ctx.device, dtype=ctx.dtype,
             head_hidden_size=self.head_hidden, checkpoint_dir=ctx.checkpoint_dir,
         )
+        # A probe trains the classifier head only. Keep the incumbent's region
+        # head when the trunk under it is unchanged; otherwise ship none.
+        self.region_proposer = settle_head_only_region_head(
+            model, ctx.checkpoint_dir / config.best_model_name
+        )
+        if self.region_proposer == "needs_full_train":
+            ctx.cb({
+                "type": "training_progress", "stage": "preparing",
+                "status_text": "Region proposer needs a full train — head-only keeps none",
+            })
+        return model
 
     def pre_loop(self, ctx: TaskContext, model) -> None:
         config = self.config
@@ -144,7 +195,8 @@ class HeadOnlyTask(TrainingTask):
             preproc_sig=gt._embedding_preproc_sig(config.train_resolution),
         )
 
-        all_samples = self.train_ds.samples + self.val_ds.samples
+        # Detection-only rows (crop-assisted groups) carry no class for a probe.
+        all_samples = labelled_samples(self.train_ds.samples) + self.val_ds.samples
 
         def _build_progress(done: int, total: int) -> None:
             cb({
@@ -185,7 +237,7 @@ class HeadOnlyTask(TrainingTask):
         none_index = gt._resolve_none_index(config.class_names)
         # Epoch-shaped (replication-expanded) train rows: ``samples`` is the
         # stable, de-replicated base list since ISSUE-0859.
-        train_epoch_samples = self.train_ds.epoch_samples()
+        train_epoch_samples = labelled_samples(self.train_ds.epoch_samples())
         probe = gt._run_auto_softness_probe(
             model, config, embed_cache, self.smart_cache,
             train_epoch_samples, self.val_ds.samples,
@@ -232,6 +284,7 @@ class HeadOnlyTask(TrainingTask):
             "validation_metric": gt._primary_validation_metric(config),
             **gt._spatial_ckpt_meta(config),
             **resolution_ckpt_meta(config.train_resolution),
+            **self._region_meta(model),
         }
         if self.head_hidden is not None:
             ckpt_meta["head_hidden_size"] = self.head_hidden
@@ -292,6 +345,8 @@ class HeadOnlyTask(TrainingTask):
         result["thin_class_warnings"] = self.thin
         result["backbone_hash"] = self.backbone_hash
         result["embedding_cache_stats"] = self.stats
+        if self.region_proposer != "none":
+            result["region_proposer"] = self.region_proposer
 
         promoted = result.get("promotion_reason") not in (None, "incumbent_wins")
         primary_metric = gt._primary_validation_metric(config)

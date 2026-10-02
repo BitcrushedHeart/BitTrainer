@@ -116,6 +116,11 @@ class RegionManifest:
     def images_in(self, split: str) -> list[RegionImage]:
         return [i for i in self.images if i.split == split]
 
+    def has_detector_data(self, split: str = "train") -> bool:
+        """True when at least one *split* image was reviewed for regions —
+        without that there is nothing to train a region head on."""
+        return any(i.supervised_types() for i in self.images_in(split))
+
     def crops_in(self, split: str) -> list[RegionCrop]:
         return [c for c in self.crops if c.split == split]
 

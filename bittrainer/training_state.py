@@ -277,6 +277,7 @@ def make_fingerprint(
     best_model_name: str,
     model_size: str,
     optimizer_identity: str | None = None,
+    region_types: list[str] | None = None,
 ) -> dict:
     """Identity of the run a backup belongs to.
 
@@ -303,6 +304,11 @@ def make_fingerprint(
     }
     if optimizer_identity is not None:
         fingerprint["optimizer"] = str(optimizer_identity)
+    # Additive like ``optimizer``: a run that trains a region head (Bitcrush
+    # ISSUE-0993) has region_head.* weights and optimizer state a head-less
+    # backup lacks, so a region run never resumes from a backup without one.
+    if region_types is not None:
+        fingerprint["region_types"] = [str(t) for t in region_types]
     return fingerprint
 
 

@@ -33,9 +33,10 @@ from bittrainer.generic.task import (
     TrainingTask,
 )
 from bittrainer.group_dataset import build_group_bucket_sampler
-from bittrainer.model import create_model, unfreeze_backbone
+from bittrainer.model import _infer_region_head, create_model, unfreeze_backbone
 from bittrainer.model_soup import greedy_soup
 from bittrainer.progress import ProgressEmitter, Stage
+from bittrainer.regions import install_region_head, region_head_ckpt_meta
 from bittrainer.runtime import configure_cuda_backend, maybe_compile, prewarm_compile
 from bittrainer.sample_stats import SampleStatsRecorder
 from bittrainer.smart_cache import _noop_callback
@@ -103,6 +104,15 @@ class GroupTask(TrainingTask):
         self._val_schedule: list[list[int]] = []
         self._current_epoch = 0
         self._sample_stats_path: Path | None = None
+        # Crop-assisted groups (Bitcrush ISSUE-0993): the run's region manifest
+        # (None = an ordinary group) and the last epoch's mean detector loss.
+        self.region_manifest = None
+        self._train_region_loss: float | None = None
+
+    def _region_meta(self, model) -> dict:
+        """Checkpoint metadata for the model's region head; empty without one."""
+        names = self.region_manifest.type_names if self.region_manifest is not None else None
+        return region_head_ckpt_meta(model, names)
 
     # -- one-time setup ----------------------------------------------------
     def make_context(
@@ -154,6 +164,8 @@ class GroupTask(TrainingTask):
                 llrd_decay=config.llrd_decay,
                 wd_exclusions=config.wd_exclusions,
             ),
+            # None for an ordinary group, which keeps its historical fingerprint.
+            region_types=gt.region_type_names(config),
         )
         if resume_state is not None:
             # Re-apply the sweep outcomes the interrupted run resolved (the sweeps
@@ -187,6 +199,7 @@ class GroupTask(TrainingTask):
         self.train_ds, self.val_ds, self.smart_cache, self.bucket_counts = (
             gt._prepare_datasets_and_cache(config, cb=ctx.cb, stop_event=ctx.stop_event)
         )
+        self.region_manifest = gt.resolve_region_manifest(config)
 
     def create_model(self, ctx: TaskContext, resume_state: dict | None):
         config = self.config
@@ -224,6 +237,11 @@ class GroupTask(TrainingTask):
             install_spatial_head(
                 model, config.cell_masks, config.grid_rows * config.grid_cols
             )
+        # The backup is the truth for the region head's shape: rebuild it from
+        # the saved weights so they have somewhere to land.
+        region_shape = _infer_region_head(resume_state["model"])
+        if region_shape is not None:
+            install_region_head(model, region_shape[0], region_shape[1])
         model.load_state_dict(resume_state["model"])
         model = model.to(device)
         if self.memory_format is not None:
@@ -571,12 +589,20 @@ class GroupTask(TrainingTask):
             idxs = schedule[batch_index]
             if len(idxs) != losses.numel():
                 return
-            rows = [samples[i] for i in idxs]
+            # Crop-assisted groups: the export is about labelled IMAGES, so the
+            # crop files and the detection-only rows are left out of it.
+            kept = [
+                (samples[i], loss)
+                for i, loss in zip(idxs, losses.tolist(), strict=True)
+                if not samples[i].get("detection_only") and samples[i].get("view") != "crop"
+            ]
+            if not kept:
+                return
             recorder.record_train(
                 epoch,
-                [r["path"] for r in rows],
-                [int(r["label"]) for r in rows],
-                losses.tolist(),
+                [r["path"] for r, _ in kept],
+                [int(r["label"]) for r, _ in kept],
+                [loss for _, loss in kept],
             )
 
         return _sink
@@ -687,6 +713,12 @@ class GroupTask(TrainingTask):
         start_batch: int,
     ):
         config = self.config
+        # The detector-loss sink is only wired for a crop-assisted run, so an
+        # ordinary group's call is the one it has always been.
+        region_kwargs: dict = {}
+        if self.region_manifest is not None:
+            self._train_region_loss = None
+            region_kwargs["region_loss_sink"] = self._record_region_loss
         return gt._train_one_epoch(
             self.fwd_model,
             train_loader,
@@ -704,7 +736,11 @@ class GroupTask(TrainingTask):
             boundary_hook=boundary_hook,
             start_batch=start_batch,
             sample_loss_sink=self._make_sample_loss_sink(),
+            **region_kwargs,
         )
+
+    def _record_region_loss(self, value: float) -> None:
+        self._train_region_loss = float(value)
 
     def on_after_train(self, ctx: TaskContext, model, epoch: int) -> None:
         # Capture the post-epoch weights into the SWA running average over the
@@ -783,6 +819,8 @@ class GroupTask(TrainingTask):
                     )
                     val_metrics["macro_f1_dual"] = dual_metrics["macro_f1"]
         val_metrics["train_loss"] = train_result[0]
+        if self._train_region_loss is not None:
+            val_metrics["train_region_loss"] = self._train_region_loss
         return val_metrics
 
     def selection_score(self, metrics: dict) -> float:
@@ -809,6 +847,7 @@ class GroupTask(TrainingTask):
             "validation_metric": gt._primary_validation_metric(config),
             **gt._spatial_ckpt_meta(config),
             **resolution_ckpt_meta(config.train_resolution),
+            **self._region_meta(model),
         }
         if self.head_hidden_size is not None:
             ckpt_meta["head_hidden_size"] = self.head_hidden_size
@@ -855,6 +894,7 @@ class GroupTask(TrainingTask):
                 "class_names": list(config.class_names),
                 **gt._spatial_ckpt_meta(config),
                 **resolution_ckpt_meta(config.train_resolution),
+                **self._region_meta(model),
             }
             if self.head_hidden_size is not None:
                 snap_meta["head_hidden_size"] = self.head_hidden_size
@@ -880,7 +920,7 @@ class GroupTask(TrainingTask):
         selected_score: float,
         best: BestTracker,
     ) -> dict:
-        return gt._build_epoch_message(
+        msg = gt._build_epoch_message(
             epoch=epoch,
             config=self.config,
             train_loss=train_result[0],
@@ -898,6 +938,9 @@ class GroupTask(TrainingTask):
                 else None
             ),
         )
+        if self._train_region_loss is not None:
+            msg["train_region_loss"] = self._train_region_loss
+        return msg
 
     def collect_extra_state(
         self, ctx: TaskContext, *, rng_epoch_start, schedule, batch_in_epoch: int
@@ -968,6 +1011,7 @@ class GroupTask(TrainingTask):
                         "validation_metric": gt._primary_validation_metric(config),
                         **gt._spatial_ckpt_meta(config),
                         **resolution_ckpt_meta(config.train_resolution),
+                        **self._region_meta(model),
                     }
                     if self.head_hidden_size is not None:
                         ckpt_meta["head_hidden_size"] = self.head_hidden_size
@@ -1042,6 +1086,7 @@ class GroupTask(TrainingTask):
                         "validation_metric": gt._primary_validation_metric(config),
                         **gt._spatial_ckpt_meta(config),
                         **resolution_ckpt_meta(config.train_resolution),
+                        **self._region_meta(model),
                     }
                     if self.head_hidden_size is not None:
                         ckpt_meta["head_hidden_size"] = self.head_hidden_size
