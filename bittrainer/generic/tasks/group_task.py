@@ -48,6 +48,7 @@ from bittrainer.training_state import (
     restore_optimizer_state,
     restore_rng_states,
 )
+from bittrainer.view_calibration import finalize_region_views
 
 logger = logging.getLogger(__name__)
 
@@ -742,6 +743,23 @@ class GroupTask(TrainingTask):
     def _record_region_loss(self, value: float) -> None:
         self._train_region_loss = float(value)
 
+    def _finalize_regions(self, ctx: TaskContext, result: dict) -> None:
+        """Crop-assisted groups: calibrate the crop view and tune the proposer
+        on whichever checkpoint promotion left in place, and report it under
+        ``result["region_training"]``. A no-op for an ordinary group."""
+        if self.region_manifest is None or not isinstance(result, dict):
+            return
+        result["region_training"] = finalize_region_views(
+            self.config,
+            checkpoint_path=result.get("checkpoint_path"),
+            manifest=self.region_manifest,
+            val_ds=self.val_ds,
+            device=ctx.device,
+            dtype=ctx.dtype,
+            batch_size=self.eff_bs or 32,
+            cb=ctx.cb,
+        )
+
     def on_after_train(self, ctx: TaskContext, model, epoch: int) -> None:
         # Capture the post-epoch weights into the SWA running average over the
         # cosine tail (uniform average; LayerNorm backbone needs no BN update).
@@ -1139,6 +1157,7 @@ class GroupTask(TrainingTask):
             total_raw=self.total_raw,
             cb=cb,
         )
+        self._finalize_regions(ctx, result)
         stats_path = self._write_sample_stats(ctx.checkpoint_dir)
         if stats_path is not None and isinstance(result, dict):
             result["sample_stats_path"] = str(stats_path)

@@ -37,6 +37,7 @@ from bittrainer.group_dataset import build_group_bucket_sampler, labelled_sample
 from bittrainer.model import backbone_feature_hash, backbone_state_hash
 from bittrainer.regions import REGION_HEAD_PREFIX, has_region_head, region_head_ckpt_meta
 from bittrainer.training_state import BackupCoordinator
+from bittrainer.view_calibration import finalize_region_views
 
 logger = logging.getLogger(__name__)
 
@@ -114,6 +115,22 @@ class HeadOnlyTask(TrainingTask):
         """Checkpoint metadata for the model's region head; empty without one."""
         names = self.region_manifest.type_names if self.region_manifest is not None else None
         return region_head_ckpt_meta(model, names)
+
+    def _finalize_regions(self, ctx: TaskContext, result: dict) -> None:
+        """Crop-assisted groups: re-fit the crop view and the proposer threshold
+        on whichever checkpoint promotion left in place. A no-op otherwise."""
+        if self.region_manifest is None or not isinstance(result, dict):
+            return
+        result["region_training"] = finalize_region_views(
+            self.config,
+            checkpoint_path=result.get("checkpoint_path"),
+            manifest=self.region_manifest,
+            val_ds=self.val_ds,
+            device=ctx.device,
+            dtype=ctx.dtype,
+            batch_size=int(self.config.batch_size or 32),
+            cb=ctx.cb,
+        )
 
     def _stop(self, ctx: TaskContext) -> bool:
         """A stop / stop-now / pause all cancel head-only (no backup/resume)."""
@@ -347,6 +364,7 @@ class HeadOnlyTask(TrainingTask):
         result["embedding_cache_stats"] = self.stats
         if self.region_proposer != "none":
             result["region_proposer"] = self.region_proposer
+        self._finalize_regions(ctx, result)
 
         promoted = result.get("promotion_reason") not in (None, "incumbent_wins")
         primary_metric = gt._primary_validation_metric(config)
