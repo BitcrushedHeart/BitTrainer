@@ -371,3 +371,115 @@ class TestTrainLoop:
 
         assert _head_delta(0.0) == 0.0
         assert _head_delta(1.0) > 0.0
+
+
+# ---------------------------------------------------------------------------
+# Dataset -> loader -> loop, in one process
+# ---------------------------------------------------------------------------
+
+
+def _region_group(tmp_path):
+    import json
+
+    import numpy as np
+    from PIL import Image
+
+    from bittrainer.group_dataset import GroupDataset
+    from bittrainer.region_manifest import load_region_manifest
+
+    def _png(path, seed):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        rng = np.random.default_rng(seed)
+        Image.fromarray(rng.integers(0, 256, size=(48, 48, 3), dtype=np.uint8)).save(path)
+        return path
+
+    root = tmp_path / "g"
+    drawn = _png(root / "a" / "train" / "a0.png", 1)
+    _png(root / "b" / "train" / "b0.png", 2)
+    _png(root / "c" / "train" / "c0.png", 3)
+    crop = _png(root / ".region_crops" / "train" / "crop0.png", 4)
+    loose = _png(tmp_path / "pool" / "loose.png", 5)
+    manifest = root / ".region_crops" / "regions_manifest.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "crop_pad": 0.15,
+                "region_types": ["Face"],
+                "crops": [
+                    {
+                        "path": str(crop),
+                        "source": str(drawn),
+                        "box": [0.2, 0.2, 0.8, 0.8],
+                        "type": 0,
+                        "class": "b",
+                        "split": "train",
+                    }
+                ],
+                "images": [
+                    {
+                        "source": str(drawn),
+                        "paths": [str(drawn)],
+                        "split": "train",
+                        "boxes": [[0.2, 0.2, 0.8, 0.8, 0]],
+                        "rejects": [],
+                    },
+                    {
+                        "source": str(loose),
+                        "paths": [str(loose)],
+                        "split": "train",
+                        "boxes": [[0.1, 0.1, 0.5, 0.5, 0]],
+                        "rejects": [],
+                    },
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    return GroupDataset(
+        root,
+        ["a", "b", "c"],
+        split="train",
+        group_name="g",
+        extra_paths={"b": [str(crop)]},
+        region_manifest=load_region_manifest(manifest),
+        train_resolution=64,
+        # Each image once: the default replication would repeat the thin classes.
+        natural_sampling=True,
+    )
+
+
+def test_region_dataset_survives_pickling(tmp_path):
+    """DataLoader workers get a pickled copy of the dataset (Windows spawn)."""
+    import pickle
+
+    ds = _region_group(tmp_path)
+    clone = pickle.loads(pickle.dumps(ds))
+    assert len(clone[0]) == 4
+    assert [s.get("view") for s in clone.samples] == [s.get("view") for s in ds.samples]
+
+
+def test_real_dataset_batches_run_through_the_loop(tmp_path):
+    from torch.utils.data import DataLoader
+
+    from bittrainer.group_dataset import build_group_bucket_sampler
+
+    ds = _region_group(tmp_path)
+    loader = DataLoader(
+        ds,
+        batch_sampler=build_group_bucket_sampler(ds, batch_size=8),
+        collate_fn=_collate_bucket_batch,
+        num_workers=0,
+    )
+    batches = list(loader)
+    assert len(batches) == 1
+    images, labels, targets = batches[0]
+    assert images.shape[0] == 5  # three class images, one crop, one detection-only
+    assert sorted(labels.tolist()) == [-100, 0, 1, 1, 2]
+    assert int(targets.detector_rows.sum()) == 2 and int((~targets.cls_mask).sum()) == 1
+
+    model = _region_model()
+    sunk: list[float] = []
+    loss, per_class = _run(model, batches, _config(), region_loss_sink=sunk.append)
+    assert loss > 0 and sunk and sunk[0] > 0
+    assert set(per_class) == {"0", "1", "2"}
