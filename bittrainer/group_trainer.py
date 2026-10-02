@@ -25,6 +25,11 @@ from bittrainer.model import (
     backbone_feature_hash,
     create_model,
 )
+from bittrainer.regions import (
+    forward_with_regions,
+    region_hflip_batch,
+    region_loss,
+)
 
 # ---------------------------------------------------------------------------
 # Extracted helpers (Bitcrush ISSUE-0542): the clusters below were moved to
@@ -240,6 +245,17 @@ class GroupTrainConfig:
     region_classes: list[str] = field(default_factory=list)
     region_selection: str = "highest_conf"
     region_fallback: str = "full_frame"
+    # Crop-assisted groups (Bitcrush ISSUE-0993): path to the Engine-written
+    # ``regions_manifest.json`` (see bittrainer.region_manifest). When set, the
+    # train crops the Engine listed in ``extra_paths_train`` are tagged as the
+    # crop view, a region head is trained on the drawn boxes beside the
+    # classifier, and finalisation calibrates the full and crop views
+    # separately. Empty = an ordinary group. Not supported with ``sourceless``
+    # (no source frames to map boxes onto) or with a label-aware flip
+    # (``cell_masks`` / ``flip_class_map``); both train without regions.
+    # ``region_loss_weight`` scales the detector loss against the classifier's.
+    region_manifest: str = ""
+    region_loss_weight: float = 1.0
     cache_dir: str | None = None
     use_cache: bool = True
     cache_workers: int = 10
@@ -984,6 +1000,7 @@ def _train_one_epoch(
     boundary_hook: Callable[[int], str | None] | None = None,
     start_batch: int = 0,
     sample_loss_sink: Callable[[int, torch.Tensor], None] | None = None,
+    region_loss_sink: Callable[[float], None] | None = None,
 ) -> tuple[float, dict[str, float]]:
     """One training epoch.
 
@@ -991,9 +1008,20 @@ def _train_one_epoch(
     per-example CE (CPU tensor, batch order) for every non-MixUp batch, keyed by
     the ABSOLUTE batch position in the epoch schedule (so a mid-epoch resume
     still maps to ``schedule[batch_index]``). Bitcrush ISSUE-0850.
+
+    Crop-assisted groups (Bitcrush ISSUE-0993): a batch may carry a third
+    element, the :class:`~bittrainer.regions.RegionTargets`. Such a batch goes
+    through ``forward_with_regions``; the detector loss is added to the
+    optimised loss (scaled by ``config.region_loss_weight``) while the returned
+    average stays the CLASSIFICATION loss, so it remains comparable with
+    ``val_loss``. The epoch's mean detector loss goes to ``region_loss_sink``.
+    Rows whose ``cls_mask`` is False (detection-only images) are skipped by the
+    classification loss and report 0.0 to ``sample_loss_sink``.
     """
     model.train()
     total_loss = 0.0
+    region_loss_total = 0.0
+    region_batches = 0
     # ``num_batches`` is the ABSOLUTE position within the epoch: it starts at
     # ``start_batch`` on a mid-epoch resume so the accumulation modulo and the
     # ``== total_steps`` final-flush check stay aligned with the full epoch, while
@@ -1058,7 +1086,10 @@ def _train_one_epoch(
     optimizer.zero_grad()
     fused_hooks = _register_fused_hooks(optimizer, config.clip_grad_norm) if fused else []
     try:
-        for images, labels in dataloader:
+        for batch in dataloader:
+            # ``(images, labels)`` — plus RegionTargets for a crop-assisted group.
+            images, labels, *extra = batch
+            region_targets = extra[0] if extra else None
             if stop_now_event is not None and stop_now_event.is_set():
                 break
             # Pause between clean boundaries (accum==1 only, where every top-of-loop
@@ -1069,10 +1100,18 @@ def _train_one_epoch(
                 break
             images = images.to(device, non_blocking=True)
             labels = labels.to(device)
+            region_kwargs: dict = {}
+            if region_targets is not None:
+                region_targets = region_targets.to(device)
             if spatial_flip_map is not None:
                 from bittrainer.spatial import spatial_hflip_batch
 
                 images, labels = spatial_hflip_batch(images, labels, spatial_flip_map)
+            elif region_targets is not None:
+                # Boxes must follow the pixels: flip them together here, and
+                # keep geometric RandAugment off the rows that carry boxes.
+                images, region_targets = region_hflip_batch(images, region_targets)
+                region_kwargs["photometric_rows"] = region_targets.detector_rows
             # NOTE: the forensic chain (blur/noise/JPEG) is NOT applied here — it
             # runs per sample in the DataLoader workers via GroupDataset's
             # ForensicAugment (ISSUE-0861). Encoding JPEG on this thread stalled
@@ -1084,16 +1123,28 @@ def _train_one_epoch(
                 randaugment_m=config.randaugment_m,
                 random_erasing_p=config.random_erasing_p,
                 memory_format=memory_format,
-                hflip=spatial_flip_map is None,
+                hflip=spatial_flip_map is None and region_targets is None,
                 photometric_only=(
                     spatial_flip_map is not None or config.randaugment_photometric_only
                 ),
+                **region_kwargs,
             )
+
+            # Rows the classification loss may see. A detection-only image has
+            # boxes but no usable class label.
+            cls_keep = region_targets.cls_mask if region_targets is not None else None
+            all_kept = cls_keep is None or bool(cls_keep.all())
 
             # MixUp/CutMix: smooth targets first (preserving ordinal/label smoothing),
             # then interpolate, so mixing composes with the soft-target loss.
+            # Never on a region batch: mixing two images detaches the boxes
+            # from the pixels they describe.
             mix_soft = None
-            if mixup_enabled and torch.rand(1).item() < config.mixup_prob:
+            if (
+                mixup_enabled
+                and region_targets is None
+                and torch.rand(1).item() < config.mixup_prob
+            ):
                 mix_soft = _build_soft_targets(
                     labels,
                     config.num_classes,
@@ -1122,7 +1173,10 @@ def _train_one_epoch(
             with torch.amp.autocast(
                 device_type=device.type, dtype=dtype, enabled=(dtype != torch.float32)
             ):
-                logits = model(images)
+                if region_targets is not None:
+                    logits, region_out = forward_with_regions(model, images)
+                else:
+                    logits = model(images)
                 if mix_soft is not None:
                     loss = _soft_ce_loss(
                         torch.log_softmax(logits.float(), dim=1),
@@ -1130,8 +1184,22 @@ def _train_one_epoch(
                         class_weights=class_weights,
                         focal_gamma=focal_gamma,
                     )
-                else:
+                elif all_kept:
                     loss = loss_fn(logits, labels)
+                elif bool(cls_keep.any()):
+                    loss = loss_fn(logits[cls_keep], labels[cls_keep])
+                else:
+                    # A batch of detection-only rows: no class signal at all.
+                    loss = logits.float().sum() * 0.0
+
+            # ``cls_loss`` is what gets reported; the detector's term is only
+            # optimised. For an ordinary batch the two are the same object.
+            cls_loss = loss
+            if region_targets is not None:
+                detector_loss = region_loss(region_out, region_targets)
+                loss = cls_loss + float(config.region_loss_weight) * detector_loss
+                region_loss_total += float(detector_loss.item())
+                region_batches += 1
 
             scaled = loss / accum if accum > 1 else loss
             scaled.backward()
@@ -1164,19 +1232,30 @@ def _train_one_epoch(
                 if boundary_hook is not None:
                     boundary_signal = boundary_hook(num_batches)
 
-            total_loss += loss.item()
+            total_loss += cls_loss.item()
 
             # Per-class train-loss telemetry — hard-label CE, diagnostic only, no
             # grad. Skipped for MixUp batches where `labels` no longer matches the
-            # optimised (interpolated soft) target.
-            if mix_soft is None:
+            # optimised (interpolated soft) target, and for multi-label groups,
+            # whose multi-hot targets have no per-class hard-label CE (the call
+            # raised on them, which failed every multi-label full fine-tune).
+            if mix_soft is None and not config.multi_label:
+                tel_logits, tel_labels = logits.float(), labels.long()
+                if not all_kept:
+                    tel_logits, tel_labels = tel_logits[cls_keep], tel_labels[cls_keep]
                 with torch.no_grad():
                     per_ex = nn.functional.cross_entropy(
-                        logits.float(), labels.long(), reduction="none"
+                        tel_logits, tel_labels, reduction="none"
                     )
-                per_class_loss_sum.index_add_(0, labels.long(), per_ex)
-                per_class_loss_count.index_add_(0, labels.long(), torch.ones_like(per_ex))
+                per_class_loss_sum.index_add_(0, tel_labels, per_ex)
+                per_class_loss_count.index_add_(0, tel_labels, torch.ones_like(per_ex))
                 if sample_loss_sink is not None:
+                    if not all_kept:
+                        # One value per batch row, so the sink can still map
+                        # rows to the schedule; skipped rows report 0.0.
+                        full = torch.zeros(labels.shape[0], dtype=per_ex.dtype, device=per_ex.device)
+                        full[cls_keep] = per_ex
+                        per_ex = full
                     # ``num_batches`` was already advanced for this batch.
                     sample_loss_sink(num_batches - 1, per_ex.detach().cpu())
 
@@ -1199,6 +1278,8 @@ def _train_one_epoch(
         # the parameter a second time during the next epoch's backward.
         for _handle in fused_hooks:
             _handle.remove()
+    if region_loss_sink is not None and region_batches:
+        region_loss_sink(region_loss_total / region_batches)
     counts = per_class_loss_count.cpu()
     sums = per_class_loss_sum.cpu()
     per_class_train_loss = {

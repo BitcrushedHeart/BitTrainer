@@ -413,3 +413,39 @@ def decode_regions(
             row.append(RegionProposal(type=int(kind), score=float(score), box=box))
         proposals.append(row)
     return proposals
+
+
+# ---------------------------------------------------------------------------
+# Augmentation
+# ---------------------------------------------------------------------------
+
+
+def region_hflip_batch(
+    images: torch.Tensor,
+    targets: RegionTargets,
+    *,
+    p: float = 0.5,
+) -> tuple[torch.Tensor, RegionTargets]:
+    """Random horizontal flip that mirrors the boxes with the pixels.
+
+    Replaces the label-blind ``gpu_random_flip`` for batches that carry region
+    targets (the same job ``spatial_hflip_batch`` does for spatial groups).
+    Images are flipped in place; the targets come back as a new object.
+    """
+    flip = torch.rand(images.shape[0], device=images.device) < p
+    if not bool(flip.any()):
+        return images, targets
+    images[flip] = images[flip].flip(-1)
+    boxes = targets.boxes.clone()
+    if boxes.shape[0]:
+        mirrored = flip.to(targets.batch_index.device)[targets.batch_index]
+        x1 = boxes[mirrored, 0].clone()
+        boxes[mirrored, 0] = 1.0 - boxes[mirrored, 2]
+        boxes[mirrored, 2] = 1.0 - x1
+    return images, RegionTargets(
+        boxes=boxes,
+        batch_index=targets.batch_index,
+        types=targets.types,
+        supervised=targets.supervised,
+        cls_mask=targets.cls_mask,
+    )

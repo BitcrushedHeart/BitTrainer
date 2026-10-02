@@ -46,7 +46,12 @@ def _get_randaugment(num_ops: int, magnitude: int, photometric_only: bool = Fals
 
 
 def gpu_randaugment(
-    batch: torch.Tensor, num_ops: int, magnitude: int, *, photometric_only: bool = False,
+    batch: torch.Tensor,
+    num_ops: int,
+    magnitude: int,
+    *,
+    photometric_only: bool = False,
+    photometric_rows: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Apply RandAugment to a uint8 CHW batch.
 
@@ -54,13 +59,25 @@ def gpu_randaugment(
     dimension, but kernel ops stay on-device. Returns uint8 batch with the
     same shape and dtype. ``photometric_only`` drops the geometric ops
     (shear/translate/rotate) for label-geometry-sensitive (spatial) groups.
+
+    ``photometric_rows`` (a ``[B]`` bool tensor) applies that restriction to
+    the flagged rows only: in a crop-assisted batch the images that carry
+    region boxes must keep their pixels where the boxes say, while crop files
+    and undrawn images keep the full policy (Bitcrush ISSUE-0993).
     """
     ra = _get_randaugment(num_ops, magnitude, photometric_only)
+    rows: list[bool] | None = None
+    ra_photometric = ra
+    if photometric_rows is not None and not photometric_only:
+        rows = [bool(v) for v in photometric_rows.tolist()]
+        if any(rows):
+            ra_photometric = _get_randaugment(num_ops, magnitude, True)
     # v2.RandAugment expects [..., C, H, W] uint8; iterate the batch to ensure
     # each sample receives an independent draw of ops + magnitude.
     out = torch.empty_like(batch)
     for i in range(batch.shape[0]):
-        out[i] = ra(batch[i])
+        policy = ra_photometric if rows is not None and rows[i] else ra
+        out[i] = policy(batch[i])
     return out
 
 
@@ -248,6 +265,7 @@ def apply_train_augment(
     blur_sigma_max: float = 1.5,
     jpeg_p: float = 0.0,
     jpeg_quality: tuple[int, int] = (50, 95),
+    photometric_rows: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Normalize uint8 batch and apply training augmentation on GPU.
 
@@ -259,6 +277,8 @@ def apply_train_augment(
     Spatial groups pass ``hflip=False`` (the trainer flips label-aware via
     ``spatial_hflip_batch`` instead) and ``photometric_only=True`` (geometric
     RandAugment ops would move the subject relative to the frame).
+    Crop-assisted batches pass ``hflip=False`` too (``region_hflip_batch``
+    mirrors the boxes) and ``photometric_rows`` for the rows that carry boxes.
 
     The forensic knobs (``blur_p``/``noise_p``/``jpeg_p``, all off by default)
     run on the uint8 batch after RandAugment in the order blur -> noise ->
@@ -276,8 +296,11 @@ def apply_train_augment(
     and for A/B parity; passing both would double-augment.
     """
     if randaugment_m > 0 and randaugment_n > 0:
+        # ``photometric_rows`` is forwarded only when set, so an ordinary
+        # group's call is the one it has always been.
+        row_kwargs = {} if photometric_rows is None else {"photometric_rows": photometric_rows}
         batch = gpu_randaugment(
-            batch, randaugment_n, randaugment_m, photometric_only=photometric_only,
+            batch, randaugment_n, randaugment_m, photometric_only=photometric_only, **row_kwargs,
         )
     batch = gpu_gaussian_blur(batch, p=blur_p, sigma_max=blur_sigma_max)
     batch = gpu_gaussian_noise(batch, p=noise_p, std=noise_std)
