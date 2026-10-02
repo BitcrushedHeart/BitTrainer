@@ -28,6 +28,12 @@ from bittrainer.image_utils import is_supported_image
 
 _NONE_CLASS_NAME = "__none__"
 
+# Class label of a detection-only sample (Bitcrush ISSUE-0993): an image whose
+# drawn regions train the region head but which has no usable class label. It is
+# ``CrossEntropyLoss``'s default ``ignore_index`` on purpose, so a stray use in
+# a plain CE is ignored rather than crashing.
+DETECTION_ONLY_LABEL = -100
+
 # Rare-group ``__none__`` oversample magnitude: the target ``__none__`` count is
 # this factor times the (equalised) non-``__none__`` total. Shared with the
 # auto-oversample sweep in group_trainer so the probe and the full fine-tune
@@ -64,6 +70,12 @@ def compute_class_log_priors(counts: dict[int, int], num_classes: int) -> dict[s
     smoothed = [float(counts.get(i, 0) or 0) + 1.0 for i in range(num_classes)]
     total = sum(smoothed)
     return {str(i): math.log(smoothed[i] / total) for i in range(num_classes)}
+
+
+def labelled_samples(samples: list[dict]) -> list[dict]:
+    """*samples* without the detection-only rows — what a classifier may train
+    or be scored on. Identity for a group without regions."""
+    return [s for s in samples if not s.get("detection_only")]
 
 
 def _list_class_images(group_folder: Path, class_name: str, split: str) -> list[Path]:
@@ -109,6 +121,8 @@ class GroupDataset(Dataset):
         natural_sampling: bool = False,
         train_resolution: int = DEFAULT_TRAIN_RESOLUTION,
         forensic: Any | None = None,        # ForensicAugment instance
+        region_manifest: Any | None = None,  # RegionManifest (ISSUE-0993)
+        scan_disk: bool = True,
     ):
         self.group_folder = Path(group_folder)
         self.class_names = class_names
@@ -136,6 +150,17 @@ class GroupDataset(Dataset):
         # class — used by the "reweight" class-balance mode, where imbalance is
         # handled by class weights in the loss instead of by oversampling.
         self._natural_sampling = natural_sampling
+        # Crop-assisted groups (Bitcrush ISSUE-0993). With a manifest attached,
+        # every item is a 4-tuple whose last element is the sample's region
+        # info (see _region_info), crop files are tagged as the crop view of
+        # their source image, and drawn images without a usable class label are
+        # appended as detection-only rows. None = an ordinary group, whose
+        # items stay the 3-tuples they have always been.
+        self._region_manifest = None if sourceless else region_manifest
+        self._detection_only_indices: list[int] = []
+        # False = the class folders are not scanned; the samples are exactly
+        # the ``extra_paths`` (the crop-view validation set is built this way).
+        self._scan_disk = scan_disk
         # Skin Tone V2 dual-view (skin_tone_views.py): a per-image colour
         # normalisation applied as a stochastic train augmentation, or forced
         # for the validation "normalized" pass. Attached post-init by
@@ -180,7 +205,9 @@ class GroupDataset(Dataset):
         extra = extra_paths or {}
         self._class_paths: list[list[Path]] = []
         for name in class_names:
-            disk_paths = _list_class_images(self.group_folder, name, split)
+            disk_paths = (
+                _list_class_images(self.group_folder, name, split) if scan_disk else []
+            )
             extras = extra.get(name, [])
             if extras:
                 seen = {str(p) for p in disk_paths}
@@ -292,6 +319,7 @@ class GroupDataset(Dataset):
 
         if self.multi_label:
             self._build_multilabel_samples()
+            self._annotate_regions()
             return
 
         bad_paths: set[str] = set()
@@ -310,6 +338,101 @@ class GroupDataset(Dataset):
                 bucket = find_nearest_bucket(*self._size_memo[sp], self._train_resolution)
                 self._class_base_indices[class_idx].append(len(self.samples))
                 self.samples.append(self._make_sample(sp, class_idx, bucket))
+        self._annotate_regions()
+
+    # -- crop-assisted groups (ISSUE-0993) ----------------------------------
+
+    def _annotate_regions(self) -> None:
+        """Tag the base list from the region manifest and append the
+        detection-only rows. Runs at the end of every base rebuild, so the
+        annotations survive ``drop_paths_without_bbox``."""
+        self._detection_only_indices = []
+        manifest = self._region_manifest
+        if manifest is None:
+            return
+        seen_images: set[int] = set()
+        for sample in self.samples:
+            crop = manifest.crop_for(sample["path"])
+            if crop is not None:
+                sample["view"] = "crop"
+                # Keys the Skin Tone dual-view bank: a crop is colour-normalised
+                # with its source image's transform (see _maybe_skin_tone_view).
+                sample["source_path"] = crop.source
+                continue
+            sample["view"] = "full"
+            image = manifest.image_for(sample["path"])
+            if image is not None and image.split == self.split:
+                sample["region_boxes"] = image.boxes
+                sample["region_types"] = tuple(sorted(image.supervised_types()))
+                seen_images.add(id(image))
+
+        if self.multi_label:
+            empty_label: int | torch.Tensor = torch.zeros(
+                len(self.class_names), dtype=torch.float32
+            )
+        else:
+            empty_label = DETECTION_ONLY_LABEL
+        for image in manifest.images_in(self.split):
+            if id(image) in seen_images or not image.supervised_types():
+                continue
+            path = next(
+                (p for p in image.paths if is_supported_image(Path(p)) and Path(p).is_file()),
+                None,
+            )
+            size = self._size_for(path) if path else None
+            if path is None or size is None:
+                continue
+            sample = self._make_sample(
+                path, empty_label, find_nearest_bucket(*size, self._train_resolution)
+            )
+            sample["view"] = "full"
+            sample["detection_only"] = True
+            sample["region_boxes"] = image.boxes
+            sample["region_types"] = tuple(sorted(image.supervised_types()))
+            self._detection_only_indices.append(len(self.samples))
+            self.samples.append(sample)
+
+    def _with_detection_only(self, indices: list[int]) -> list[int]:
+        """Add the detection-only rows to a TRAIN epoch schedule (the other
+        branches already walk every base row)."""
+        if self._detection_only_indices:
+            indices = indices + self._detection_only_indices
+            random.shuffle(indices)
+        return indices
+
+    def _region_info(self, sample: dict) -> dict:
+        """The 4th item element: this sample's region supervision.
+
+        ``boxes`` are the kept regions in the frame of the tensor (the source
+        image after the bucket's aspect crop), ``supervised`` marks the region
+        types the user reviewed on the image, and ``cls`` is False for a
+        detection-only row. A crop file or an undrawn image supervises nothing.
+        """
+        from bittrainer.face_crop import aspect_crop_rect
+        from bittrainer.region_manifest import map_box_into_rect
+
+        num_types = self._region_manifest.num_types
+        supervised = torch.zeros(num_types, dtype=torch.bool)
+        boxes: list[tuple[float, float, float, float]] = []
+        types: list[int] = []
+        kinds = sample.get("region_types") or ()
+        size = self._size_memo.get(sample["path"]) if kinds else None
+        if size is not None:
+            for k in kinds:
+                supervised[k] = True
+            bw, bh = int(sample["bucket"][0]), int(sample["bucket"][1])
+            rect = aspect_crop_rect(size[0], size[1], bw / bh, sample.get("face_bbox"))
+            for x1, y1, x2, y2, kind in sample.get("region_boxes") or ():
+                mapped = map_box_into_rect((x1, y1, x2, y2), size[0], size[1], rect)
+                if mapped is not None:
+                    boxes.append(mapped)
+                    types.append(int(kind))
+        return {
+            "boxes": torch.tensor(boxes, dtype=torch.float32).reshape(-1, 4),
+            "types": torch.tensor(types, dtype=torch.long),
+            "supervised": supervised,
+            "cls": not sample.get("detection_only", False),
+        }
 
     # -- epoch schedule (redrawn every reshuffle) ---------------------------
 
@@ -348,7 +471,7 @@ class GroupDataset(Dataset):
             (len(b) for b in self._class_base_indices if len(b) > 0), default=0
         )
         if max_count == 0:
-            self._epoch_indices = []
+            self._epoch_indices = self._with_detection_only([])
             return
 
         indices = []
@@ -376,7 +499,7 @@ class GroupDataset(Dataset):
             indices.extend(self._rare_group_extra_indices(max_count))
 
         random.shuffle(indices)
-        self._epoch_indices = indices
+        self._epoch_indices = self._with_detection_only(indices)
 
     def _rare_group_extra_indices(self, max_count: int) -> list[int]:
         """EXTRA ``__none__`` base indices so the rare-group target dominates.
@@ -531,8 +654,18 @@ class GroupDataset(Dataset):
     def __len__(self) -> int:
         return len(self.samples)
 
-    def __getitem__(self, idx: int) -> tuple[torch.Tensor, int | torch.Tensor, tuple[int, int]]:
+    def __getitem__(self, idx: int):
+        """``(tensor, label, bucket)`` — plus the sample's region info as a
+        fourth element when a region manifest is attached (ISSUE-0993)."""
         sample = self.samples[idx]
+        item = self._load_item(sample)
+        if self._region_manifest is None:
+            return item
+        return (*item, self._region_info(sample))
+
+    def _load_item(
+        self, sample: dict
+    ) -> tuple[torch.Tensor, int | torch.Tensor, tuple[int, int]]:
         bucket = sample["bucket"]
         bw, bh = int(bucket[0]), int(bucket[1])
 
@@ -615,7 +748,8 @@ class GroupDataset(Dataset):
         counts: dict[int, int] = {}
         for i in self._epoch_indices:
             lbl = self.samples[i]["label"]
-            if isinstance(lbl, int):
+            # Detection-only rows (label -100) are not class exposure.
+            if isinstance(lbl, int) and lbl >= 0:
                 counts[lbl] = counts.get(lbl, 0) + 1
         return counts
 

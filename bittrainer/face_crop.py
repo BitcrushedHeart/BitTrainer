@@ -211,26 +211,23 @@ def precompute_face_bboxes(
     )
 
 
-def face_aware_crop(
-    img: Image.Image,
+def aspect_crop_rect(
+    img_w: int,
+    img_h: int,
     target_ratio: float,
-    face_bbox: list[int] | None,
-) -> Image.Image:
-    """Crop image to target aspect ratio, keeping faces in frame.
+    face_bbox: list[int] | None = None,
+) -> tuple[int, int, int, int]:
+    """The ``(left, top, width, height)`` rectangle :func:`face_aware_crop` keeps.
 
-    Args:
-        img: PIL Image to crop.
-        target_ratio: Target width/height ratio.
-        face_bbox: [x1, y1, x2, y2] union of all faces, or empty/None for centre crop.
-
-    Returns:
-        Cropped PIL Image at the target aspect ratio.
+    Split out so anything that has to follow the pixels through the crop — a
+    region box drawn on the source image (Bitcrush ISSUE-0993) — uses the very
+    same geometry instead of a second copy of it. A source already within 1% of
+    the target aspect is kept whole.
     """
-    img_w, img_h = img.size
     img_ratio = img_w / img_h
 
     if abs(img_ratio - target_ratio) < 0.01:
-        return img
+        return 0, 0, img_w, img_h
 
     if target_ratio > img_ratio:
         # Crop height (image is too tall)
@@ -268,4 +265,26 @@ def face_aware_crop(
     left = max(0, min(left, img_w - new_w))
     top = max(0, min(top, img_h - new_h))
 
+    return left, top, new_w, new_h
+
+
+def face_aware_crop(
+    img: Image.Image,
+    target_ratio: float,
+    face_bbox: list[int] | None,
+) -> Image.Image:
+    """Crop image to target aspect ratio, keeping faces in frame.
+
+    Args:
+        img: PIL Image to crop.
+        target_ratio: Target width/height ratio.
+        face_bbox: [x1, y1, x2, y2] union of all faces, or empty/None for centre crop.
+
+    Returns:
+        Cropped PIL Image at the target aspect ratio.
+    """
+    img_w, img_h = img.size
+    left, top, new_w, new_h = aspect_crop_rect(img_w, img_h, target_ratio, face_bbox)
+    if (left, top, new_w, new_h) == (0, 0, img_w, img_h):
+        return img
     return img.crop((left, top, left + new_w, top + new_h))
