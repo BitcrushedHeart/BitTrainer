@@ -280,7 +280,7 @@ class GroupTask(TrainingTask):
         model = model.to(device)
         if self.memory_format is not None:
             model = model.to(memory_format=self.memory_format)
-        prepare_for_finetune(model, config.finetune_blocks)
+        prepare_for_finetune(model, getattr(config, "finetune_blocks", 4))
         return model
 
     def pre_loop(self, ctx: TaskContext, model) -> None:
@@ -301,7 +301,7 @@ class GroupTask(TrainingTask):
         )
         # The probe froze the backbone: restore the fine-tune's trainable set
         # (ConvNeXt: everything; SigLIP: heads + the last finetune_blocks blocks).
-        prepare_for_finetune(model, self.config.finetune_blocks)
+        prepare_for_finetune(model, getattr(self.config, "finetune_blocks", 4))
 
     def resolve_batch_size(
         self, ctx: TaskContext, model, resume_state: dict | None
