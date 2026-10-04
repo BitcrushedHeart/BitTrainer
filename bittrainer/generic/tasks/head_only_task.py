@@ -23,17 +23,20 @@ test / monkeypatch seams keep firing.
 from __future__ import annotations
 
 import logging
+import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import torch
 from torch.utils.data import DataLoader
 
 import bittrainer.group_trainer as gt
+from bittrainer.cached_eval import CachedValScorer, val_inputs_are_cache_inputs
 from bittrainer.dataset import resolution_ckpt_meta
 from bittrainer.embedding_cache import EmbeddingCache
 from bittrainer.generic.task import BestTracker, LoopSpec, TaskContext, TrainingTask
 from bittrainer.group_dataset import build_group_bucket_sampler, labelled_samples
+from bittrainer.head_probe import prepare_head_probe_tensors
 from bittrainer.model import backbone_feature_hash, backbone_state_hash
 from bittrainer.regions import REGION_HEAD_PREFIX, has_region_head, region_head_ckpt_meta
 from bittrainer.training_state import BackupCoordinator
@@ -74,6 +77,23 @@ def settle_head_only_region_head(model: torch.nn.Module, incumbent_path: str | P
     return "needs_full_train"
 
 
+def _val_pass_progress(cb: Callable[[dict], None], label: str) -> Callable[[int, int], None]:
+    """Rate-limited per-batch frames for a full val pass (ISSUE-1110: job
+    1593's pass emitted none for 20+ minutes and the UI looked frozen)."""
+    last = [0.0]
+
+    def _report(done: int, total: int) -> None:
+        now = time.monotonic()
+        if done < total and now - last[0] < 0.5:
+            return
+        last[0] = now
+        cb({"type": "training_progress", "stage": "evaluating",
+            "status_text": f"{label} ({done}/{total} batches)",
+            "step": done, "total_steps": total})
+
+    return _report
+
+
 def _thin_class_warnings(class_counts: dict[int, int], class_names: list[str]) -> list[dict]:
     warnings: list[dict] = []
     for idx, count in class_counts.items():
@@ -88,8 +108,13 @@ class HeadOnlyTask(TrainingTask):
 
     trainer_name = "head_only"
 
-    def __init__(self, config: gt.GroupTrainConfig) -> None:
+    def __init__(self, config: gt.GroupTrainConfig, *, cached_val_eval: bool = True) -> None:
         self.config = config
+        # ISSUE-1110: score the candidate (and a same-trunk incumbent) on the
+        # cached val vectors instead of running the frozen trunk over every val
+        # image. ``False`` forces the full passes (tests compare the two).
+        self.cached_val_eval = bool(cached_val_eval)
+        self.cached_val = None
         # Populated across the lifecycle hooks.
         self.train_ds = None
         self.val_ds = None
@@ -212,9 +237,12 @@ class HeadOnlyTask(TrainingTask):
         self.backbone_hash = backbone_feature_hash(model)
         pooled_dim = int(getattr(model, "num_features", 0))
         embed_root = config.embedding_cache_dir or str(group_folder / ".embedding_cache")
+        # Packed (ISSUE-1110): the run's vectors stay in memory after ensure()
+        # and one consolidated pack serves the next run / comparison candidate.
         embed_cache = EmbeddingCache(
             embed_root, self.backbone_hash, pooled_dim,
-            preproc_sig=gt._embedding_preproc_sig(config.train_resolution),
+            preproc_sig=gt._group_embedding_preproc_sig(config),
+            packed=True,
         )
 
         # Detection-only rows (crop-assisted groups) carry no class for a probe.
@@ -227,12 +255,21 @@ class HeadOnlyTask(TrainingTask):
                 "step": done, "total_steps": total,
             })
 
+        def _check_progress(done: int, total: int) -> None:
+            cb({
+                "type": "training_progress", "stage": "embedding_build",
+                "status_text": f"Checking feature cache ({done}/{total})",
+                "step": done, "total_steps": total,
+            })
+
         cb({"type": "training_progress", "stage": "embedding_build",
             "status_text": f"Caching backbone features (era {self.backbone_hash})"})
         self.stats = embed_cache.ensure(
             all_samples, model, self.smart_cache, device=device, dtype=dtype,
             batch_size=config.embedding_batch_size, progress_cb=_build_progress,
             stop_check=lambda: self._stop(ctx),
+            prune=bool(config.embedding_cache_prune),
+            check_progress_cb=_check_progress,
         )
         logger.info("EmbeddingCache: %s", self.stats)
 
@@ -243,6 +280,8 @@ class HeadOnlyTask(TrainingTask):
             return
 
         # Mandatory: fail loud on a stale/bad cache before any probe consumes it.
+        cb({"type": "training_progress", "stage": "embedding_build",
+            "status_text": "Verifying feature cache against a live forward"})
         checked = embed_cache.verify(all_samples, model, self.smart_cache, device=device, dtype=dtype)
         logger.info("EmbeddingCache.verify: %d vectors matched live forward", checked)
 
@@ -260,10 +299,17 @@ class HeadOnlyTask(TrainingTask):
         # Epoch-shaped (replication-expanded) train rows: ``samples`` is the
         # stable, de-replicated base list since ISSUE-0859.
         train_epoch_samples = labelled_samples(self.train_ds.epoch_samples())
+        # Load the cached features ONCE for both sweeps (ISSUE-1110: each sweep
+        # used to re-read every vector from its own .npy file).
+        tensors = prepare_head_probe_tensors(
+            embed_cache, self.smart_cache, train_epoch_samples, self.val_ds.samples,
+            config, cb=cb,
+        )
         probe = gt._run_auto_softness_probe(
             model, config, embed_cache, self.smart_cache,
             train_epoch_samples, self.val_ds.samples,
             device=device, none_index=none_index, cb=cb, stop_event=ctx.stop_event,
+            tensors=tensors,
         )
         # Second pre-training sweep: __none__ oversample off vs 1.5x. When it runs
         # it leaves the head in the selected state and supersedes the softness probe
@@ -272,14 +318,14 @@ class HeadOnlyTask(TrainingTask):
             model, config, embed_cache, self.smart_cache,
             train_epoch_samples, self.val_ds.samples,
             device=device, none_index=none_index, cb=cb, stop_event=ctx.stop_event,
+            tensors=tensors,
         )
         if oversample_probe:
             probe = oversample_probe
         self.probe = probe
 
         # Evaluate the trained candidate (frozen backbone + warm head) on the val
-        # images, so it competes with the incumbent on identical _evaluate footing.
-        # A one-shot val pass (num_workers=0 — small, single-process, no spawn).
+        # set, so it competes with the incumbent on identical _evaluate footing.
         collate_fn = gt._collate_multilabel_batch if config.multi_label else gt._collate_bucket_batch
         val_bs = config.batch_size or 32
         val_loader = DataLoader(
@@ -289,11 +335,31 @@ class HeadOnlyTask(TrainingTask):
         )
         self._val_loader = val_loader
         model.eval()
-        self.candidate_metrics = gt._evaluate(
-            model, val_loader, config.num_classes, device, dtype,
-            multi_label=config.multi_label, ordinal=config.ordinal,
-            none_index=none_index,
-        )
+        x_val = tensors[2]
+        if (
+            self.cached_val_eval
+            and x_val.shape[0] == len(self.val_ds.samples)
+            and val_inputs_are_cache_inputs(self.val_ds)
+        ):
+            # Every val image has its cached vector (the gather skips none), and
+            # the val set feeds the model exactly the tensors the cache embedded:
+            # the head on those vectors IS the full pass (ISSUE-1110).
+            self.cached_val = CachedValScorer(
+                model, x_val, self.backbone_hash, multi_label=config.multi_label,
+            )
+            cb({"type": "training_progress", "stage": "evaluating",
+                "status_text": "Scoring the trained head on cached validation features"})
+            self.candidate_metrics = self.cached_val.evaluate(
+                model, val_loader, config.num_classes, device, dtype,
+                ordinal=config.ordinal, none_index=none_index,
+            )
+        else:
+            self.candidate_metrics = gt._evaluate(
+                model, val_loader, config.num_classes, device, dtype,
+                multi_label=config.multi_label, ordinal=config.ordinal,
+                none_index=none_index,
+                progress=_val_pass_progress(cb, "Scoring the trained head on validation images"),
+            )
         self.candidate_macro_f1 = self.candidate_metrics.get("macro_f1", 0.0)
         self.candidate_qwk = self.candidate_metrics.get("qwk", -1.0)
 
@@ -364,6 +430,7 @@ class HeadOnlyTask(TrainingTask):
             effective_class_counts=self.train_ds.get_effective_class_counts(),
             total_raw=self.total_raw,
             cb=cb,
+            cached_val=self.cached_val,
         )
         result["mode"] = "head_only"
         result["probe_head"] = config.probe_head

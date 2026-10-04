@@ -32,6 +32,9 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+#: ``(x_train, y_train, x_val, y_val)`` cached-feature tensors (ISSUE-1110).
+ProbeTensors = tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
+
 _ORDINAL_SIGMA_CANDIDATES = [round(i / 10, 3) for i in range(11)]
 _LABEL_SMOOTHING_CANDIDATES = [0.0, 0.025, 0.05, 0.075, 0.1, 0.15, 0.2]
 # __none__ oversample sweep candidates: (label, oversample_none flag).
@@ -124,19 +127,33 @@ def _run_auto_softness_probe(
     none_index: int,
     cb: Callable[[dict], None],
     stop_event: object | None,
+    tensors: ProbeTensors | None = None,
 ) -> dict:
+    """Soft-label sweep on cached features.
+
+    ``tensors`` -- ``(x_train, y_train, x_val, y_val)`` from
+    :func:`prepare_head_probe_tensors` -- lets a run load the features once
+    for every sweep (ISSUE-1110); ``None`` loads them here.
+    """
     kind = _auto_softness_kind(config)
     if kind is None:
-        return train_head_probe(
-            model, embed_cache, smart_cache,
-            train_samples, val_samples, config,
-            device=device, none_index=none_index,
-            cb=cb, stop_event=stop_event,
+        if tensors is None:
+            return train_head_probe(
+                model, embed_cache, smart_cache,
+                train_samples, val_samples, config,
+                device=device, none_index=none_index,
+                cb=cb, stop_event=stop_event,
+            )
+        return train_head_probe_from_tensors(
+            model, *tensors, config,
+            device=device, none_index=none_index, cb=cb, stop_event=stop_event,
         )
 
-    x_train, y_train, x_val, y_val = prepare_head_probe_tensors(
-        embed_cache, smart_cache, train_samples, val_samples, config, cb=cb,
-    )
+    if tensors is None:
+        tensors = prepare_head_probe_tensors(
+            embed_cache, smart_cache, train_samples, val_samples, config, cb=cb,
+        )
+    x_train, y_train, x_val, y_val = tensors
     original_head_state = copy.deepcopy(model.head.state_dict())
     original_rng_state = _capture_rng_state(device)
     original_sigma = config.ordinal_sigma
@@ -311,6 +328,7 @@ def _run_auto_oversample_probe(
     none_index: int,
     cb: Callable[[dict], None],
     stop_event: object | None,
+    tensors: ProbeTensors | None = None,
 ) -> dict:
     """Sweep ``__none__`` oversampling (off vs 1.5x) on cached features.
 
@@ -319,13 +337,16 @@ def _run_auto_oversample_probe(
     score, and writes the choice to ``config.oversample_none`` (+ tuning
     metadata). Returns the winning probe dict, or ``{}`` when the sweep is
     skipped (multi-label, no ``__none__`` class, or oversampling adds nothing).
+    ``tensors`` reuses features the run already loaded (ISSUE-1110).
     """
     if not _auto_oversample_enabled(config, none_index):
         return {}
 
-    x_train, y_train, x_val, y_val = prepare_head_probe_tensors(
-        embed_cache, smart_cache, train_samples, val_samples, config, cb=cb,
-    )
+    if tensors is None:
+        tensors = prepare_head_probe_tensors(
+            embed_cache, smart_cache, train_samples, val_samples, config, cb=cb,
+        )
+    x_train, y_train, x_val, y_val = tensors
     x_train_os, y_train_os = _build_oversampled_tensors(x_train, y_train, none_index)
     if x_train_os.shape[0] == x_train.shape[0]:
         # No extra __none__ rows were added: the two candidates are identical,

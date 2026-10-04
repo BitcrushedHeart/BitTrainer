@@ -14,6 +14,19 @@ deleted rather than left to accumulate under the cache root.
 The cache point is ``flatten(norm(global_pool(features)))`` (pre pre_logits/fc),
 computed by :func:`bittrainer.model.pooled_features` with the backbone in
 ``eval()`` so the forward is deterministic (no drop_path, no head dropout).
+
+**Packs** (Bitcrush ISSUE-1110, opt-in via ``packed=True``): reading one small
+``.npy`` per image costs ~0.5 ms each on NTFS (minutes cold), and a head-only
+run read every vector three times (``ensure``'s audit, then each probe
+sweep's gather). A packed cache keeps the run's vectors in memory once loaded
+and writes one consolidated ``pack-<ns>-<id>.npz`` holding exactly the run's
+vectors, so the next run — or the next backbone-comparison candidate — loads
+them in one read. The per-image ``.npy`` files are still written and stay the
+durable source of truth, so readers that predate packs keep working. A pack
+is written under a fresh name and then older packs are deleted best-effort:
+it is never replaced in place (on Windows a reader holding a file open makes
+``os.replace`` over it fail), it is read fully into memory (never memory-
+mapped), and a pack that fails validation is simply ignored.
 """
 
 from __future__ import annotations
@@ -26,7 +39,9 @@ import os
 import random
 import re
 import shutil
+import time
 import uuid
+import zipfile
 from collections import defaultdict, deque
 from pathlib import Path
 from typing import Any, Callable
@@ -47,6 +62,12 @@ EMBED_CACHE_VERSION = 1
 # signature digest (see _sig_suffix). Used to recognise our own era directories
 # when pruning so we never touch an unrelated sibling under the cache root.
 _ERA_DIR_RE = re.compile(r"^[0-9a-f]{16}(-[0-9a-f]{8})?$")
+
+# Consolidated vector packs (see the module docstring). Names sort
+# chronologically: ``pack-<time_ns, 20 digits>-<8 hex>.npz``.
+PACK_VERSION = 1
+_PACK_GLOB = "pack-*.npz"
+_PACK_READ_ERRORS = (OSError, ValueError, KeyError, EOFError, zipfile.BadZipFile)
 
 
 def _sig_suffix(preproc_sig: str) -> str:
@@ -117,6 +138,7 @@ class EmbeddingCache:
         pooled_dim: int,
         *,
         preproc_sig: str = "val_imagenet",
+        packed: bool = False,
     ) -> None:
         self.root = Path(cache_dir) / (backbone_hash + _sig_suffix(preproc_sig))
         self.backbone_hash = backbone_hash
@@ -130,6 +152,13 @@ class EmbeddingCache:
         # OOMs, every later batch runs at the reduced size (see
         # _forward_pooled_capped).
         self._forward_cap: int | None = None
+        # Packed mode (ISSUE-1110): validated vectors held in memory by content
+        # hash (loaded from the newest pack, from per-image files, or built),
+        # and a consolidated pack of the run's set written by ensure().
+        self.packed = bool(packed)
+        self._mem: dict[str, np.ndarray] = {}
+        self._pack_loaded = False
+        self._pack_hashes: frozenset[str] = frozenset()
 
     def _hash(self, path: str, smart_cache: Any | None) -> str | None:
         if path in self._hash_memo:
@@ -194,6 +223,116 @@ class EmbeddingCache:
         except (OSError, ValueError, EOFError):
             return None
         return vector if self._valid_vector(vector) else None
+
+    # -- consolidated packs (ISSUE-1110) -----------------------------------
+    def _pack_meta(self) -> dict[str, Any]:
+        return {
+            "pack_version": PACK_VERSION,
+            "embed_version": EMBED_CACHE_VERSION,
+            "backbone_hash": self.backbone_hash,
+            "pooled_dim": self.pooled_dim,
+            "preproc_sig": self.preproc_sig,
+        }
+
+    def _pack_paths(self) -> list[Path]:
+        """Packs in this era, newest first (names sort chronologically)."""
+        if not self.root.is_dir():
+            return []
+        return sorted(self.root.glob(_PACK_GLOB), key=lambda p: p.name, reverse=True)
+
+    def _read_pack(self, path: Path) -> dict[str, np.ndarray] | None:
+        """One pack fully in memory, or ``None`` when it fails any check.
+
+        All-or-nothing: a pack from another era, of the wrong shape, or with a
+        single non-finite / zero row is rejected whole — the per-image files
+        then serve, and the next ``ensure`` writes a good pack.
+        """
+        try:
+            with np.load(path, allow_pickle=False) as z:
+                meta = json.loads(str(z["meta"][()]))
+                hashes = z["hashes"]
+                vectors = z["vectors"]
+        except (*_PACK_READ_ERRORS, json.JSONDecodeError, TypeError):
+            return None
+        if not isinstance(meta, dict) or meta != self._pack_meta():
+            return None
+        if (
+            vectors.ndim != 2
+            or vectors.shape != (hashes.shape[0], self.pooled_dim)
+            or vectors.dtype != np.float32
+            or hashes.ndim != 1
+        ):
+            return None
+        if not bool(np.isfinite(vectors).all()):
+            return None
+        if vectors.shape[0] and float(np.linalg.norm(vectors, axis=1).min()) <= 1e-12:
+            return None
+        return {str(h): vectors[i] for i, h in enumerate(hashes)}
+
+    def _load_pack(self) -> dict[str, np.ndarray] | None:
+        """The newest valid pack of this era, or ``None``.
+
+        A pack deleted by a concurrent writer between the listing and the read
+        (or one this process cannot open) just falls through to the next.
+        """
+        for path in self._pack_paths():
+            rows = self._read_pack(path)
+            if rows is not None:
+                return rows
+            logger.info("EmbeddingCache: ignoring unreadable pack %s", path.name)
+        return None
+
+    def _ensure_pack_loaded(self) -> None:
+        if not self.packed or self._pack_loaded:
+            return
+        self._pack_loaded = True
+        rows = self._load_pack()
+        if rows:
+            self._pack_hashes = frozenset(rows)
+            for content_hash, vector in rows.items():
+                self._mem.setdefault(content_hash, vector)
+
+    def _write_pack(self, hashes: list[str]) -> Path | None:
+        """Write the vectors of *hashes* (all held in memory) as a new pack.
+
+        Written to a temp file and renamed to a NEW unique name, so no reader's
+        open handle can block it; older packs are then removed best-effort (a
+        pack another process is reading stays until a later write). Failures
+        only cost the speed-up, never the run.
+        """
+        if not hashes:
+            return None
+        self.root.mkdir(parents=True, exist_ok=True)
+        name = f"pack-{time.time_ns():020d}-{uuid.uuid4().hex[:8]}.npz"
+        final_path = self.root / name
+        tmp_path = self.root / f".{name}.{os.getpid()}.tmp"
+        try:
+            vectors = np.stack([self._mem[h] for h in hashes]).astype(np.float32, copy=False)
+            with tmp_path.open("wb") as handle:
+                np.savez(
+                    handle,
+                    meta=np.array(json.dumps(self._pack_meta())),
+                    hashes=np.array(hashes),
+                    vectors=vectors,
+                )
+            os.replace(tmp_path, final_path)
+        except (OSError, ValueError, KeyError) as exc:
+            logger.warning("EmbeddingCache: could not write a vector pack: %s", exc)
+            return None
+        finally:
+            try:
+                tmp_path.unlink()
+            except OSError:
+                pass
+        self._pack_hashes = frozenset(hashes)
+        for old in self._pack_paths():
+            if old.name >= name:
+                continue
+            try:
+                old.unlink()
+            except OSError:
+                pass
+        return final_path
 
     def _save_vector(self, content_hash: str, vector: np.ndarray) -> None:
         """Save one vector via temp file + atomic replace (no per-vector fsync).
@@ -364,6 +503,7 @@ class EmbeddingCache:
         progress_cb: Callable[[int, int], None] | None = None,
         stop_check: Callable[[], bool] | None = None,
         prune: bool = True,
+        check_progress_cb: Callable[[int, int], None] | None = None,
     ) -> dict:
         """Build any missing pooled vectors for *samples* under this backbone era.
 
@@ -377,6 +517,12 @@ class EmbeddingCache:
         eras must coexist deliberately (the resolution probe builds one small
         era per candidate resolution and must not delete the production era or
         its own previous candidates; the next real training run prunes losers).
+
+        Packed caches (ISSUE-1110) take every vector the newest valid pack
+        holds without touching its per-image file, keep all of the run's
+        vectors in memory, and write a new pack when the run's set was not
+        already covered. ``check_progress_cb(done, total)`` reports the
+        existing-vector check, which reads one file per image not in a pack.
 
         Returns ``{"built": n, "reused": n, "total": n}``.
         """
@@ -403,31 +549,53 @@ class EmbeddingCache:
             by_hash.setdefault(h, s)
 
         total = len(by_hash)
+        self._ensure_pack_loaded()
         missing: list[tuple[str, dict]] = []
-        for content_hash, sample in by_hash.items():
-            vector_path = self._vec_path(content_hash)
-            if not vector_path.is_file():
-                missing.append((content_hash, sample))
-                continue
-            # Validate every vector referenced by this run, even when the era
-            # marker says complete. The root is shared across concepts: a
-            # different concept may have set the era complete after a crash
-            # without referencing (and therefore auditing) this file.
-            if self._load_vector_path(vector_path) is None:
-                logger.warning(
-                    "EmbeddingCache: rebuilding invalid vector left by an "
-                    "interrupted cache build: %s",
-                    vector_path,
-                )
-                try:
-                    vector_path.unlink()
-                except FileNotFoundError:
-                    pass
-                missing.append((content_hash, sample))
+        last_check_report = 0.0
+        # Vectors validated when the pack was read (or loaded / built by this
+        # process) need no per-image read. The rest are read on io_workers
+        # threads -- one small file each, ~9x faster in parallel on a cold NTFS
+        # cache (measured, ISSUE-1110) -- and consumed in order, so the outcome
+        # is the serial audit's.
+        skip = {h for h in by_hash if self.packed and h in self._mem}
+        to_read = [h for h in by_hash if h not in skip]
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, io_workers)) as pool:
+            audited = pool.map(self._audit_vector, to_read)
+            for checked, (content_hash, sample) in enumerate(by_hash.items(), start=1):
+                if check_progress_cb is not None:
+                    now = time.monotonic()
+                    if checked == total or now - last_check_report >= 0.25:
+                        last_check_report = now
+                        check_progress_cb(checked, total)
+                if content_hash in skip:
+                    continue
+                exists, vector = next(audited)
+                vector_path = self._vec_path(content_hash)
+                if not exists:
+                    missing.append((content_hash, sample))
+                    continue
+                # Validate every vector referenced by this run, even when the era
+                # marker says complete. The root is shared across concepts: a
+                # different concept may have set the era complete after a crash
+                # without referencing (and therefore auditing) this file.
+                if vector is None:
+                    logger.warning(
+                        "EmbeddingCache: rebuilding invalid vector left by an "
+                        "interrupted cache build: %s",
+                        vector_path,
+                    )
+                    try:
+                        vector_path.unlink()
+                    except FileNotFoundError:
+                        pass
+                    missing.append((content_hash, sample))
+                elif self.packed:
+                    self._mem[content_hash] = np.ascontiguousarray(vector, dtype=np.float32)
         reused = total - len(missing)
         if not missing:
             if audit_existing:
                 self._write_meta(complete=True)
+            self._maybe_write_run_pack(list(by_hash))
             return {"built": 0, "reused": reused, "total": total}
 
         # This marker reaches disk before any vector write. A hard reset then
@@ -510,6 +678,9 @@ class EmbeddingCache:
                             )
                         vector = retry
                     safe_vecs.append(np.ascontiguousarray(vector, dtype=np.float32))
+                if self.packed:
+                    for content_hash, vector in zip(hashes, safe_vecs):
+                        self._mem[content_hash] = vector
                 save_futures.append(
                     saver.submit(self._save_many, list(zip(hashes, safe_vecs)))
                 )
@@ -524,16 +695,119 @@ class EmbeddingCache:
 
         if built == len(missing):
             self._write_meta(complete=True)
+            self._maybe_write_run_pack(list(by_hash))
         return {"built": built, "reused": reused, "total": total}
+
+    def _maybe_write_run_pack(self, run_hashes: list[str]) -> None:
+        """Packed caches: write a pack of exactly the run's set unless the
+        newest pack already covers it. Bounded by the current dataset — a
+        hash that left the group drops out at the next rewrite."""
+        if not self.packed or not run_hashes:
+            return
+        if self._pack_hashes.issuperset(run_hashes):
+            return
+        if any(h not in self._mem for h in run_hashes):
+            return
+        self._write_pack(run_hashes)
 
     def get_vector(self, path: str, smart_cache: Any | None) -> np.ndarray | None:
         h = self._hash(path, smart_cache)
         if h is None:
             return None
+        if self.packed:
+            self._ensure_pack_loaded()
+            vector = self._mem.get(h)
+            if vector is not None:
+                return vector
         p = self._vec_path(h)
         if not p.is_file():
             return None
+        vector = self._load_vector_path(p)
+        if vector is not None and self.packed:
+            vector = np.ascontiguousarray(vector, dtype=np.float32)
+            self._mem[h] = vector
+        return vector
+
+    def vectors_for(
+        self,
+        samples: list[dict],
+        smart_cache: Any | None,
+        *,
+        progress_cb: Callable[[int, int], None] | None = None,
+        io_workers: int = 8,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Pooled vectors for *samples*, one row per sample (ISSUE-1110).
+
+        Returns ``(matrix, present)``: a float32 ``[len(samples), pooled_dim]``
+        array (zero rows where absent) and a bool mask of the rows that have a
+        vector. Each distinct image is read once however often it repeats
+        (the replication-expanded train schedule repeats rows); vectors come
+        from memory / the pack first, then from per-image files on a thread
+        pool. ``progress_cb(done, total)`` counts distinct images.
+        """
+        hashes = [self._hash(s["path"], smart_cache) for s in samples]
+        unique: list[str] = list(dict.fromkeys(h for h in hashes if h is not None))
+        if self.packed:
+            self._ensure_pack_loaded()
+        found: dict[str, np.ndarray] = {}
+        pending: list[str] = []
+        for h in unique:
+            vector = self._mem.get(h)
+            if vector is not None:
+                found[h] = vector
+            else:
+                pending.append(h)
+        total = len(unique)
+        done = len(found)
+        if progress_cb is not None:
+            progress_cb(done, total)
+        if pending:
+            last_report = time.monotonic()
+            with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, io_workers)) as pool:
+                for h, vector in zip(
+                    pending, pool.map(self._load_hash, pending)
+                ):
+                    done += 1
+                    if vector is not None:
+                        vector = np.ascontiguousarray(vector, dtype=np.float32)
+                        found[h] = vector
+                        if self.packed:
+                            self._mem[h] = vector
+                    now = time.monotonic()
+                    if progress_cb is not None and (done == total or now - last_report >= 0.25):
+                        last_report = now
+                        progress_cb(done, total)
+        matrix = np.zeros((len(samples), self.pooled_dim), dtype=np.float32)
+        present = np.zeros(len(samples), dtype=bool)
+        for row, h in enumerate(hashes):
+            vector = found.get(h) if h is not None else None
+            if vector is not None:
+                matrix[row] = vector
+                present[row] = True
+        return matrix, present
+
+    def _audit_vector(self, content_hash: str) -> tuple[bool, np.ndarray | None]:
+        """``(file exists, validated vector or None)`` for one content hash."""
+        path = self._vec_path(content_hash)
+        if not path.is_file():
+            return False, None
+        return True, self._load_vector_path(path)
+
+    def _load_hash(self, content_hash: str) -> np.ndarray | None:
+        p = self._vec_path(content_hash)
+        if not p.is_file():
+            return None
         return self._load_vector_path(p)
+
+    def has_vector(self, path: str, smart_cache: Any | None) -> bool:
+        h = self._hash(path, smart_cache)
+        if h is None:
+            return False
+        if self.packed:
+            self._ensure_pack_loaded()
+            if h in self._mem:
+                return True
+        return self._vec_path(h).is_file()
 
     def verify(
         self,
@@ -572,8 +846,7 @@ class EmbeddingCache:
         picks: list[dict] = []
         for idx in order:
             s = samples[idx]
-            h = self._hash(s["path"], smart_cache)
-            if h is not None and self._vec_path(h).is_file():
+            if self.has_vector(s["path"], smart_cache):
                 picks.append(s)
                 if len(picks) >= sample_n:
                     break

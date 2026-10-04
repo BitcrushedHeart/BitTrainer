@@ -114,6 +114,37 @@ def _evaluate_probe(
     return metrics, score
 
 
+def _labels_tensor(labels: list[Any], *, multi_label: bool) -> torch.Tensor:
+    if multi_label:
+        return torch.stack([
+            lbl if torch.is_tensor(lbl) else torch.as_tensor(lbl, dtype=torch.float32)
+            for lbl in labels
+        ]).float()
+    return torch.tensor([int(lbl) for lbl in labels], dtype=torch.long)
+
+
+def _gather_bulk(
+    samples: list[dict],
+    embed_cache: Any,
+    smart_cache: Any | None,
+    *,
+    multi_label: bool,
+    progress_cb: Callable[[int, int], None] | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """:func:`_gather` through :meth:`EmbeddingCache.vectors_for` (ISSUE-1110).
+
+    Same rows, same order, same dtypes -- absent vectors are skipped exactly
+    as the per-sample loader skips them -- but each distinct image is read
+    once, from memory / the cache's pack when it has one.
+    """
+    matrix, present = embed_cache.vectors_for(samples, smart_cache, progress_cb=progress_cb)
+    if not bool(present.any()):
+        raise RuntimeError("Head probe: no cached embeddings available for these samples")
+    x = torch.from_numpy(np.ascontiguousarray(matrix[present]))
+    labels = [s["label"] for s, keep in zip(samples, present, strict=True) if keep]
+    return x, _labels_tensor(labels, multi_label=multi_label)
+
+
 def prepare_head_probe_tensors(
     embed_cache: Any,
     smart_cache: Any | None,
@@ -123,29 +154,48 @@ def prepare_head_probe_tensors(
     *,
     cb: Callable[[dict], None] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Load cached feature tensors once for one or more probe runs."""
+    """Load cached feature tensors once for one or more probe runs.
+
+    A head-only run calls this ONCE and hands the tensors to every sweep
+    (ISSUE-1110); caches with the bulk API read each distinct image once.
+    """
     _cb = cb or (lambda _msg: None)
-    total_vectors = len(train_samples) + len(val_samples)
     _last_load_report = [0.0]
 
-    def _load_progress(done: int) -> None:
+    def _emit(done: int, total: int) -> None:
         now = time.monotonic()
-        if done < total_vectors and now - _last_load_report[0] < 0.25:
+        if done < total and now - _last_load_report[0] < 0.25:
             return
         _last_load_report[0] = now
         _cb({
             "type": "training_progress", "stage": "embedding_build",
-            "status_text": f"Loading cached features ({done}/{total_vectors})",
-            "step": done, "total_steps": total_vectors,
+            "status_text": f"Loading cached features ({done}/{total})",
+            "step": done, "total_steps": total,
         })
 
+    if hasattr(embed_cache, "vectors_for"):
+        # Progress in distinct images: the train schedule repeats rows.
+        n_train = len({s["path"] for s in train_samples})
+        n_total = n_train + len({s["path"] for s in val_samples})
+        x_train, y_train = _gather_bulk(
+            train_samples, embed_cache, smart_cache, multi_label=config.multi_label,
+            progress_cb=lambda done, _t: _emit(done, n_total),
+        )
+        x_val, y_val = _gather_bulk(
+            val_samples, embed_cache, smart_cache, multi_label=config.multi_label,
+            progress_cb=lambda done, _t: _emit(n_train + done, n_total),
+        )
+        return x_train, y_train, x_val, y_val
+
+    total_vectors = len(train_samples) + len(val_samples)
     x_train, y_train = _gather(
         train_samples, embed_cache, smart_cache, multi_label=config.multi_label,
-        progress_cb=_load_progress,
+        progress_cb=lambda done: _emit(done, total_vectors),
     )
     x_val, y_val = _gather(
         val_samples, embed_cache, smart_cache, multi_label=config.multi_label,
-        progress_cb=_load_progress, progress_offset=len(train_samples),
+        progress_cb=lambda done: _emit(done, total_vectors),
+        progress_offset=len(train_samples),
     )
     return x_train, y_train, x_val, y_val
 
@@ -305,152 +355,17 @@ def train_head_probe(
 
     Returns a metrics dict (macro_f1, per-class scores, ordinal/multi-label
     extras, tuned thresholds, best_epoch, epochs_completed, val_loss).
+
+    Gathers the features (with per-step "Loading cached features" frames) and
+    runs :func:`train_head_probe_from_tensors` -- one training loop, not two
+    copies that can drift (ISSUE-1110). The probe runs in float32 on the
+    float32 cached features; the head tail is cast to float32 for training and
+    back to the model's dtype afterwards.
     """
-    from bittrainer.group_trainer import build_group_loss_fn
-
-    _cb = cb or (lambda _msg: None)
-    use_soft = (
-        config.ordinal
-        or bool(config.soft_aliases)
-        or bool(config.class_similarity_centroids)
-        or (not config.multi_label and config.label_smoothing > 0)
+    x_train, y_train, x_val, y_val = prepare_head_probe_tensors(
+        embed_cache, smart_cache, train_samples, val_samples, config, cb=cb,
     )
-
-    # Loading tens of thousands of small .npy vectors takes minutes on NTFS —
-    # without per-step frames this was the longest silent phase of a run.
-    total_vectors = len(train_samples) + len(val_samples)
-    _last_load_report = [0.0]
-
-    def _load_progress(done: int) -> None:
-        now = time.monotonic()
-        if done < total_vectors and now - _last_load_report[0] < 0.25:
-            return
-        _last_load_report[0] = now
-        _cb({
-            "type": "training_progress", "stage": "embedding_build",
-            "status_text": f"Loading cached features ({done}/{total_vectors})",
-            "step": done, "total_steps": total_vectors,
-        })
-
-    x_train, y_train = _gather(
-        train_samples, embed_cache, smart_cache, multi_label=config.multi_label,
-        progress_cb=_load_progress,
+    return train_head_probe_from_tensors(
+        model, x_train, y_train, x_val, y_val, config,
+        device=device, none_index=none_index, cb=cb, stop_event=stop_event,
     )
-    x_val, y_val = _gather(
-        val_samples, embed_cache, smart_cache, multi_label=config.multi_label,
-        progress_cb=_load_progress, progress_offset=len(train_samples),
-    )
-
-    # Freeze everything except the head tail the probe trains. The probe runs in
-    # float32 (the cached features are float32, and a tiny head trains fine/stably
-    # in full precision), so the trainable tail is cast to float32 regardless of
-    # the model's compute dtype (bf16/fp16) — otherwise head.fc(float32 input)
-    # hits "mat1 and mat2 must have same dtype". The model dtype is restored after
-    # training so the full model stays uniform for eval/checkpoint.
-    for p in model.parameters():
-        p.requires_grad_(False)
-    tail_dtype = model.head.fc.weight.dtype
-    model.head.fc.float()
-    model.head.pre_logits.float()
-    tail_params = head_tail_parameters(model)
-    for p in tail_params:
-        p.requires_grad_(True)
-    model.eval()  # head dropout defaults to p=0 -> deterministic; backbone unused
-
-    loss_fn = build_group_loss_fn(
-        config, use_soft_targets=use_soft, none_index=none_index, device=device,
-    )
-    # Probe loss runs in fp32 on cached features (tiny compute, no autocast).
-    optimizer = torch.optim.AdamW(tail_params, lr=_PROBE_LR, weight_decay=config.head_weight_decay)
-
-    loader = DataLoader(
-        TensorDataset(x_train, y_train),
-        batch_size=min(_PROBE_BATCH, len(x_train)), shuffle=True, drop_last=False,
-    )
-
-    best_score = -1.0
-    best_epoch = 0
-    best_metrics: dict = {}
-    best_head_state = copy.deepcopy(model.head.state_dict())
-    patience = 0
-
-    for epoch in range(config.head_max_epochs):
-        if stop_event is not None and getattr(stop_event, "is_set", lambda: False)():
-            break
-
-        for xb, yb in loader:
-            xb = xb.to(device)
-            yb = yb.to(device)
-            optimizer.zero_grad()
-            logits = head_tail_logits(model, xb)
-            loss = loss_fn(logits, yb)
-            loss.backward()
-            optimizer.step()
-
-        metrics, score = _evaluate_probe(model, x_val, y_val, config, device, none_index, loss_fn)
-        improved = score > best_score
-        if improved:
-            best_score = score
-            best_epoch = epoch
-            best_metrics = metrics
-            best_head_state = copy.deepcopy(model.head.state_dict())
-            patience = 0
-        else:
-            patience += 1
-
-        probe_msg = {
-            "type": "training_progress",
-            "stage": "training",
-            "status_text": (
-                f"Head probe epoch {epoch + 1}/{config.head_max_epochs} "
-                f"(val {'qwk' if config.ordinal else 'macroF1'} {score:.3f})"
-            ),
-            "epoch": epoch + 1,
-            "max_epochs": config.head_max_epochs,
-            "val_macro_f1": metrics.get("macro_f1"),
-            "per_class_f1": metrics.get("per_class_f1", {}),
-            "best_val_macro_f1": best_metrics.get("macro_f1"),
-            "best_epoch": best_epoch + 1,
-        }
-        if config.ordinal:
-            probe_msg["val_qwk"] = metrics.get("qwk")
-            probe_msg["best_val_qwk"] = best_metrics.get("qwk")
-        _cb(probe_msg)
-
-        if patience >= config.head_patience:
-            logger.info("Head probe early-stopping at epoch %d (patience=%d)", epoch + 1, config.head_patience)
-            break
-
-    # Restore the best head weights, then cast the head back to the model's
-    # compute dtype so the full model is uniform again for eval/checkpoint.
-    model.head.load_state_dict(best_head_state)
-    model.head.to(tail_dtype)
-
-    result = {
-        "macro_f1": best_metrics.get("macro_f1", 0.0),
-        "macro_precision": best_metrics.get("macro_precision", 0.0),
-        "macro_recall": best_metrics.get("macro_recall", 0.0),
-        "per_class_f1": best_metrics.get("per_class_f1", {}),
-        "per_class_precision": best_metrics.get("per_class_precision", {}),
-        "per_class_recall": best_metrics.get("per_class_recall", {}),
-        "none_precision": best_metrics.get("none_precision"),
-        "none_recall": best_metrics.get("none_recall"),
-        "none_f1": best_metrics.get("none_f1"),
-        "none_false_positive_rate": best_metrics.get("none_false_positive_rate"),
-        "none_support": best_metrics.get("none_support"),
-        "val_loss": best_metrics.get("val_loss"),
-        "best_epoch": best_epoch + 1,
-        "epochs_completed": epoch + 1,
-        "thresholds": best_metrics.get("thresholds") if config.multi_label else None,
-    }
-    if config.ordinal:
-        result["qwk"] = best_metrics.get("qwk")
-        result["ordinal_mae"] = best_metrics.get("ordinal_mae")
-        result["adjacent_accuracy"] = best_metrics.get("adjacent_accuracy")
-    if config.multi_label:
-        result["hamming_loss"] = best_metrics.get("hamming_loss")
-        result["exact_match_ratio"] = best_metrics.get("exact_match_ratio")
-    else:
-        result["confusion_matrix"] = best_metrics.get("confusion_matrix", [])
-        result["balanced_accuracy"] = best_metrics.get("balanced_accuracy")
-    return result

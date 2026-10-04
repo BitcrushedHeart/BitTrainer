@@ -11,6 +11,7 @@ here too. ``group_trainer`` re-imports every name below, keeping objects identic
 from __future__ import annotations
 
 import logging
+import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable
 
@@ -42,6 +43,7 @@ from bittrainer.selection import (
 )
 
 if TYPE_CHECKING:
+    from bittrainer.cached_eval import CachedValScorer
     from bittrainer.group_trainer import GroupTrainConfig
 
 logger = logging.getLogger(__name__)
@@ -180,6 +182,7 @@ def _compare_promote_finalize(
     total_raw: int,
     effective_class_counts: dict[int, int] | None = None,
     cb: Callable[[dict], None] | None = None,
+    cached_val: CachedValScorer | None = None,
 ) -> dict:
     """Promote-if-better vs the incumbent, tune thresholds, build the result dict.
 
@@ -187,13 +190,43 @@ def _compare_promote_finalize(
     ``run_head_only_training`` (after the probe) so both resolve a candidate
     identically: a worse candidate never replaces a better incumbent, and the
     winner's path is returned for the group to adopt.
+
+    ``cached_val`` (head-only runs, ISSUE-1110) scores the candidate — and any
+    incumbent sharing its frozen trunk — on the cached val vectors instead of
+    reloading the checkpoint and running the trunk over every val image; a
+    checkpoint with another trunk still gets the full pass. Every full pass
+    reports per-batch progress.
     """
     def _emit(stage: str, status_text: str) -> None:
         if cb is not None:
             cb({"type": "training_progress", "stage": stage, "status_text": status_text})
 
+    def _pass_progress(stage: str, label: str):
+        if cb is None:
+            return None
+        last = [0.0]
+
+        def _report(done: int, total: int) -> None:
+            now = time.monotonic()
+            if done < total and now - last[0] < 0.5:
+                return
+            last[0] = now
+            cb({
+                "type": "training_progress", "stage": stage,
+                "status_text": f"{label} ({done}/{total} batches)",
+                "step": done, "total_steps": total,
+            })
+
+        return _report
+
     promotion_reason: PromotionReason | None = None
     existing_best = checkpoint_dir / config.best_model_name
+    # Whether the checkpoint finalisation calibrates is the run's own candidate
+    # (the model in memory) rather than a kept incumbent.
+    shipped_is_candidate = False
+    # A same-trunk incumbent's head, once built for the comparison (reused if
+    # promotion keeps it, so its checkpoint is not read a second time).
+    incumbent_cached_model = None
     best_val_macro_f1 = candidate_macro_f1
     best_val_qwk = candidate_qwk
     best_checkpoint_path = candidate_path
@@ -238,7 +271,10 @@ def _compare_promote_finalize(
         else:
             _emit("comparing", "Comparing against current model")
             try:
-                old_data = torch.load(str(existing_best), map_location=device, weights_only=True)
+                # On the CPU: only its metadata (and, for a cached-feature
+                # incumbent, its head) is read from this copy; load_checkpoint
+                # below builds the model on the device when a full pass is due.
+                old_data = torch.load(str(existing_best), map_location="cpu", weights_only=True)
                 if isinstance(old_data, dict):
                     incumbent_class_names = old_data.get("class_names")
                     incumbent_num_classes = old_data.get("num_classes")
@@ -255,31 +291,57 @@ def _compare_promote_finalize(
                     or incumbent_num_classes == config.num_classes
                 )
                 if names_match and counts_match:
-                    # load_checkpoint infers head_hidden_size from the weights, so
-                    # an MLP-head incumbent reconstructs correctly.
-                    old_model = load_checkpoint(
-                        str(existing_best), device=str(device), dtype=dtype,
-                        model_size=old_size, num_classes=config.num_classes,
-                    ).to(device)
-                    if config.multi_label:
-                        old_metrics = _evaluate(
-                            old_model, val_loader, config.num_classes, device, dtype,
-                            multi_label=True,
-                            ordinal=config.ordinal,
-                            none_index=_resolve_none_index(config.class_names),
-                        )
+                    none_idx_inc = _resolve_none_index(config.class_names)
+                    cached_inc = (
+                        cached_val.model_for_state(old_data) if cached_val is not None else None
+                    )
+                    incumbent_cached_model = cached_inc
+                    if cached_inc is not None:
+                        # Same frozen trunk as the candidate (a head-only group's
+                        # next run): score its head on the cached val vectors.
+                        _emit("comparing", "Scoring the current model on cached features")
+                        if config.multi_label:
+                            old_metrics = cached_val.evaluate(
+                                cached_inc, val_loader, config.num_classes, device, dtype,
+                                ordinal=config.ordinal, none_index=none_idx_inc,
+                            )
+                        else:
+                            inc_logits, inc_labels = cached_val.collect_logits(
+                                cached_inc, val_loader, device, dtype,
+                            )
+                            old_metrics = _incumbent_decode_metrics(
+                                inc_logits, inc_labels, config, none_idx_inc, old_data,
+                            )
                     else:
-                        # Fair comparison: the incumbent is judged under its own
-                        # persisted calibration/decode (argmax for pre-calibration
-                        # checkpoints), matching the shipped-decode candidate score.
-                        inc_logits, inc_labels = _collect_val_logits(
-                            old_model, val_loader, config, device, dtype,
+                        progress = _pass_progress(
+                            "comparing", "Scoring the current model on validation images",
                         )
-                        old_metrics = _incumbent_decode_metrics(
-                            inc_logits, inc_labels, config,
-                            _resolve_none_index(config.class_names), old_data,
-                        )
-                    del old_model
+                        # load_checkpoint infers head_hidden_size from the weights, so
+                        # an MLP-head incumbent reconstructs correctly.
+                        old_model = load_checkpoint(
+                            str(existing_best), device=str(device), dtype=dtype,
+                            model_size=old_size, num_classes=config.num_classes,
+                        ).to(device)
+                        if config.multi_label:
+                            old_metrics = _evaluate(
+                                old_model, val_loader, config.num_classes, device, dtype,
+                                multi_label=True,
+                                ordinal=config.ordinal,
+                                none_index=none_idx_inc,
+                                progress=progress,
+                            )
+                        else:
+                            # Fair comparison: the incumbent is judged under its own
+                            # persisted calibration/decode (argmax for pre-calibration
+                            # checkpoints), matching the shipped-decode candidate score.
+                            inc_logits, inc_labels = _collect_val_logits(
+                                old_model, val_loader, config, device, dtype,
+                                progress=progress,
+                            )
+                            old_metrics = _incumbent_decode_metrics(
+                                inc_logits, inc_labels, config, none_idx_inc, old_data,
+                            )
+                        del old_model
                     incumbent_score = _metric_score(old_metrics, config)
                     eval_ok = True
             except Exception:
@@ -297,6 +359,7 @@ def _compare_promote_finalize(
                 candidate_num_classes=config.num_classes,
             )
 
+        shipped_is_candidate = bool(promote)
         if promote:
             logger.info("Promoting new checkpoint (reason=%s)", promotion_reason.value)
             _emit("promoting", "Promoting new model")
@@ -346,13 +409,28 @@ def _compare_promote_finalize(
                 "calibrating",
                 "Calibrating decision boundaries" if needs_calibration else "Finalising priors",
             )
-            calib_model = load_checkpoint(
-                best_checkpoint_path, device=str(device), dtype=dtype,
-                model_size=config.backbone_variant, num_classes=config.num_classes,
-            ).to(device)
-            shipped_threshold = has_threshold_head(calib_model)
-            logits, labels = _collect_val_logits(calib_model, val_loader, config, device, dtype)
-            del calib_model
+            cached_model = None
+            if cached_val is not None:
+                if shipped_is_candidate:
+                    cached_model = cached_val.model
+                else:
+                    cached_model = incumbent_cached_model or cached_val.model_for_checkpoint(
+                        best_checkpoint_path
+                    )
+            if cached_model is not None:
+                shipped_threshold = has_threshold_head(cached_model)
+                logits, labels = cached_val.collect_logits(cached_model, val_loader, device, dtype)
+            else:
+                calib_model = load_checkpoint(
+                    best_checkpoint_path, device=str(device), dtype=dtype,
+                    model_size=config.backbone_variant, num_classes=config.num_classes,
+                ).to(device)
+                shipped_threshold = has_threshold_head(calib_model)
+                logits, labels = _collect_val_logits(
+                    calib_model, val_loader, config, device, dtype,
+                    progress=_pass_progress("calibrating", "Scoring validation images"),
+                )
+                del calib_model
 
             # Prior correction (ISSUE-0490 A): adjust val logits by
             # tau*(log natural - log effective train prior) and persist both

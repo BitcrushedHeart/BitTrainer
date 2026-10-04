@@ -59,15 +59,63 @@ def _evaluate(
     none_index: int = -1,
     thresholds: np.ndarray | None = None,
     channels_last: bool = False,
+    progress=None,
 ) -> dict:
     """Evaluate ``model`` on the validation set.
 
     For multi-label, sigmoid probs and labels are accumulated and stored on
     the returned dict under ``_probs`` and ``_labels`` so the caller can run
     per-class threshold tuning. ``thresholds`` may be passed to binarise at
-    custom thresholds (otherwise 0.5 is used).
+    custom thresholds (otherwise 0.5 is used). ``progress(done, total)`` is
+    called after every batch (ISSUE-1110: a long pass must never look frozen).
     """
     model.eval()
+    return _score_batches(
+        _image_batches(dataloader, device, dtype, channels_last=channels_last),
+        model, num_classes, device, dtype,
+        multi_label=multi_label, ordinal=ordinal, none_index=none_index,
+        thresholds=thresholds, progress=progress, total=_batch_count(dataloader),
+    )
+
+
+def _batch_count(loader) -> int | None:
+    try:
+        return len(loader)
+    except TypeError:
+        return None
+
+
+def _image_batches(dataloader, device: torch.device, dtype: torch.dtype, *, channels_last: bool):
+    """Val images moved and normalised exactly as every full pass always has."""
+    from bittrainer.gpu_augment import apply_val_transform
+
+    memory_format = torch.channels_last if channels_last else None
+    for images, labels in dataloader:
+        images = images.to(device, non_blocking=True)
+        images = apply_val_transform(images, dtype=dtype, memory_format=memory_format)
+        yield images, labels
+
+
+def _score_batches(
+    batches,
+    forward,
+    num_classes: int,
+    device: torch.device,
+    dtype: torch.dtype,
+    *,
+    multi_label: bool = False,
+    ordinal: bool = False,
+    none_index: int = -1,
+    thresholds: np.ndarray | None = None,
+    progress=None,
+    total: int | None = None,
+) -> dict:
+    """The body of :func:`_evaluate` over ``(inputs, labels)`` batches.
+
+    ``forward(inputs)`` gives the logits — the model on images for a full pass,
+    the head tail on cached pooled vectors for :mod:`bittrainer.cached_eval`
+    (ISSUE-1110) — so both share one loss/metric implementation.
+    """
     all_probs_ml = []
     all_labels_ml = []
     all_preds = []
@@ -80,16 +128,11 @@ def _evaluate(
     else:
         criterion = nn.CrossEntropyLoss()
 
-    from bittrainer.gpu_augment import apply_val_transform
-
-    memory_format = torch.channels_last if channels_last else None
-    for images, labels in dataloader:
-        images = images.to(device, non_blocking=True)
-        images = apply_val_transform(images, dtype=dtype, memory_format=memory_format)
+    for inputs, labels in batches:
         labels = labels.to(device)
 
         with torch.amp.autocast(device_type=device.type, dtype=dtype, enabled=(dtype != torch.float32)):
-            logits = model(images)
+            logits = forward(inputs)
             if multi_label:
                 loss = criterion(logits.float(), labels.float())
             else:
@@ -111,6 +154,8 @@ def _evaluate(
 
         total_loss += loss.item()
         num_batches += 1
+        if progress is not None:
+            progress(num_batches, total if total is not None else num_batches)
 
     if multi_label:
         all_labels_arr = np.concatenate(all_labels_ml, axis=0)
@@ -231,21 +276,37 @@ def _collect_val_logits(
     config: GroupTrainConfig,
     device: torch.device,
     dtype: torch.dtype,
+    *,
+    progress=None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    from bittrainer.gpu_augment import apply_val_transform
-
     model.eval()
-    memory_format = torch.channels_last if config.channels_last else None
+    return _collect_logit_batches(
+        _image_batches(val_loader, device, dtype, channels_last=bool(config.channels_last)),
+        model, device, dtype, progress=progress, total=_batch_count(val_loader),
+    )
+
+
+def _collect_logit_batches(
+    batches,
+    forward,
+    device: torch.device,
+    dtype: torch.dtype,
+    *,
+    progress=None,
+    total: int | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """The body of :func:`_collect_val_logits` over ``(inputs, labels)`` batches
+    (shared with :mod:`bittrainer.cached_eval`, ISSUE-1110)."""
     all_logits: list[torch.Tensor] = []
     all_labels: list[torch.Tensor] = []
-    for images, labels in val_loader:
-        images = images.to(device, non_blocking=True)
-        images = apply_val_transform(images, dtype=dtype, memory_format=memory_format)
+    for inputs, labels in batches:
         labels = labels.to(device)
         with torch.amp.autocast(device_type=device.type, dtype=dtype, enabled=(dtype != torch.float32)):
-            logits = model(images)
+            logits = forward(inputs)
         all_logits.append(logits.float().cpu())
         all_labels.append(labels.long().cpu())
+        if progress is not None:
+            progress(len(all_logits), total if total is not None else len(all_logits))
     if not all_logits:
         raise RuntimeError("No validation logits available for calibration")
     return torch.cat(all_logits, dim=0), torch.cat(all_labels, dim=0)

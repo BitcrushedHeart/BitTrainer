@@ -20,6 +20,7 @@ from bittrainer.group_dataset import GroupDataset, labelled_samples
 from bittrainer.dynamic_class_weights import DynamicClassWeightController
 from bittrainer.losses import AsymmetricLoss, FocalLoss
 from bittrainer.embedding_cache import EmbeddingCache
+from bittrainer.head_probe import prepare_head_probe_tensors
 from bittrainer.backbone_init import apply_backbone_init, wants_timm_pretrained
 from bittrainer.backbones import backbone_family
 from bittrainer.ordinal_threshold import (
@@ -421,6 +422,12 @@ class GroupTrainConfig:
     head_patience: int = 5
     head_weight_decay: float = 0.02
     embedding_cache_dir: str | None = None
+    # Whether establishing this run's embedding-cache era deletes the other eras
+    # under the cache root (Bitcrush ISSUE-1110). Backbone-comparison candidates
+    # share the GROUP's cache root and set this False, so a candidate never
+    # deletes the vectors the group's own model (or another candidate) uses;
+    # the group's next own run prunes as before.
+    embedding_cache_prune: bool = True
     # Batch size for the pooled-feature cache build only (no-grad eval forward,
     # so much larger than the training batch; EmbeddingCache backs off on OOM).
     embedding_batch_size: int = 256
@@ -1563,6 +1570,37 @@ def _embedding_preproc_sig(train_resolution: int) -> str:
     return f"val_imagenet@{int(train_resolution)}"
 
 
+def _group_embedding_preproc_sig(config: GroupTrainConfig) -> str:
+    """The full embedding-cache identity of a group run's input tensors.
+
+    Resolution alone (:func:`_embedding_preproc_sig`) is not enough (Bitcrush
+    ISSUE-1110): the embedded tensor is also face/region-cropped (the crop
+    window follows the detector's box) and optionally skin-normalised, so two
+    runs that differ there embed different pixels from the same file. Both
+    are folded in — the crop as the same :func:`region_signature` that keys
+    the SmartCache (detector file + mtime, class filter, selection). A run
+    with neither keeps the historical sig, so existing caches stay valid; a
+    crop or skin-normalised group re-embeds once into its own era.
+    """
+    sig = _embedding_preproc_sig(config.train_resolution)
+    parts: list[str] = []
+    crop_model = config.region_model_path or config.face_model_path
+    if crop_model:
+        from bittrainer.smart_cache import region_signature
+
+        parts.append(
+            "crop="
+            + region_signature(
+                crop_model,
+                config.region_classes if config.region_model_path else None,
+                config.region_selection if config.region_model_path else "union",
+            )
+        )
+    if config.skin_normalise:
+        parts.append("skin_normalise")
+    return sig if not parts else sig + "+" + "+".join(parts)
+
+
 def _prepare_datasets_and_cache(
     config: GroupTrainConfig,
     *,
@@ -2039,11 +2077,14 @@ def _warmup_head_probe(
     backbone_hash = backbone_feature_hash(model)
     group_folder = Path(config.group_folder)
     embed_root = config.embedding_cache_dir or str(group_folder / ".embedding_cache")
+    # Packed (ISSUE-1110): the vectors ensure() checks or builds stay in memory
+    # for the probe gather instead of being re-read from one file per image.
     embed_cache = EmbeddingCache(
         embed_root,
         backbone_hash,
         int(getattr(model, "num_features", 0)),
-        preproc_sig=_embedding_preproc_sig(config.train_resolution),
+        preproc_sig=_group_embedding_preproc_sig(config),
+        packed=True,
     )
     # The probe is a classifier: detection-only rows (crop-assisted groups)
     # have no class to learn from. ``labelled_samples`` is the identity for
@@ -2074,6 +2115,17 @@ def _warmup_head_probe(
             "status_text": f"Warmup: caching backbone features (era {backbone_hash})",
         }
     )
+    def _check_progress(done: int, total: int) -> None:
+        cb(
+            {
+                "type": "training_progress",
+                "stage": "embedding_build",
+                "status_text": f"Warmup: checking feature cache ({done}/{total})",
+                "step": done,
+                "total_steps": total,
+            }
+        )
+
     embed_cache.ensure(
         all_samples,
         model,
@@ -2083,6 +2135,8 @@ def _warmup_head_probe(
         batch_size=config.embedding_batch_size,
         progress_cb=_build_progress,
         stop_check=_stop,
+        prune=bool(config.embedding_cache_prune),
+        check_progress_cb=_check_progress,
     )
     if _stop():
         return
@@ -2098,6 +2152,10 @@ def _warmup_head_probe(
     # The probes train a head on the epoch-shaped (replication-expanded) train
     # set, exactly as they did when ``samples`` itself carried the replication.
     train_epoch_samples = labelled_samples(train_ds.epoch_samples())
+    # One feature load for both sweeps (ISSUE-1110).
+    tensors = prepare_head_probe_tensors(
+        embed_cache, smart_cache, train_epoch_samples, val_ds.samples, config, cb=cb,
+    )
     _run_auto_softness_probe(
         model,
         config,
@@ -2109,6 +2167,7 @@ def _warmup_head_probe(
         none_index=none_index,
         cb=cb,
         stop_event=stop_event,
+        tensors=tensors,
     )
     if _stop():
         return
@@ -2126,6 +2185,7 @@ def _warmup_head_probe(
         none_index=none_index,
         cb=cb,
         stop_event=stop_event,
+        tensors=tensors,
     )
 
 
