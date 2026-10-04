@@ -147,7 +147,11 @@ class HeadOnlyTask(TrainingTask):
         from bittrainer.smart_cache import _noop_callback
 
         config = self.config
+        # Refuse impossible backbone settings up front (no-op for ConvNeXt).
+        notes = gt.validate_backbone_config(config, mode="head_only")
         em = ProgressEmitter(progress_callback or config.progress_callback or _noop_callback)
+        for note in notes:
+            em.raw({"type": "training_progress", "stage": "preparing", "status_text": note})
         device = torch.device(config.device)
         dtype = gt._get_dtype(config.dtype)
         configure_cuda_backend()
@@ -302,6 +306,9 @@ class HeadOnlyTask(TrainingTask):
             **gt._spatial_ckpt_meta(config),
             **resolution_ckpt_meta(config.train_resolution),
             **self._region_meta(model),
+            # The trunk is frozen: SigLIP records the embedding-cache hash it
+            # already computed; ConvNeXt gets nothing (byte-identical).
+            **gt._architecture_ckpt_meta(config, model, backbone_hash=self.backbone_hash),
         }
         if self.head_hidden is not None:
             ckpt_meta["head_hidden_size"] = self.head_hidden

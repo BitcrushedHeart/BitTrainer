@@ -23,16 +23,21 @@ logger = logging.getLogger(__name__)
 _WEIGHT_DECAY = 0.01
 
 
-def _split_no_decay_flat(model: nn.Module) -> list[dict]:
+def _split_no_decay_flat(
+    model: nn.Module, *, trainable_only: bool = False
+) -> list[dict]:
     """Two flat groups: matrix params (decayed) + 1-D params (no decay).
 
     ConvNeXtV2's norm scales, biases and GRN gains are all 1-D; decaying them
     pulls scale/shift parameters toward zero for no benefit. The decayed group
     omits ``weight_decay`` so it inherits the optimizer default (0.01).
+    ``trainable_only`` drops frozen parameters (SigLIP's frozen trunk blocks).
     """
     decay: list[nn.Parameter] = []
     no_decay: list[nn.Parameter] = []
     for param in model.parameters():
+        if trainable_only and not param.requires_grad:
+            continue
         (no_decay if param.ndim < 2 else decay).append(param)
     groups: list[dict] = []
     if decay:
@@ -89,12 +94,21 @@ def make_optimizer(
     single flat group so existing callers are byte-identical; trainers opt in via
     config. The changed param-group layout is why callers fold an optimizer
     identity into their resume fingerprint (see :func:`optimizer_identity`).
+
+    A SigLIP wrapper (Bitcrush ISSUE-1106) hands the optimiser ONLY its
+    trainable parameters: its frozen trunk blocks never train, and Prodigy state
+    for them would cost ~2.2x a 430M-parameter trunk. ConvNeXt is unchanged.
     """
+    from bittrainer.siglip_model import is_siglip_model
+
+    trainable_only = is_siglip_model(model)
     if llrd:
         base_groups = build_llrd_param_groups(model, llrd_decay)
         params = _split_no_decay_llrd(base_groups) if wd_exclusions else base_groups
     elif wd_exclusions:
-        params = _split_no_decay_flat(model)
+        params = _split_no_decay_flat(model, trainable_only=trainable_only)
+    elif trainable_only:
+        params = [p for p in model.parameters() if p.requires_grad]
     else:
         params = model.parameters()
     return Prodigy_adv(
@@ -109,7 +123,13 @@ def make_optimizer(
     )
 
 
-def optimizer_identity(*, llrd: bool, llrd_decay: float, wd_exclusions: bool) -> str:
+def optimizer_identity(
+    *,
+    llrd: bool,
+    llrd_decay: float,
+    wd_exclusions: bool,
+    trainable_blocks: int | None = None,
+) -> str:
     """Stable identity string for the optimizer's param-group layout.
 
     Folded into the run fingerprint so a backup whose optimizer state has a
@@ -118,12 +138,19 @@ def optimizer_identity(*, llrd: bool, llrd_decay: float, wd_exclusions: bool) ->
     ``optimizer.load_state_dict``. ``(False, *, False)`` returns the historical
     ``"Prodigy_adv"`` so untouched runs keep their existing fingerprint; the
     decay VALUE is part of the identity because it changes the per-group ``lr``.
+
+    ``trainable_blocks`` (SigLIP only, Bitcrush ISSUE-1106) appends ``+sb{N}``:
+    the optimizer holds only the unfrozen blocks, so a backup taken with a
+    different block count has a different parameter set. ``None`` (every
+    ConvNeXt caller) leaves the string exactly as it was.
     """
     parts = ["Prodigy_adv"]
     if llrd:
         parts.append(f"llrd{llrd_decay:g}")
     if wd_exclusions:
         parts.append("nd")
+    if trainable_blocks is not None:
+        parts.append(f"sb{int(trainable_blocks)}")
     return "+".join(parts)
 
 

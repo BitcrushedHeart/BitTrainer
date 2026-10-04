@@ -1,4 +1,8 @@
-"""ConvNeXt V2 model factory with freezing utilities."""
+"""Group/binary model factory with freezing utilities.
+
+ConvNeXt V2 is the historical family; SigLIP2 sizes dispatch to
+``bittrainer.siglip_model`` (Bitcrush ISSUE-1106) behind the same functions.
+"""
 
 from __future__ import annotations
 
@@ -6,6 +10,7 @@ import torch
 import torch.nn as nn
 import timm
 
+from bittrainer.backbones import is_siglip, siglip_size_from_dim
 from bittrainer.convnextv2_catalog import CONVNEXTV2_PRETRAINED_SOURCES
 
 _MODEL_REGISTRY = {
@@ -28,7 +33,15 @@ def _infer_model_size(state_dict: dict[str, torch.Tensor]) -> str | None:
     stem_weight = state_dict.get("stem.0.weight")
     if stem_weight is not None:
         return _STEM_DIM_TO_SIZE.get(stem_weight.shape[0])
+    # SigLIP2 wrapper (Bitcrush ISSUE-1106): the patch projection's row count is
+    # the embedding width, which names the size.
+    proj = state_dict.get(_SIGLIP_PROJ_KEY)
+    if proj is not None:
+        return siglip_size_from_dim(proj.shape[0])
     return None
+
+
+_SIGLIP_PROJ_KEY = "trunk.embeds.proj.weight"
 
 
 def _infer_num_classes(state_dict: dict[str, torch.Tensor]) -> int | None:
@@ -109,7 +122,22 @@ def create_model(
     forwards nothing to timm, so the created model is byte-identical to the
     historical call; a float is passed straight through to timm's ConvNeXt
     ``drop_path_rate`` (parameter-free, so it never changes the state-dict shape).
+
+    SigLIP2 sizes (``"siglip2_so400m"`` / ``"siglip2_base"``, Bitcrush
+    ISSUE-1106) build a :class:`~bittrainer.siglip_model.SigLIPClassifier`, a
+    wrapper with the same head surface, so every caller stays family-agnostic.
     """
+    if is_siglip(model_size):
+        from bittrainer.siglip_model import create_siglip_model
+
+        return create_siglip_model(
+            model_size=model_size,
+            pretrained=pretrained,
+            dtype=dtype,
+            num_classes=num_classes,
+            head_hidden_size=head_hidden_size,
+            drop_path_rate=drop_path_rate,
+        )
     model_name = _MODEL_REGISTRY.get(model_size)
     if model_name is None:
         raise ValueError(
@@ -147,6 +175,23 @@ def unfreeze_backbone(model: nn.Module) -> None:
     """Unfreeze all parameters."""
     for param in model.parameters():
         param.requires_grad = True
+
+
+def prepare_for_finetune(model: nn.Module, finetune_blocks: int = 4) -> None:
+    """Set the trainable parameters for the in-loop fine-tune.
+
+    ConvNeXt unfreezes everything (exactly :func:`unfreeze_backbone`). A SigLIP
+    wrapper trains its head(s) plus the last ``finetune_blocks`` transformer
+    blocks; 0 keeps its trunk frozen (Bitcrush ISSUE-1106).
+    """
+    from bittrainer.siglip_model import is_siglip_model
+
+    if is_siglip_model(model):
+        from bittrainer.siglip_model import prepare_for_finetune as _prepare_siglip
+
+        _prepare_siglip(model, finetune_blocks)
+        return
+    unfreeze_backbone(model)
 
 
 def unfreeze_stage(model: nn.Module, stage_index: int) -> None:
@@ -251,7 +296,16 @@ def build_llrd_param_groups(model: nn.Module, decay: float) -> list[dict]:
     Each group's ``lr`` acts as a multiplier on the optimizer's base ``lr`` —
     for Prodigy_adv this multiplies the adapted step size ``d`` per group, so
     earlier (shallower) stages take smaller steps and the head moves fastest.
+
+    A SigLIP wrapper buckets by transformer block instead and keeps only its
+    trainable parameters (see ``build_siglip_llrd_param_groups``).
     """
+    from bittrainer.siglip_model import is_siglip_model
+
+    if is_siglip_model(model):
+        from bittrainer.siglip_model import build_siglip_llrd_param_groups
+
+        return build_siglip_llrd_param_groups(model, decay)
     buckets: dict[str, list[nn.Parameter]] = {k: [] for k in _LLRD_DEPTH}
     for name, param in model.named_parameters():
         # The multi-task backbone builder wraps the trunk as ``backbone.*`` and the
@@ -322,6 +376,12 @@ def load_checkpoint(
     inferred_size = _infer_model_size(state_dict)
     if inferred_size is not None and inferred_size != ckpt_size:
         ckpt_size = inferred_size
+    if _SIGLIP_PROJ_KEY in state_dict and not is_siglip(ckpt_size):
+        width = int(state_dict[_SIGLIP_PROJ_KEY].shape[0])
+        raise ValueError(
+            f"SigLIP checkpoint {path} has an unrecognised trunk width ({width}) "
+            f"and no SigLIP model_size (got {ckpt_size!r})"
+        )
     inferred_classes = _infer_num_classes(state_dict)
     if inferred_classes is not None and inferred_classes != ckpt_classes:
         ckpt_classes = inferred_classes

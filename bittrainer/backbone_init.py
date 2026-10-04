@@ -66,6 +66,15 @@ def apply_backbone_init(module: nn.Module, spec: dict | None) -> bool:
     checkpoint_path = _local_checkpoint(spec)
     if checkpoint_path is None:
         return False
+    from bittrainer.backbones import SIGLIP_FAMILY
+
+    if getattr(module, "backbone_family", None) == SIGLIP_FAMILY:
+        # CrushVision backbones are ConvNeXt trunks: no tensor would match, and
+        # "trained from the local backbone" would silently mean "from timm".
+        raise ValueError(
+            f"backbone_init {checkpoint_path}: a local (CrushVision) backbone cannot "
+            "initialise a SigLIP model (Bitcrush ISSUE-1106)"
+        )
     path = Path(checkpoint_path)
     if not path.is_file():
         raise FileNotFoundError(f"backbone_init checkpoint not found: {path}")

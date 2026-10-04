@@ -21,6 +21,7 @@ from bittrainer.dynamic_class_weights import DynamicClassWeightController
 from bittrainer.losses import AsymmetricLoss, FocalLoss
 from bittrainer.embedding_cache import EmbeddingCache
 from bittrainer.backbone_init import apply_backbone_init, wants_timm_pretrained
+from bittrainer.backbones import backbone_family
 from bittrainer.model import (
     backbone_feature_hash,
     create_model,
@@ -149,7 +150,16 @@ class GroupTrainConfig:
     class_names: list[str]
     max_epochs: int = 50
     patience: int = 3
+    # Backbone size: a ConvNeXt V2 size ("atto".."huge") or a SigLIP2 size
+    # ("siglip2_so400m" / "siglip2_base", Bitcrush ISSUE-1106); one namespace,
+    # see bittrainer.backbones.
     backbone_variant: str = "nano"
+    # SigLIP only: how many of the LAST transformer blocks the in-loop fine-tune
+    # trains (plus the norm / MAP pool after them and the heads). 0 keeps the
+    # trunk frozen and trains only the heads in the loop — how crop-assisted
+    # "head-only" SigLIP groups train their region head. Ignored for ConvNeXt,
+    # whose full fine-tune always unfreezes everything.
+    finetune_blocks: int = 4
     # Per-group training resolution: scales the aspect-bucket table (512 = the
     # canonical ~512px buckets; see bittrainer.dataset.scaled_buckets). For
     # groups whose discriminative detail is too small even after region crops.
@@ -481,6 +491,106 @@ def region_type_names(config: GroupTrainConfig) -> list[str] | None:
     if manifest is None or not manifest.has_detector_data("train"):
         return None
     return list(manifest.type_names)
+
+
+def validate_backbone_config(config: GroupTrainConfig, *, mode: str = "full") -> list[str]:
+    """Check (and where harmless, adjust) a run's backbone settings up front.
+
+    ``mode`` is ``"full"`` (GroupTask: the in-loop fine-tune) or ``"head_only"``
+    (HeadOnlyTask: frozen trunk + cached features). Returns human-readable notes
+    for every adjustment; raises ``ValueError`` for what cannot run.
+
+    ConvNeXt configs pass through untouched (an empty list). For SigLIP
+    (Bitcrush ISSUE-1106):
+
+    * refused — ``sourceless`` runs (cloud pods ship no SigLIP support), a
+      fine-tune (``mode="full"`` with ``finetune_blocks > 0``) on a non-CUDA
+      device, a negative ``finetune_blocks``, and a local CrushVision
+      ``backbone_init`` spec (those checkpoints are ConvNeXt trunks);
+    * switched off with a note — ``channels_last`` (no conv layers to help),
+      ``use_compile`` (the regional compile walks ConvNeXt stages only) and
+      ``use_greedy_soup`` (averaging epochs of a 400M-parameter trunk is a lot
+      of disk and memory for a head-dominated model).
+
+    Crop-assisted groups train their region head inside the loop, so a
+    crop-assisted SigLIP group that should keep its trunk frozen runs in
+    ``mode="full"`` with ``finetune_blocks=0`` (frozen trunk, class + region
+    heads trained). In ``mode="head_only"`` such a group still trains its
+    classifier head, and a note says where the region head would train.
+    """
+    from bittrainer.backbone_init import _local_checkpoint
+    from bittrainer.backbones import is_siglip
+
+    if not is_siglip(config.backbone_variant):
+        return []
+    size = config.backbone_variant
+    if config.sourceless:
+        raise ValueError(f"{size}: SigLIP backbones cannot train sourceless (cloud) runs")
+    if int(config.finetune_blocks) < 0:
+        raise ValueError(f"{size}: finetune_blocks must be >= 0, got {config.finetune_blocks}")
+    if mode == "full" and int(config.finetune_blocks) > 0:
+        if torch.device(config.device).type != "cuda":
+            raise ValueError(
+                f"{size}: a SigLIP fine-tune needs a CUDA device (got {config.device!r}); "
+                "train head-only or with finetune_blocks=0 instead"
+            )
+    if _local_checkpoint(config.backbone_init):
+        raise ValueError(
+            f"{size}: a local backbone_init (CrushVision backbone) is a ConvNeXt trunk "
+            "and cannot initialise a SigLIP model"
+        )
+    notes: list[str] = []
+    for attr, label in (
+        ("channels_last", "channels_last memory format"),
+        ("use_compile", "torch.compile"),
+        ("use_greedy_soup", "greedy weight soup"),
+    ):
+        if getattr(config, attr):
+            setattr(config, attr, False)
+            notes.append(f"SigLIP: {label} switched off ({attr}=False)")
+    if mode == "head_only" and getattr(config, "region_manifest", ""):
+        notes.append(
+            "SigLIP head-only: the region head trains only in the full trainer with "
+            "finetune_blocks=0 (frozen trunk); this run trains the classifier head"
+        )
+    for note in notes:
+        logger.info(note)
+    return notes
+
+
+def _architecture_ckpt_meta(
+    config: GroupTrainConfig,
+    model: nn.Module,
+    *,
+    state: dict | None = None,
+    backbone_hash: str | None = None,
+) -> dict:
+    """Checkpoint keys describing a non-default architecture (Bitcrush ISSUE-1106).
+
+    Spread into every group checkpoint save site. Empty for a ConvNeXt softmax
+    model, so those checkpoints stay byte-identical. A SigLIP model records
+    ``backbone_family``; when its trunk is frozen (head-only, or
+    ``finetune_blocks=0``) it also records ``backbone_hash`` — of ``state`` (the
+    weights actually being saved: an EMA can drift a frozen trunk by an ulp),
+    or the caller's precomputed ``backbone_hash`` — so Engine can share one
+    frozen trunk between groups whose trunks really are identical.
+    """
+    from bittrainer.backbones import CONVNEXT_FAMILY
+    from bittrainer.model import backbone_feature_hash, backbone_state_hash
+
+    meta: dict = {}
+    family = getattr(model, "backbone_family", None) or CONVNEXT_FAMILY
+    if family != CONVNEXT_FAMILY:
+        meta["backbone_family"] = family
+        trunk_frozen = getattr(model, "trunk_frozen", None)
+        if callable(trunk_frozen) and trunk_frozen():
+            if backbone_hash:
+                meta["backbone_hash"] = str(backbone_hash)
+            elif state is not None:
+                meta["backbone_hash"] = backbone_state_hash(state)
+            else:
+                meta["backbone_hash"] = backbone_feature_hash(model)
+    return meta
 
 
 def _spatial_ckpt_meta(config: GroupTrainConfig) -> dict:
@@ -1649,10 +1759,11 @@ def _emit_model_load_stage(em, config: GroupTrainConfig, checkpoint_dir: Path) -
     try:
         from huggingface_hub import try_to_load_from_cache
 
-        from bittrainer.model import _MODEL_REGISTRY
+        from bittrainer.backbones import pretrained_repo
 
-        model_name = _MODEL_REGISTRY.get(config.backbone_variant, "")
-        cached = try_to_load_from_cache(f"timm/{model_name}", "model.safetensors")
+        cached = try_to_load_from_cache(
+            pretrained_repo(config.backbone_variant), "model.safetensors"
+        )
         downloading = not isinstance(cached, str)
     except (ImportError, OSError, ValueError):
         downloading = False
@@ -1663,6 +1774,22 @@ def _emit_model_load_stage(em, config: GroupTrainConfig, checkpoint_dir: Path) -
         )
     else:
         em.stage(Stage.loading_model, f"Loading model ({config.backbone_variant})")
+
+
+class _CrossFamilyWarmStart(Exception):
+    """The incumbent is another backbone family: no warm start, start fresh."""
+
+
+def _checkpoint_family(state: dict, size: str | None) -> str:
+    """Backbone family of a saved state dict: the weights decide, the size
+    string is the fallback (bare or unusual checkpoints)."""
+    from bittrainer.backbones import CONVNEXT_FAMILY, SIGLIP_FAMILY
+
+    if any(str(k).startswith("trunk.") for k in state):
+        return SIGLIP_FAMILY
+    if "stem.0.weight" in state:
+        return CONVNEXT_FAMILY
+    return backbone_family(size)
 
 
 def _create_or_warmstart_model(
@@ -1721,6 +1848,17 @@ def _create_or_warmstart_model(
             else:
                 state = data
                 size = config.backbone_variant
+            incumbent_family = _checkpoint_family(state, size)
+            if incumbent_family != backbone_family(config.backbone_variant):
+                # A ConvNeXt incumbent shares no tensor with a SigLIP model (or
+                # the other way round): start fresh in the configured family.
+                logger.info(
+                    "Warm start skipped: incumbent %s is %s, run is %s",
+                    existing_best,
+                    incumbent_family,
+                    backbone_family(config.backbone_variant),
+                )
+                raise _CrossFamilyWarmStart
             model = _finalise_head(
                 create_model(
                     model_size=size,
@@ -1744,6 +1882,8 @@ def _create_or_warmstart_model(
                 len(target),
             )
             return model
+        except _CrossFamilyWarmStart:
+            pass
         except (RuntimeError, OSError, KeyError, EOFError):
             logger.warning(
                 "Warm-start failed, falling back to pretrained", exc_info=True
