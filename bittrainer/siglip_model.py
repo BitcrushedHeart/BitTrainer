@@ -135,6 +135,57 @@ class SigLIPClassifier(nn.Module):
     def get_classifier(self) -> nn.Module:
         return self.head.fc
 
+    # -- crop-assist region head (Phase A2) ----------------------------------
+
+    def region_block_indices(self) -> tuple[int, int]:
+        """The two blocks the region head reads: the middle one and the last.
+
+        ``depth // 2 - 1`` is block number ``depth // 2`` counted from one (13 of
+        27 for so400m, 6 of 12 for base): mid-level tokens still carry fine
+        spatial detail, the last block the semantics. A one-block trunk reads
+        its only block twice.
+        """
+        depth = self.depth
+        return max(0, depth // 2 - 1), depth - 1
+
+    def region_in_channels(self) -> tuple[int, int]:
+        """Channel widths of :meth:`region_feature_maps` (both the trunk width)."""
+        return self.num_features, self.num_features
+
+    def _pooled_and_region_maps(
+        self, x: torch.Tensor
+    ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
+        """ONE trunk pass: the pooled vector plus the two NCHW token maps.
+
+        timm's ``forward_intermediates`` runs the same embed -> blocks -> norm
+        sequence as ``forward_features`` and additionally returns the chosen
+        blocks' tokens reshaped to ``[B, D, H/16, W/16]``, each passed through
+        the final LayerNorm (late ViT residual streams carry a few huge
+        channels; the norm keeps the head's 1x1 laterals well scaled).
+        """
+        mid, last = self.region_block_indices()
+        indices = sorted({mid, last})
+        final, maps = self.trunk.forward_intermediates(
+            self.to_siglip_input(x),
+            indices=indices,
+            norm=True,
+            output_fmt="NCHW",
+        )
+        by_index = dict(zip(indices, maps, strict=True))
+        pooled = self.trunk.forward_head(final)
+        return pooled, (by_index[mid], by_index[last])
+
+    def region_feature_maps(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """The two ``[B, D, H/16, W/16]`` token maps the region head fuses."""
+        return self._pooled_and_region_maps(x)[1]
+
+    def forward_with_regions(self, x: torch.Tensor):
+        """Classifier logits and region maps from one trunk pass; the logits are
+        bit-identical to ``self(x)``. Called through
+        :func:`bittrainer.regions.forward_with_regions`."""
+        pooled, (mid, last) = self._pooled_and_region_maps(x)
+        return self.head(pooled), self.region_head(mid, last)
+
     def trunk_frozen(self) -> bool:
         """True when no trunk weight is trainable (head-only / ``finetune_blocks=0``)."""
         return not any(p.requires_grad for p in self.trunk.parameters())

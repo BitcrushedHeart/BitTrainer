@@ -14,6 +14,10 @@ boxes per image need no anchors and no NMS (a 3x3 max-pool finds the peaks), the
 head is a few hundred thousand parameters, and it learns from the hundreds of
 boxes a person can realistically draw.
 
+On a SigLIP trunk (Bitcrush ISSUE-1106) the same head reads two transformer
+blocks' patch tokens instead — the middle block and the last, both reshaped to
+NCHW at the patch stride of 16 — via the model's own ``forward_with_regions``.
+
 Supervision is *partial*. An image nobody drew on is unknown to the detector,
 never a negative; drawing a region type on an image asserts that every instance
 of that type on it has been drawn. :class:`RegionTargets.supervised` carries
@@ -120,6 +124,12 @@ def has_region_head(model: nn.Module) -> bool:
 
 
 def _trunk_channels(model: nn.Module) -> tuple[int, int]:
+    # A model that taps its own feature maps (the SigLIP wrapper, Bitcrush
+    # ISSUE-1106) says how wide they are.
+    own = getattr(model, "region_in_channels", None)
+    if callable(own):
+        c3, c4 = own()
+        return int(c3), int(c4)
     info = getattr(model, "feature_info", None)
     if not info or len(info) < 4:
         raise RuntimeError("region head needs a four-stage ConvNeXt trunk")
@@ -127,14 +137,20 @@ def _trunk_channels(model: nn.Module) -> tuple[int, int]:
 
 
 def install_region_head(
-    model: nn.Module, num_types: int, channels: int = REGION_HEAD_CHANNELS
+    model: nn.Module,
+    num_types: int,
+    channels: int = REGION_HEAD_CHANNELS,
+    *,
+    in_channels: tuple[int, int] | None = None,
 ) -> RegionHead:
     """Attach a fresh :class:`RegionHead` as ``model.region_head``.
 
     Device and dtype follow the trunk. ``model.forward`` is not touched: the
-    classifier keeps emitting exactly what it did.
+    classifier keeps emitting exactly what it did. ``in_channels`` overrides the
+    widths read off the trunk (ConvNeXt stage 3/4; SigLIP ``(D, D)``).
     """
-    head = RegionHead(_trunk_channels(model), num_types, channels)
+    widths = tuple(int(c) for c in in_channels) if in_channels else _trunk_channels(model)
+    head = RegionHead(widths, num_types, channels)
     ref = next(model.parameters())
     model.region_head = head.to(device=ref.device, dtype=ref.dtype)
     return model.region_head
@@ -167,9 +183,15 @@ def forward_with_regions(model: nn.Module, x: torch.Tensor) -> tuple[torch.Tenso
 
     Unrolls timm's ``forward_features`` (``stem -> stages -> norm_pre``) to tap
     the stage-3 and stage-4 maps; the logits are bit-identical to ``model(x)``.
+    A model with its own ``forward_with_regions`` (the SigLIP wrapper taps two
+    transformer blocks' patch tokens, Bitcrush ISSUE-1106) is dispatched to, so
+    callers never need to know the family.
     """
     if not has_region_head(model):
         raise RuntimeError("model has no region head installed")
+    own = getattr(model, "forward_with_regions", None)
+    if callable(own):
+        return own(x)
     feat = model.stem(x)
     taps: list[torch.Tensor] = []
     for stage in model.stages:
