@@ -31,6 +31,7 @@ from bittrainer.group_validation import (
     find_per_class_thresholds,
 )
 from bittrainer.model import load_checkpoint
+from bittrainer.ordinal_threshold import THRESHOLD_HEAD, has_threshold_head
 from bittrainer.priors import _apply_and_persist_priors
 from bittrainer.promotion import PromotionReason, decide_promotion
 from bittrainer.selection import (
@@ -330,6 +331,10 @@ def _compare_promote_finalize(
     # Reused below to persist the strictness val data without a second val pass.
     val_logits_cache: torch.Tensor | None = None
     val_labels_cache: torch.Tensor | None = None
+    # Does the SHIPPED checkpoint carry the all-threshold ordinal head
+    # (Bitcrush ISSUE-1106)? Read off the model loaded for calibration, because
+    # promotion may have kept an incumbent with the other head.
+    shipped_threshold: bool | None = None
     # Single-label groups always reach finalisation so prior-correction vectors
     # are persisted (ISSUE-0490 A) — even plain groups with no __none__ / ordinal
     # calibration, which is the motivating class-imbalance case. Calibration
@@ -345,6 +350,7 @@ def _compare_promote_finalize(
                 best_checkpoint_path, device=str(device), dtype=dtype,
                 model_size=config.backbone_variant, num_classes=config.num_classes,
             ).to(device)
+            shipped_threshold = has_threshold_head(calib_model)
             logits, labels = _collect_val_logits(calib_model, val_loader, config, device, dtype)
             del calib_model
 
@@ -383,6 +389,7 @@ def _compare_promote_finalize(
                 calibrated_logits = logits.float() / max(calibration_temperature, 1e-6) + bias_t
                 ordinal_cut_points, decoded_metrics = _finalise_ordinal_decode(
                     calibrated_logits, labels, config, none_idx,
+                    threshold_head=shipped_threshold,
                 )
                 best_metrics = decoded_metrics
                 if ordinal_cut_points is not None:
@@ -521,6 +528,9 @@ def _compare_promote_finalize(
     }
     if final_thresholds is not None:
         result["per_class_thresholds"] = final_thresholds
+    if shipped_threshold:
+        # Only for the threshold head, so softmax results keep their shape.
+        result["ordinal_head"] = THRESHOLD_HEAD
     if config.ordinal:
         result["best_val_qwk"] = best_val_qwk
         result["qwk"] = best_metrics.get("qwk")

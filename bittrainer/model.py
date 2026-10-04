@@ -48,6 +48,10 @@ def _infer_num_classes(state_dict: dict[str, torch.Tensor]) -> int | None:
     head_weight = state_dict.get("head.fc.weight")
     if head_weight is not None:
         return head_weight.shape[0]
+    # All-threshold ordinal head (Bitcrush ISSUE-1106): K classes, K-1 logits.
+    threshold_weight = state_dict.get("head.fc.threshold_fc.weight")
+    if threshold_weight is not None:
+        return threshold_weight.shape[0] + 1
     return None
 
 
@@ -365,12 +369,14 @@ def load_checkpoint(
         cell_masks = data.get("cell_masks")
         grid_rows = int(data.get("grid_rows") or 3)
         grid_cols = int(data.get("grid_cols") or 3)
+        class_names = data.get("class_names")
     else:
         state_dict = data
         ckpt_size = model_size
         ckpt_classes = num_classes
         cell_masks = None
         grid_rows = grid_cols = 3
+        class_names = None
 
     # Infer architecture from weights when metadata is missing or wrong
     inferred_size = _infer_model_size(state_dict)
@@ -405,6 +411,17 @@ def load_checkpoint(
             model,
             [list(m) for m in cell_masks],
             grid_rows * grid_cols,
+        )
+    if "head.fc.threshold_fc.weight" in state_dict:
+        # All-threshold ordinal checkpoint (Bitcrush ISSUE-1106): swap in the
+        # threshold head; it still emits num_classes log-probabilities.
+        from bittrainer.ordinal_threshold import (
+            install_ordinal_threshold_head,
+            threshold_none_index,
+        )
+
+        install_ordinal_threshold_head(
+            model, ckpt_classes, threshold_none_index(state_dict, class_names)
         )
     region_shape = _infer_region_head(state_dict)
     if region_shape is not None:

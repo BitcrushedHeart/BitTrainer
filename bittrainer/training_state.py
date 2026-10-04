@@ -278,6 +278,7 @@ def make_fingerprint(
     model_size: str,
     optimizer_identity: str | None = None,
     region_types: list[str] | None = None,
+    ordinal_head: str | None = None,
 ) -> dict:
     """Identity of the run a backup belongs to.
 
@@ -309,6 +310,11 @@ def make_fingerprint(
     # backup lacks, so a region run never resumes from a backup without one.
     if region_types is not None:
         fingerprint["region_types"] = [str(t) for t in region_types]
+    # Additive too (Bitcrush ISSUE-1106): an all-threshold head has different
+    # head weights and optimizer state than a softmax one. Softmax runs pass
+    # None and keep their historical fingerprint.
+    if ordinal_head is not None:
+        fingerprint["ordinal_head"] = str(ordinal_head)
     return fingerprint
 
 

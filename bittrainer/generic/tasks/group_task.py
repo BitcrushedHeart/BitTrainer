@@ -36,6 +36,12 @@ from bittrainer.backbones import is_siglip
 from bittrainer.group_dataset import build_group_bucket_sampler
 from bittrainer.model import _infer_region_head, create_model, prepare_for_finetune
 from bittrainer.model_soup import greedy_soup
+from bittrainer.ordinal_threshold import (
+    THRESHOLD_HEAD,
+    THRESHOLD_STATE_KEY,
+    install_ordinal_threshold_head,
+    uses_threshold_head,
+)
 from bittrainer.progress import ProgressEmitter, Stage
 from bittrainer.regions import install_region_head, region_head_ckpt_meta
 from bittrainer.runtime import configure_cuda_backend, maybe_compile, prewarm_compile
@@ -130,6 +136,7 @@ class GroupTask(TrainingTask):
         # Refuse impossible backbone settings before anything is built and
         # switch off the ConvNeXt-only speedups for SigLIP (a no-op for ConvNeXt).
         notes = gt.validate_backbone_config(config, mode="full")
+        notes += gt.validate_ordinal_head(config)
         em = ProgressEmitter(
             progress_callback or config.progress_callback or _noop_callback
         )
@@ -184,6 +191,9 @@ class GroupTask(TrainingTask):
             ),
             # None for an ordinary group, which keeps its historical fingerprint.
             region_types=gt.region_type_names(config),
+            # None for a softmax head (historical fingerprint), "threshold" for
+            # the all-threshold ordinal head.
+            ordinal_head=THRESHOLD_HEAD if uses_threshold_head(config) else None,
         )
         if resume_state is not None:
             # Re-apply the sweep outcomes the interrupted run resolved (the sweeps
@@ -254,6 +264,12 @@ class GroupTask(TrainingTask):
 
             install_spatial_head(
                 model, config.cell_masks, config.grid_rows * config.grid_cols
+            )
+        if THRESHOLD_STATE_KEY in resume_state["model"]:
+            install_ordinal_threshold_head(
+                model,
+                config.num_classes,
+                gt._resolve_none_index(config.class_names),
             )
         # The backup is the truth for the region head's shape: rebuild it from
         # the saved weights so they have somewhere to land.

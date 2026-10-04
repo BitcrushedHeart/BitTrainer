@@ -331,9 +331,18 @@ def _finalise_ordinal_decode(
     *,
     grid_steps: int = 20,
     passes: int = 3,
+    threshold_head: bool | None = None,
 ) -> tuple[list[float] | None, dict]:
     """Fit E[j] cut-points on (calibrated) val logits, adopting the EV decode
     only when it beats argmax on the selection score.
+
+    All-threshold ordinal heads (Bitcrush ISSUE-1106) fit no cut-points: their
+    decode is the argmax of the K log-probabilities (the count rule for
+    monotone thresholds), reported as ``ordinal_decode="threshold_argmax"``.
+    ``threshold_head`` says whether the scored model has that head; ``None``
+    reads it off the config (the epoch loop's own candidate). Finalisation
+    passes the SHIPPED checkpoint's answer, which differs when promotion kept
+    an incumbent with the other head.
 
     Returns ``(cut_points or None, metrics under the chosen decode)``. ``None``
     cut-points mean inference keeps argmax (the safe default) — so the shipped
@@ -348,6 +357,13 @@ def _finalise_ordinal_decode(
     argmax_metrics = _metrics_from_logits(logits, labels, config, none_index, cut_points=None)
     argmax_metrics["ordinal_decode"] = "argmax"
     if not config.ordinal:
+        return None, argmax_metrics
+    if threshold_head is None:
+        from bittrainer.ordinal_threshold import uses_threshold_head
+
+        threshold_head = uses_threshold_head(config)
+    if threshold_head:
+        argmax_metrics["ordinal_decode"] = "threshold_argmax"
         return None, argmax_metrics
 
     probs = torch.softmax(logits.float(), dim=1).cpu().numpy()

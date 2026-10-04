@@ -22,6 +22,14 @@ from bittrainer.losses import AsymmetricLoss, FocalLoss
 from bittrainer.embedding_cache import EmbeddingCache
 from bittrainer.backbone_init import apply_backbone_init, wants_timm_pretrained
 from bittrainer.backbones import backbone_family
+from bittrainer.ordinal_threshold import (
+    THRESHOLD_HEAD,
+    has_threshold_head,
+    install_ordinal_threshold_head,
+    ordinal_threshold_loss,
+    threshold_logits_from_scores,
+    uses_threshold_head,
+)
 from bittrainer.model import (
     backbone_feature_hash,
     create_model,
@@ -170,6 +178,13 @@ class GroupTrainConfig:
     label_smoothing: float = 0.1
     ordinal: bool = False
     ordinal_sigma: float = 1.0
+    # Ordinal head (Bitcrush ISSUE-1106): "softmax" (default, unchanged) or
+    # "threshold" — the all-threshold head (bittrainer.ordinal_threshold): one
+    # "is the step above k?" logit per boundary, decoded to exact per-class
+    # log-probabilities, trained with BCE against cumulative soft targets, and
+    # shipped with an argmax decode (no cut-points). Only applies when
+    # ``ordinal``; refused with multi_label, cell_masks and focal loss.
+    ordinal_head: str = "softmax"
     validation_metric: str = "qwk"
     # __none__ "guard": when True, fold the __none__-class F1 into epoch/candidate
     # selection (macro_f1 + 0.1*none_f1, and qwk + 0.1*none_f1 for guarded_qwk
@@ -558,6 +573,34 @@ def validate_backbone_config(config: GroupTrainConfig, *, mode: str = "full") ->
     return notes
 
 
+def validate_ordinal_head(config: GroupTrainConfig) -> list[str]:
+    """Check ``config.ordinal_head`` up front (Bitcrush ISSUE-1106).
+
+    ``"softmax"`` (the default) needs nothing. ``"threshold"`` is refused with
+    multi-label groups, spatial (``cell_masks``) groups and focal loss, which
+    have no all-threshold equivalent; on a non-ordinal group it is ignored, with
+    a note. An unknown value is refused.
+    """
+    from bittrainer.ordinal_threshold import ORDINAL_HEADS, THRESHOLD_HEAD
+
+    head = getattr(config, "ordinal_head", "softmax")
+    if head not in ORDINAL_HEADS:
+        raise ValueError(f"ordinal_head must be one of {ORDINAL_HEADS}, got {head!r}")
+    if head != THRESHOLD_HEAD:
+        return []
+    if not config.ordinal:
+        note = "ordinal_head='threshold' ignored: the group is not ordinal"
+        logger.info(note)
+        return [note]
+    if config.multi_label:
+        raise ValueError("ordinal_head='threshold' is not supported for multi_label groups")
+    if config.cell_masks:
+        raise ValueError("ordinal_head='threshold' is not supported for spatial (cell_masks) groups")
+    if config.use_focal:
+        raise ValueError("ordinal_head='threshold' does not support focal loss (use_focal)")
+    return []
+
+
 def _architecture_ckpt_meta(
     config: GroupTrainConfig,
     model: nn.Module,
@@ -573,7 +616,9 @@ def _architecture_ckpt_meta(
     ``finetune_blocks=0``) it also records ``backbone_hash`` — of ``state`` (the
     weights actually being saved: an EMA can drift a frozen trunk by an ulp),
     or the caller's precomputed ``backbone_hash`` — so Engine can share one
-    frozen trunk between groups whose trunks really are identical.
+    frozen trunk between groups whose trunks really are identical. A model
+    with the all-threshold ordinal head (either family) records
+    ``ordinal_head="threshold"``.
     """
     from bittrainer.backbones import CONVNEXT_FAMILY
     from bittrainer.model import backbone_feature_hash, backbone_state_hash
@@ -590,6 +635,8 @@ def _architecture_ckpt_meta(
                 meta["backbone_hash"] = backbone_state_hash(state)
             else:
                 meta["backbone_hash"] = backbone_feature_hash(model)
+    if has_threshold_head(model):
+        meta["ordinal_head"] = THRESHOLD_HEAD
     return meta
 
 
@@ -750,6 +797,38 @@ def _get_dtype(name: str) -> torch.dtype:
 # ---------------------------------------------------------------------------
 
 
+def _soft_target_loss(
+    logits: torch.Tensor,
+    soft: torch.Tensor,
+    config: GroupTrainConfig,
+    *,
+    none_index: int,
+    class_weights: torch.Tensor | None = None,
+    focal_gamma: float = 0.0,
+) -> torch.Tensor:
+    """Loss of per-class ``logits`` against per-class ``soft`` targets.
+
+    Softmax heads: the soft cross-entropy (exactly what the MixUp path always
+    computed). All-threshold heads (ISSUE-1106): BCE of the thresholds —
+    recovered from the head's log-probability scores — against cumulative
+    targets. Shared by the threshold loss branch and the MixUp path so a mixed
+    batch is scored the way the head is trained.
+    """
+    if uses_threshold_head(config):
+        return ordinal_threshold_loss(
+            threshold_logits_from_scores(logits, none_index),
+            soft,
+            none_index=none_index,
+            class_weights=class_weights,
+        )
+    return _soft_ce_loss(
+        torch.log_softmax(logits.float(), dim=1),
+        soft,
+        class_weights=class_weights,
+        focal_gamma=focal_gamma,
+    )
+
+
 def build_group_loss_fn(
     config: GroupTrainConfig,
     *,
@@ -780,6 +859,33 @@ def build_group_loss_fn(
 
         def loss_fn(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
             return ml_criterion(logits.float(), labels.float())
+
+    elif uses_threshold_head(config):
+        # All-threshold ordinal head (ISSUE-1106): the same soft targets (the
+        # ordinal sigma sweep still applies), turned into cumulative targets
+        # for the thresholds. Focal loss is refused for this head.
+        perceptual_kernel = _build_perceptual_kernel(
+            list(config.class_names),
+            config.class_similarity_centroids or {},
+            config.perceptual_sigma,
+            none_index=none_index,
+        )
+
+        def loss_fn(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+            soft = _build_soft_targets(
+                labels,
+                config.num_classes,
+                ordinal=config.ordinal,
+                ordinal_sigma=config.ordinal_sigma,
+                label_smoothing=config.label_smoothing,
+                soft_aliases=config.soft_aliases or None,
+                none_index=none_index,
+                device=device,
+                perceptual_kernel=perceptual_kernel,
+            )
+            return _soft_target_loss(
+                logits, soft, config, none_index=none_index, class_weights=class_weights
+            )
 
     elif use_soft_targets:
         perceptual_kernel = _build_perceptual_kernel(
@@ -1322,9 +1428,11 @@ def _train_one_epoch(
                 else:
                     logits = model(images)
                 if mix_soft is not None:
-                    loss = _soft_ce_loss(
-                        torch.log_softmax(logits.float(), dim=1),
+                    loss = _soft_target_loss(
+                        logits,
                         mix_soft,
+                        config,
+                        none_index=none_index,
                         class_weights=class_weights,
                         focal_gamma=focal_gamma,
                     )
@@ -1825,6 +1933,13 @@ def _create_or_warmstart_model(
                 model,
                 config.cell_masks,
                 config.grid_rows * config.grid_cols,
+            )
+        # All-threshold ordinal head (ISSUE-1106), installed before warm-start
+        # matching too: a threshold incumbent's head carries over, a softmax
+        # incumbent's head.fc simply does not match and the head starts fresh.
+        if uses_threshold_head(config):
+            install_ordinal_threshold_head(
+                model, config.num_classes, _resolve_none_index(config.class_names)
             )
         # Crop-assisted groups: attach the region head, also before warm-start
         # matching, so an incumbent's region_head.* carries over and a

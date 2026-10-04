@@ -149,6 +149,7 @@ class HeadOnlyTask(TrainingTask):
         config = self.config
         # Refuse impossible backbone settings up front (no-op for ConvNeXt).
         notes = gt.validate_backbone_config(config, mode="head_only")
+        notes += gt.validate_ordinal_head(config)
         em = ProgressEmitter(progress_callback or config.progress_callback or _noop_callback)
         for note in notes:
             em.raw({"type": "training_progress", "stage": "preparing", "status_text": note})
