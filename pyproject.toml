@@ -25,7 +25,10 @@ avif = ["pillow-avif-plugin"]
 # torch.compile's CUDA inductor backend needs triton; on Windows that's the
 # triton-windows wheel. Trainers fall back to eager when it's absent.
 compile = ["triton-windows; sys_platform == 'win32'"]
-all = ["pillow-heif", "pillow-avif-plugin"]
+# Caption-conditioned reward models (Bitcrush Optimise P8) pair the timm SigLIP2
+# image trunk with the matching Hugging Face text tower.
+text = ["transformers>=4.50"]
+all = ["pillow-heif", "pillow-avif-plugin", "transformers>=4.50"]
 
 [tool.setuptools.packages.find]
 where = ["."]

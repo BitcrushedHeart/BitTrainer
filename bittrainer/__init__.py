@@ -11,6 +11,7 @@ from bittrainer.model import (
 from bittrainer.trainer import TrainConfig, run_training
 from bittrainer.group_trainer import GroupTrainConfig, run_group_training
 from bittrainer.head_only_trainer import run_head_only_training
+from bittrainer.reward_trainer import RewardTrainConfig, run_pairwise_reward_training
 from bittrainer.validation import compute_metrics, find_optimal_threshold
 from bittrainer.checkpoint import compare_checkpoints, save_if_better
 from bittrainer.dataset import (
@@ -39,6 +40,8 @@ __all__ = [
     "GroupTrainConfig",
     "run_group_training",
     "run_head_only_training",
+    "RewardTrainConfig",
+    "run_pairwise_reward_training",
     # validation
     "compute_metrics",
     "find_optimal_threshold",
