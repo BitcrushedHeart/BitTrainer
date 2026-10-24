@@ -39,6 +39,38 @@ ProgressFn = Callable[[int, int], None]
 _HEAD_PREFIX = "head."
 
 
+def _fit_head_type(head: nn.Module, head_state: dict) -> None:
+    """Swap ``head.fc`` for the saved head's type, in place (Bitcrush ISSUE-1496).
+
+    A head search can put a softmax candidate up against a threshold incumbent
+    (or the other way round) on the same trunk; the incumbent's head is still
+    servable from the cached vectors once ``fc`` has its shape.
+    """
+    from bittrainer.ordinal_threshold import (
+        NONE_MASK_STATE_KEY,
+        OrdinalThresholdFC,
+        threshold_none_index,
+    )
+
+    fc = head.fc
+    saved_threshold = "fc.threshold_fc.weight" in head_state
+    if saved_threshold == isinstance(fc, OrdinalThresholdFC):
+        return
+    ref = fc.weight
+    if saved_threshold:
+        mask = head_state.get("fc.none_mask")
+        none_index = (
+            threshold_none_index({NONE_MASK_STATE_KEY: mask}) if mask is not None else -1
+        )
+        rows = int(head_state["fc.threshold_fc.weight"].shape[0])
+        new_fc: nn.Module = OrdinalThresholdFC(int(fc.in_features), rows + 1, none_index)
+    else:
+        new_fc = nn.Linear(
+            int(fc.in_features), int(head_state["fc.weight"].shape[0]), bias="fc.bias" in head_state
+        )
+    head.fc = new_fc.to(device=ref.device, dtype=ref.dtype)
+
+
 def val_inputs_are_cache_inputs(val_ds: Any) -> bool:
     """True when the val dataset feeds the model the tensors the cache embedded.
 
@@ -188,6 +220,7 @@ class CachedValScorer:
                 k[len(_HEAD_PREFIX):]: v for k, v in state.items() if k.startswith(_HEAD_PREFIX)
             }
             head = copy.deepcopy(self.model.head)
+            _fit_head_type(head, head_state)
             head.load_state_dict(head_state, strict=True)
         except (RuntimeError, KeyError, TypeError, ValueError, AttributeError) as exc:
             logger.info("CachedValScorer: checkpoint head not servable (%s)", exc)

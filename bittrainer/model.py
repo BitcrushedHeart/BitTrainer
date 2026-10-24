@@ -248,6 +248,31 @@ def head_tail_parameters(model: nn.Module) -> list[nn.Parameter]:
     return params
 
 
+def trunk_state(state: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    """``state`` without the head tail (``head.pre_logits`` / ``head.fc``).
+
+    What a fresh-head warm start keeps (Bitcrush ISSUE-1496): the trunk,
+    ``head.norm`` (the cache point) and any region head carry over; the
+    classifier tail is left at its fresh init.
+    """
+    return {k: v for k, v in state.items() if not str(k).startswith(_HEAD_TAIL_PREFIXES)}
+
+
+@torch.no_grad()
+def reset_head_tail(model: nn.Module) -> None:
+    """Re-initialise ``head.pre_logits`` / ``head.fc`` in place (Bitcrush ISSUE-1496).
+
+    The init timm's ConvNeXt gives a freshly built head (truncated-normal
+    weights, std 0.02, zero bias), so a warm-started model trains a new
+    classifier tail on its kept trunk.
+    """
+    for module in (*model.head.pre_logits.modules(), *model.head.fc.modules()):
+        if isinstance(module, nn.Linear):
+            nn.init.trunc_normal_(module.weight, std=0.02)
+            if module.bias is not None:
+                nn.init.zeros_(module.bias)
+
+
 # The region head (Bitcrush ISSUE-0993) branches off the trunk's stage maps and
 # never feeds the pooled vector, so it is not backbone identity either: training
 # or attaching one must not invalidate the embedding cache.

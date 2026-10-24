@@ -34,6 +34,7 @@ from bittrainer.ordinal_threshold import (
 from bittrainer.model import (
     backbone_feature_hash,
     create_model,
+    trunk_state,
 )
 from bittrainer.regions import (
     forward_with_regions,
@@ -186,6 +187,11 @@ class GroupTrainConfig:
     # shipped with an argmax decode (no cut-points). Only applies when
     # ``ordinal``; refused with multi_label, cell_masks and focal loss.
     ordinal_head: str = "softmax"
+    # Head-only runs (Bitcrush ISSUE-1496): train a softmax and an all-threshold
+    # tail on the same cached features and keep the better on validation. Only
+    # where the threshold head can train (ordinal, single-label, no cell masks,
+    # no focal loss); both tails start fresh. The winner becomes ordinal_head.
+    ordinal_head_search: bool = False
     validation_metric: str = "qwk"
     # __none__ "guard": when True, fold the __none__-class F1 into epoch/candidate
     # selection (macro_f1 + 0.1*none_f1, and qwk + 0.1*none_f1 for guarded_qwk
@@ -227,6 +233,10 @@ class GroupTrainConfig:
     device: str = "cuda"
     dtype: str = "bfloat16"
     from_scratch: bool = False
+    # Warm start the trunk but not the classifier tail (Bitcrush ISSUE-1496):
+    # best.pt's trunk, head.norm and region head carry over, head.pre_logits /
+    # head.fc start fresh. No effect on a from-scratch run or without best.pt.
+    fresh_head: bool = False
     # Bitcrush Engine backbone spec (see bittrainer.backbone_init) — governs
     # where fresh-model backbone weights come from. None = timm pretrained.
     backbone_init: dict | None = None
@@ -1893,7 +1903,8 @@ def _emit_model_load_stage(em, config: GroupTrainConfig, checkpoint_dir: Path) -
     if not config.from_scratch and existing_best.exists():
         em.stage(
             Stage.loading_model,
-            f"Loading model ({config.backbone_variant}, warm start)",
+            f"Loading model ({config.backbone_variant}, warm start"
+            f"{', fresh head' if config.fresh_head else ''})",
         )
         return
     if not wants_timm_pretrained(config.backbone_init):
@@ -2022,6 +2033,9 @@ def _create_or_warmstart_model(
                 )
             ).to(device)
             target = model.state_dict()
+            if config.fresh_head:
+                # ISSUE-1496: keep the trunk, train the classifier tail anew.
+                state = trunk_state(state)
             matched = {
                 k: v.to(target[k].dtype)
                 for k, v in state.items()
@@ -2029,10 +2043,11 @@ def _create_or_warmstart_model(
             }
             model.load_state_dict(matched, strict=False)
             logger.info(
-                "Warm-starting from %s (%d/%d tensors matched)",
+                "Warm-starting from %s (%d/%d tensors matched%s)",
                 existing_best,
                 len(matched),
                 len(target),
+                ", fresh head" if config.fresh_head else "",
             )
             return model
         except _CrossFamilyWarmStart:

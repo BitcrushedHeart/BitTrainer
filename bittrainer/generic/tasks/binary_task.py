@@ -49,6 +49,7 @@ from bittrainer.generic.task import (
 from bittrainer.model import (
     freeze_backbone,
     load_checkpoint,
+    reset_head_tail,
     unfreeze_backbone,
     unfreeze_stage,
 )
@@ -380,7 +381,14 @@ class BinaryTask(TrainingTask):
                     dtype=dtype,
                     model_size=config.model_size,
                 ).to(device)
-                logger.info("Warm-starting from existing checkpoint: %s", existing_best)
+                if config.fresh_head:
+                    # ISSUE-1496: keep the trunk, train the classifier tail anew.
+                    reset_head_tail(model)
+                logger.info(
+                    "Warm-starting from existing checkpoint: %s%s",
+                    existing_best,
+                    " (fresh head)" if config.fresh_head else "",
+                )
             except Exception:
                 logger.warning(
                     "Failed to load existing checkpoint, starting from pretrained",

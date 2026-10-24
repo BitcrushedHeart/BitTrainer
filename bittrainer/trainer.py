@@ -59,6 +59,10 @@ class TrainConfig:
     device: str = "cuda"
     dtype: str = "bfloat16"
     from_scratch: bool = False
+    # Warm start the trunk but not the classifier tail (Bitcrush ISSUE-1496):
+    # best.pt's trunk carries over, head.fc starts fresh. No effect on a
+    # from-scratch run or without best.pt.
+    fresh_head: bool = False
     # Bitcrush Engine backbone spec (see bittrainer.backbone_init) — governs
     # where fresh-model backbone weights come from. None = timm pretrained.
     backbone_init: dict | None = None

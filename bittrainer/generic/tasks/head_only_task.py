@@ -22,6 +22,7 @@ test / monkeypatch seams keep firing.
 
 from __future__ import annotations
 
+import copy
 import logging
 import time
 from pathlib import Path
@@ -38,13 +39,79 @@ from bittrainer.generic.task import BestTracker, LoopSpec, TaskContext, Training
 from bittrainer.group_dataset import build_group_bucket_sampler, labelled_samples
 from bittrainer.head_probe import prepare_head_probe_tensors
 from bittrainer.model import backbone_feature_hash, backbone_state_hash
+from bittrainer.ordinal_threshold import (
+    ORDINAL_HEADS,
+    SOFTMAX_HEAD,
+    THRESHOLD_HEAD,
+    install_ordinal_threshold_head,
+)
 from bittrainer.regions import REGION_HEAD_PREFIX, has_region_head, region_head_ckpt_meta
-from bittrainer.training_state import BackupCoordinator
+from bittrainer.training_state import (
+    BackupCoordinator,
+    capture_rng_states,
+    restore_rng_states,
+)
 from bittrainer.view_calibration import finalize_region_views
 
 logger = logging.getLogger(__name__)
 
 _THIN_CLASS_THRESHOLD = 20
+
+#: How the head search names each head in its progress lines (Engine's words).
+HEAD_LABELS = {SOFTMAX_HEAD: "Standard", THRESHOLD_HEAD: "Ordered"}
+
+#: Config fields the head-probe sweeps resolve. Each searched head tunes them
+#: afresh from the same starting values; the winner's choices stick.
+_SWEEP_FIELDS = (
+    "ordinal_sigma",
+    "label_smoothing",
+    "oversample_none",
+    "selected_softness_kind",
+    "selected_softness_value",
+    "soft_label_tuning_metric",
+    "soft_label_tuning_results",
+    "soft_label_tuning_elapsed_ms",
+    "selected_oversample_none",
+    "oversample_tuning_metric",
+    "oversample_tuning_results",
+    "oversample_tuning_elapsed_ms",
+)
+
+
+def head_search_enabled(config: gt.GroupTrainConfig) -> bool:
+    """True when the run searches softmax vs threshold (Bitcrush ISSUE-1496):
+    asked for, and the threshold head can train this group."""
+    return (
+        bool(config.ordinal_head_search)
+        and bool(config.ordinal)
+        and not config.multi_label
+        and not config.cell_masks
+        and not config.use_focal
+    )
+
+
+def pick_head(arms: list[dict]) -> dict:
+    """The searched head with the higher validation score; softmax (the
+    default head) on a tie."""
+    best: dict | None = None
+    for arm in arms:
+        if (
+            best is None
+            or arm["score"] > best["score"]
+            or (arm["score"] == best["score"] and arm["head"] == SOFTMAX_HEAD)
+        ):
+            best = arm
+    assert best is not None
+    return best
+
+
+def _sweep_state(config: gt.GroupTrainConfig) -> dict:
+    return {name: copy.copy(getattr(config, name)) for name in _SWEEP_FIELDS}
+
+
+def _apply_sweep_state(config: gt.GroupTrainConfig, state: dict) -> None:
+    for name, value in state.items():
+        setattr(config, name, copy.copy(value))
 
 
 def settle_head_only_region_head(model: torch.nn.Module, incumbent_path: str | Path) -> str:
@@ -132,6 +199,9 @@ class HeadOnlyTask(TrainingTask):
         self.candidate_path: Path | None = None
         self._val_loader = None
         self._cancelled = False
+        # Softmax vs threshold head search (Bitcrush ISSUE-1496).
+        self.search_heads = head_search_enabled(config)
+        self.head_search: list[dict] = []
         # Crop-assisted groups (Bitcrush ISSUE-0993).
         self.region_manifest = None
         self.region_proposer = "none"
@@ -211,6 +281,11 @@ class HeadOnlyTask(TrainingTask):
     def create_model(self, ctx: TaskContext, resume_state: dict | None):
         config = self.config
         self.head_hidden = config.probe_mlp_hidden if config.probe_head == "mlp" else None
+        if self.search_heads:
+            # Both searched tails start fresh on the kept trunk: the softmax one
+            # is built here, the threshold one is installed by the search.
+            config.ordinal_head = SOFTMAX_HEAD
+            config.fresh_head = True
         ctx.cb({"type": "training_progress", "stage": "preparing", "status_text": "Loading model"})
         model = gt._create_or_warmstart_model(
             config, device=ctx.device, dtype=ctx.dtype,
@@ -305,61 +380,26 @@ class HeadOnlyTask(TrainingTask):
             embed_cache, self.smart_cache, train_epoch_samples, self.val_ds.samples,
             config, cb=cb,
         )
-        probe = gt._run_auto_softness_probe(
-            model, config, embed_cache, self.smart_cache,
-            train_epoch_samples, self.val_ds.samples,
-            device=device, none_index=none_index, cb=cb, stop_event=ctx.stop_event,
-            tensors=tensors,
-        )
-        # Second pre-training sweep: __none__ oversample off vs 1.5x. When it runs
-        # it leaves the head in the selected state and supersedes the softness probe
-        # as the candidate to evaluate.
-        oversample_probe = gt._run_auto_oversample_probe(
-            model, config, embed_cache, self.smart_cache,
-            train_epoch_samples, self.val_ds.samples,
-            device=device, none_index=none_index, cb=cb, stop_event=ctx.stop_event,
-            tensors=tensors,
-        )
-        if oversample_probe:
-            probe = oversample_probe
-        self.probe = probe
-
-        # Evaluate the trained candidate (frozen backbone + warm head) on the val
-        # set, so it competes with the incumbent on identical _evaluate footing.
         collate_fn = gt._collate_multilabel_batch if config.multi_label else gt._collate_bucket_batch
         val_bs = config.batch_size or 32
-        val_loader = DataLoader(
+        self._val_loader = DataLoader(
             self.val_ds,
             batch_sampler=build_group_bucket_sampler(self.val_ds, batch_size=val_bs),
             collate_fn=collate_fn, num_workers=0,
         )
-        self._val_loader = val_loader
-        model.eval()
-        x_val = tensors[2]
-        if (
-            self.cached_val_eval
-            and x_val.shape[0] == len(self.val_ds.samples)
-            and val_inputs_are_cache_inputs(self.val_ds)
-        ):
-            # Every val image has its cached vector (the gather skips none), and
-            # the val set feeds the model exactly the tensors the cache embedded:
-            # the head on those vectors IS the full pass (ISSUE-1110).
-            self.cached_val = CachedValScorer(
-                model, x_val, self.backbone_hash, multi_label=config.multi_label,
-            )
-            cb({"type": "training_progress", "stage": "evaluating",
-                "status_text": "Scoring the trained head on cached validation features"})
-            self.candidate_metrics = self.cached_val.evaluate(
-                model, val_loader, config.num_classes, device, dtype,
-                ordinal=config.ordinal, none_index=none_index,
-            )
+        if self.search_heads:
+            probe = self._search_heads(ctx, model, embed_cache, tensors,
+                                       train_epoch_samples, none_index)
+            if probe is None:
+                cb({"type": "training_cancelled", "stage": "training",
+                    "status_text": "Cancelled during the head search"})
+                self._cancelled = True
+                return
         else:
-            self.candidate_metrics = gt._evaluate(
-                model, val_loader, config.num_classes, device, dtype,
-                multi_label=config.multi_label, ordinal=config.ordinal,
-                none_index=none_index,
-                progress=_val_pass_progress(cb, "Scoring the trained head on validation images"),
-            )
+            probe = self._train_head(ctx, model, embed_cache, tensors,
+                                     train_epoch_samples, none_index)
+            self.candidate_metrics = self._score_head(ctx, model, tensors[2], none_index)
+        self.probe = probe
         self.candidate_macro_f1 = self.candidate_metrics.get("macro_f1", 0.0)
         self.candidate_qwk = self.candidate_metrics.get("qwk", -1.0)
 
@@ -383,6 +423,129 @@ class HeadOnlyTask(TrainingTask):
             ckpt_meta["multi_label"] = True
         torch.save(ckpt_meta, candidate_path)
         self.candidate_path = candidate_path
+
+    def _train_head(self, ctx: TaskContext, model, embed_cache, tensors,
+                    train_samples: list[dict], none_index: int) -> dict:
+        """The softness sweep, then the __none__ oversample sweep, on the head
+        ``model`` carries now. Returns the probe dict of the head left in place."""
+        config = self.config
+        probe = gt._run_auto_softness_probe(
+            model, config, embed_cache, self.smart_cache,
+            train_samples, self.val_ds.samples,
+            device=ctx.device, none_index=none_index, cb=ctx.cb, stop_event=ctx.stop_event,
+            tensors=tensors,
+        )
+        # Second pre-training sweep: __none__ oversample off vs 1.5x. When it runs
+        # it leaves the head in the selected state and supersedes the softness probe
+        # as the candidate to evaluate.
+        oversample_probe = gt._run_auto_oversample_probe(
+            model, config, embed_cache, self.smart_cache,
+            train_samples, self.val_ds.samples,
+            device=ctx.device, none_index=none_index, cb=ctx.cb, stop_event=ctx.stop_event,
+            tensors=tensors,
+        )
+        return oversample_probe or probe
+
+    def _score_head(self, ctx: TaskContext, model, x_val: torch.Tensor, none_index: int) -> dict:
+        """Evaluate the trained head (frozen backbone) on the val set, so it
+        competes with the incumbent on identical _evaluate footing."""
+        config = self.config
+        model.eval()
+        if (
+            self.cached_val is None
+            and self.cached_val_eval
+            and x_val.shape[0] == len(self.val_ds.samples)
+            and val_inputs_are_cache_inputs(self.val_ds)
+        ):
+            # Every val image has its cached vector (the gather skips none), and
+            # the val set feeds the model exactly the tensors the cache embedded:
+            # the head on those vectors IS the full pass (ISSUE-1110).
+            self.cached_val = CachedValScorer(
+                model, x_val, self.backbone_hash, multi_label=config.multi_label,
+            )
+        if self.cached_val is not None:
+            ctx.cb({"type": "training_progress", "stage": "evaluating",
+                    "status_text": "Scoring the trained head on cached validation features"})
+            return self.cached_val.evaluate(
+                model, self._val_loader, config.num_classes, ctx.device, ctx.dtype,
+                ordinal=config.ordinal, none_index=none_index,
+            )
+        return gt._evaluate(
+            model, self._val_loader, config.num_classes, ctx.device, ctx.dtype,
+            multi_label=config.multi_label, ordinal=config.ordinal,
+            none_index=none_index,
+            progress=_val_pass_progress(ctx.cb, "Scoring the trained head on validation images"),
+        )
+
+    def _search_heads(self, ctx: TaskContext, model, embed_cache, tensors,
+                      train_samples: list[dict], none_index: int) -> dict | None:
+        """Train a softmax and a threshold tail and keep the better (ISSUE-1496).
+
+        Both start from the same fresh tail, RNG state and sweep settings; each
+        runs the full softness + oversample sweeps and is scored like the
+        candidate always is. The winner's head, sweep choices and
+        ``ordinal_head`` are left on the model and config, and its metrics
+        become the candidate's. ``None`` when a stop / pause arrived.
+        """
+        config = self.config
+        cb = ctx.cb
+        base_pre_logits = copy.deepcopy(model.head.pre_logits)
+        base_fc = copy.deepcopy(model.head.fc)
+        start_sweep = _sweep_state(config)
+        start_rng = capture_rng_states(ctx.device)
+        primary = gt._primary_validation_metric(config)
+        arms: list[dict] = []
+        for idx, head in enumerate(ORDINAL_HEADS, start=1):
+            if self._stop(ctx):
+                return None
+            _apply_sweep_state(config, start_sweep)
+            restore_rng_states(start_rng, ctx.device)
+            config.ordinal_head = head
+            model.head.pre_logits = copy.deepcopy(base_pre_logits)
+            model.head.fc = copy.deepcopy(base_fc)
+            if head == THRESHOLD_HEAD:
+                install_ordinal_threshold_head(model, config.num_classes, none_index)
+            label = HEAD_LABELS[head]
+            cb({"type": "training_progress", "stage": "head_search",
+                "status_text": f"Training the {label} head ({idx}/{len(ORDINAL_HEADS)})",
+                "step": idx, "total_steps": len(ORDINAL_HEADS), "ordinal_head": head})
+            probe = self._train_head(ctx, model, embed_cache, tensors, train_samples, none_index)
+            if self._stop(ctx):
+                return None
+            metrics = self._score_head(ctx, model, tensors[2], none_index)
+            score = float(gt._metric_score(metrics, config))
+            arms.append({
+                "head": head, "score": score, "metrics": metrics, "probe": probe,
+                "pre_logits": model.head.pre_logits, "fc": model.head.fc,
+                "sweep": _sweep_state(config),
+            })
+            cb({"type": "training_progress", "stage": "head_search",
+                "status_text": f"{label} head: val {primary} {score:.3f}",
+                "step": idx, "total_steps": len(ORDINAL_HEADS), "ordinal_head": head,
+                "selected_validation_score": score})
+
+        winner = pick_head(arms)
+        model.head.pre_logits = winner["pre_logits"]
+        model.head.fc = winner["fc"]
+        _apply_sweep_state(config, winner["sweep"])
+        config.ordinal_head = winner["head"]
+        self.head_search = [
+            {
+                "head": arm["head"],
+                "score": arm["score"],
+                "qwk": arm["metrics"].get("qwk"),
+                "macro_f1": arm["metrics"].get("macro_f1"),
+                "selected": arm is winner,
+            }
+            for arm in arms
+        ]
+        self.candidate_metrics = winner["metrics"]
+        cb({"type": "training_progress", "stage": "head_search",
+            "status_text": f"Kept the {HEAD_LABELS[winner['head']]} head "
+                           f"(val {primary} {winner['score']:.3f})",
+            "step": len(ORDINAL_HEADS), "total_steps": len(ORDINAL_HEADS),
+            "ordinal_head": winner["head"], "selected_validation_score": winner["score"]})
+        return winner["probe"]
 
     # Head-only has no epoch loop / optimizer — the following hooks are inert.
     def resolve_batch_size(self, ctx: TaskContext, model, resume_state: dict | None) -> int:
@@ -442,6 +605,12 @@ class HeadOnlyTask(TrainingTask):
         self._finalize_regions(ctx, result)
 
         promoted = result.get("promotion_reason") not in (None, "incumbent_wins")
+        if self.head_search:
+            result["head_search"] = self.head_search
+            if promoted:
+                # The searched winner shipped: name it either way, so Engine
+                # adopts a softmax winner over a threshold group too.
+                result["ordinal_head"] = config.ordinal_head
         primary_metric = gt._primary_validation_metric(config)
         final_score = result.get("selected_validation_score")
         if final_score is None:
