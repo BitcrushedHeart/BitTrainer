@@ -216,6 +216,10 @@ class HeadOnlyTask(TrainingTask):
         on whichever checkpoint promotion left in place. A no-op otherwise."""
         if self.region_manifest is None or not isinstance(result, dict):
             return
+        if result.get("promotion_reason") == "incumbent_wins":
+            # Bitcrush ISSUE-1501: a kept incumbent's checkpoint is never rewritten.
+            result["region_training"] = {"status": "incumbent_kept"}
+            return
         result["region_training"] = finalize_region_views(
             self.config,
             checkpoint_path=result.get("checkpoint_path"),

@@ -234,6 +234,10 @@ def _compare_promote_finalize(
     # loop; None for legacy/head-only paths). Captured before finalisation
     # overwrites best_metrics with the calibrated dicts.
     selection_decode = best_metrics.get("selection_decode")
+    # The incumbent's checkpoint dict and head type, read for the comparison and
+    # reused to report a kept incumbent's stored calibration (ISSUE-1501).
+    old_data: dict | None = None
+    incumbent_threshold: bool | None = None
 
     if best_checkpoint_path:
         candidate_score = _metric_score(best_metrics, config)
@@ -297,6 +301,7 @@ def _compare_promote_finalize(
                     )
                     incumbent_cached_model = cached_inc
                     if cached_inc is not None:
+                        incumbent_threshold = has_threshold_head(cached_inc)
                         # Same frozen trunk as the candidate (a head-only group's
                         # next run): score its head on the cached val vectors.
                         _emit("comparing", "Scoring the current model on cached features")
@@ -322,6 +327,7 @@ def _compare_promote_finalize(
                             str(existing_best), device=str(device), dtype=dtype,
                             model_size=old_size, num_classes=config.num_classes,
                         ).to(device)
+                        incumbent_threshold = has_threshold_head(old_model)
                         if config.multi_label:
                             old_metrics = _evaluate(
                                 old_model, val_loader, config.num_classes, device, dtype,
@@ -384,6 +390,12 @@ def _compare_promote_finalize(
                 best_val_macro_f1 = old_metrics.get("macro_f1", best_val_macro_f1)
                 best_val_qwk = old_metrics.get("qwk", best_val_qwk)
 
+    # A kept incumbent's checkpoint is never written (Bitcrush ISSUE-1501): its
+    # file hash is the suite's model version, so re-calibrating it here threw
+    # away every cached score for a model that had not changed. It ships as is,
+    # reported under its own stored calibration and decode.
+    incumbent_kept = promotion_reason is PromotionReason.incumbent_wins
+
     # Per-class threshold tuning for multi-label â€” replaces the hardcoded 0.5
     # with F1-optimal thresholds picked on the validation set used by the best
     # (or post-compare) model. Thresholds are baked into the checkpoint.
@@ -398,11 +410,31 @@ def _compare_promote_finalize(
     # (Bitcrush ISSUE-1106)? Read off the model loaded for calibration, because
     # promotion may have kept an incumbent with the other head.
     shipped_threshold: bool | None = None
+    final_thresholds: list[float] | None = None
+    if incumbent_kept:
+        stored = old_data if isinstance(old_data, dict) else {}
+        calibration_temperature = float(stored.get("temperature", 1.0))
+        if stored.get("class_logit_bias") is not None:
+            class_logit_bias = [float(v) for v in stored["class_logit_bias"]]
+        if stored.get("ordinal_cut_points") is not None:
+            ordinal_cut_points = [float(x) for x in stored["ordinal_cut_points"]]
+        shipped_threshold = incumbent_threshold
+        if config.multi_label and stored.get("per_class_thresholds") is not None:
+            final_thresholds = [float(t) for t in stored["per_class_thresholds"]]
+            if best_metrics.get("_probs") is not None and best_metrics.get("_labels") is not None:
+                # Score it under the thresholds it ships with, not the 0.5 default.
+                tuned = compute_multilabel_metrics(
+                    best_metrics["_labels"], predictions=None,
+                    num_classes=config.num_classes,
+                    thresholds=np.asarray(final_thresholds), probs=best_metrics["_probs"],
+                )
+                best_metrics.update(tuned)
+                best_val_macro_f1 = tuned["macro_f1"]
     # Single-label groups always reach finalisation so prior-correction vectors
     # are persisted (ISSUE-0490 A) — even plain groups with no __none__ / ordinal
     # calibration, which is the motivating class-imbalance case. Calibration
     # (temperature / none-bias / cut-points) is layered on only when applicable.
-    if best_checkpoint_path and not config.multi_label:
+    if best_checkpoint_path and not config.multi_label and not incumbent_kept:
         needs_calibration = _has_none_class(config) or config.ordinal
         try:
             _emit(
@@ -486,9 +518,9 @@ def _compare_promote_finalize(
         except Exception:
             logger.warning("Calibration / decode tuning failed; keeping uncalibrated checkpoint", exc_info=True)
 
-    final_thresholds: list[float] | None = None
     if (
-        config.multi_label
+        not incumbent_kept
+        and config.multi_label
         and config.per_class_thresholds_enabled
         and best_metrics.get("_probs") is not None
         and best_metrics.get("_labels") is not None
@@ -517,19 +549,20 @@ def _compare_promote_finalize(
     # the auto-correct strictness curve later without re-running inference. Uses
     # the logits already collected during calibration when available; for plain
     # single-label groups (no __none__, not ordinal) it does one extra val pass.
-    _persist_strictness_val_data(
-        best_checkpoint_path,
-        config=config,
-        val_loader=val_loader,
-        device=device,
-        dtype=dtype,
-        temperature=calibration_temperature,
-        class_logit_bias=class_logit_bias,
-        ml_probs=best_metrics.get("_probs"),
-        ml_labels=best_metrics.get("_labels"),
-        cached_logits=val_logits_cache,
-        cached_labels=val_labels_cache,
-    )
+    if not incumbent_kept:
+        _persist_strictness_val_data(
+            best_checkpoint_path,
+            config=config,
+            val_loader=val_loader,
+            device=device,
+            dtype=dtype,
+            temperature=calibration_temperature,
+            class_logit_bias=class_logit_bias,
+            ml_probs=best_metrics.get("_probs"),
+            ml_labels=best_metrics.get("_labels"),
+            cached_logits=val_logits_cache,
+            cached_labels=val_labels_cache,
+        )
 
     # Strip internal numpy arrays before constructing the result dict â€”
     # downstream consumers serialise this to JSON.
