@@ -722,3 +722,52 @@ def test_stock_grn_reaches_the_run_from_the_command_line(monkeypatch, tmp_path):
     assert seen["stock_grn"] is False
     assert runner.main([*base, "--stock-grn"]) == 0
     assert seen["stock_grn"] is True
+
+
+# -- what a detached run leaves for whoever asks how it is doing ----------------
+
+
+def test_a_run_keeps_a_status_file_and_stamps_its_frames(tmp_path):
+    import bittrainer.tools.backbone_status as status
+
+    pack = _make_pack(tmp_path)
+    out = tmp_path / "run"
+    seen: list[dict] = []
+
+    def _watch(frame, control):
+        if not seen:
+            seen.append(json.loads((out / "status.json").read_text(encoding="utf-8")))
+
+    summary = runner.train_from_pack(pack, out, on_frame=_watch, **_options())
+
+    # While it ran: running, with the process, the machine and the plan.
+    assert seen[0]["status"] == "running" and seen[0]["pid"] > 0 and seen[0]["host"]
+    assert seen[0]["plan"]["epochs"] == 1 and seen[0]["plan"]["image_size"] == 64
+    # After: how it ended, and every frame says when it was written.
+    assert summary["status"] == "finished"
+    ended = json.loads((out / "status.json").read_text(encoding="utf-8"))
+    assert ended["status"] == "finished" and ended["ended"] >= seen[0]["started"]
+    frames = _frames(out)
+    assert frames and all(isinstance(frame.get("t"), float) for frame in frames)
+    # And the status tool reads the folder.
+    read_frames, read_status = status.read_run(out)
+    report = status.summarise(read_frames, read_status, now=ended["ended"])
+    assert report["state"] == "finished" and report["epoch"] == 1
+
+
+def test_a_refused_run_says_so_in_its_status_file(tmp_path, monkeypatch):
+    from bittrainer.generic.tasks.backbone_task import BackboneRunRefused
+
+    async def _refuse(request, **_kwargs):
+        raise BackboneRunRefused("the tail does not fit")
+
+    import bittrainer.backbone_trainer as trainer
+
+    monkeypatch.setattr(trainer, "run_backbone_training", _refuse)
+    out = tmp_path / "run"
+
+    summary = runner.train_from_pack(_make_pack(tmp_path), out, **_options())
+
+    assert summary["status"] == "refused"
+    ended = json.loads((out / "status.json").read_text(encoding="utf-8"))
+    assert ended["status"] == "refused" and "does not fit" in ended["reason"]

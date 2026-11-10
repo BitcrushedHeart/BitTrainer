@@ -49,8 +49,11 @@ import argparse
 import asyncio
 import importlib.util
 import json
+import os
 import signal
+import socket
 import threading
+import time
 import traceback
 from pathlib import Path
 
@@ -360,6 +363,28 @@ def _line(frame: dict) -> str | None:
     return None
 
 
+# What backbone_status needs to know of a run's plan to say how long is left.
+_PLAN_KEYS = (
+    "epochs",
+    "image_size",
+    "batch_size",
+    "finetune_image_size",
+    "finetune_epochs",
+    "finetune_batch_size",
+)
+
+
+def _write_status(out: Path, status: str, **fields) -> None:
+    """Keep ``status.json`` current: it is how ``backbone_status`` tells a run
+    that is running from one that paused, finished, failed or simply vanished."""
+    path = Path(out) / "status.json"
+    scratch = path.with_name("status.json.tmp")
+    scratch.write_text(
+        json.dumps({"status": status, **fields}, default=_jsonable), encoding="utf-8"
+    )
+    scratch.replace(path)
+
+
 def train_from_pack(
     pack: Path,
     out: Path,
@@ -430,6 +455,15 @@ def train_from_pack(
     out.mkdir(parents=True, exist_ok=True)
     control = Control(out)
     control.clear_files()
+    plan = {key: request["training_config"].get(key) for key in _PLAN_KEYS}
+    _write_status(
+        out,
+        "running",
+        pid=os.getpid(),
+        host=socket.gethostname(),
+        started=round(time.time(), 1),
+        plan=plan,
+    )
     if install_signal_handlers:
         for name in ("SIGINT", "SIGTERM"):
             signal.signal(getattr(signal, name), lambda *_args: control.pause())
@@ -449,6 +483,9 @@ def train_from_pack(
     with (out / "progress.jsonl").open("a", encoding="utf-8") as progress:
 
         def _frame(frame: dict) -> None:
+            # Stamped here, not in the trainer: only a detached run needs to be
+            # asked later when it last made progress.
+            frame = {**frame, "t": round(time.time(), 1)}
             progress.write(json.dumps(frame, default=_jsonable) + "\n")
             progress.flush()
             line = _line(frame)
@@ -478,23 +515,26 @@ def train_from_pack(
             watcher.join(timeout=poll_seconds + 1)
 
     if refusal is not None:
-        return {"status": "refused", "reason": refusal}
-    if failure is not None:
-        return {"status": "failed", "reason": failure}
-    if result.get("paused"):
-        return {"status": "paused", "backup": result.get("backup_path")}
-    if torch.cuda.is_available():
-        # What the run needed at its peak, to size the batch for the next one.
-        result["peak_vram_mb"] = round(torch.cuda.max_memory_allocated() / 2**20)
-    (out / "result.json").write_text(
-        json.dumps(result, indent=1, default=_jsonable), encoding="utf-8"
-    )
-    return {
-        "status": "finished",
-        "validation_score": result.get("validation_score"),
-        "best_epoch": result.get("best_epoch"),
-        "epochs_completed": result.get("epochs_completed"),
-    }
+        summary = {"status": "refused", "reason": refusal}
+    elif failure is not None:
+        summary = {"status": "failed", "reason": failure}
+    elif result.get("paused"):
+        summary = {"status": "paused", "backup": result.get("backup_path")}
+    else:
+        if torch.cuda.is_available():
+            # What the run needed at its peak, to size the batch for the next one.
+            result["peak_vram_mb"] = round(torch.cuda.max_memory_allocated() / 2**20)
+        (out / "result.json").write_text(
+            json.dumps(result, indent=1, default=_jsonable), encoding="utf-8"
+        )
+        summary = {
+            "status": "finished",
+            "validation_score": result.get("validation_score"),
+            "best_epoch": result.get("best_epoch"),
+            "epochs_completed": result.get("epochs_completed"),
+        }
+    _write_status(out, plan=plan, ended=round(time.time(), 1), **summary)
+    return summary
 
 
 def _setting(text: str) -> tuple[str, object]:

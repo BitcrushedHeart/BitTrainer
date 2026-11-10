@@ -58,6 +58,7 @@ _ROUND_TESTS = (
     "test_backbone_label_policy.py",
     "test_backbone_geometry.py",
     "test_backbone_validation_report.py",
+    "test_backbone_status.py",
 )
 # The files with tests that only run on a GPU (named ..._real_gpu, or the one
 # that checks the precision matches the card).
