@@ -80,6 +80,9 @@ _OTHER_TESTS = (
     "test_backbone_init.py",
     "test_backbone_hash.py",
     "test_generic_trainer.py",
+    # Outside the package's own test folder. It builds the optimiser without a
+    # run context, which is how the preflight's first version was caught.
+    "../../tests/test_backbone_trainer_parity.py",
 )
 
 

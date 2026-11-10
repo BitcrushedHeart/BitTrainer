@@ -826,7 +826,10 @@ class BackboneTask(TrainingTask):
         # Here, not inside the epoch loop: a refusal then leaves no backup
         # behind for the next attempt to trip over.
         start_epoch = int(resume_state["epoch"]) if resume_state is not None else 0
-        self._preflight(ctx, model, optimizer, start_epoch)
+        # A caller that only wants the optimiser (no run context: a tool, a test)
+        # has no card to check a step against.
+        if ctx is not None:
+            self._preflight(ctx, model, optimizer, start_epoch)
         return optimizer, scheduler, t_max
 
     def restore_resume_extra(self, ctx: TaskContext, resume_state: dict) -> None:
