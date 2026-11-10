@@ -331,3 +331,13 @@ def test_a_run_that_never_pauses_fails_the_check(tmp_path):
 
     assert result.status == "failed"
     assert "exit" in result.note
+
+
+def test_base_stages_ask_for_what_a_16gb_card_holds():
+    """First run on the T4: Base ran out of memory at batch 128, and at 384px
+    with batch 32. The comparison that replaced them measures what the lean GRN
+    layer buys, so that gain stays under watch."""
+    names = {stage.name for stage in vm.STAGES}
+
+    assert "speed_base_batch128" not in names
+    assert "speed_base_stock_grn" in names

@@ -340,7 +340,7 @@ def test_shared_logits_are_one_matrix_product_in_the_shared_layout():
         {"g": ["x", "y", "z"], "h": ["q", "p"]},
     )
     calls = []
-    for head in [*heads.binary.values(), *heads.groups.values()]:
+    for head in heads.groups.values():
         head.register_forward_hook(lambda *_args: calls.append(1))
     features = torch.randn(5, 8, generator=torch.Generator().manual_seed(3))
 
@@ -349,8 +349,8 @@ def test_shared_logits_are_one_matrix_product_in_the_shared_layout():
     assert calls == []
     expected = torch.cat(
         [
-            F.linear(features, heads.binary["a"].weight, heads.binary["a"].bias),
-            F.linear(features, heads.binary["c"].weight, heads.binary["c"].bias),
+            F.linear(features, *heads.binary_rows(["a"])),
+            F.linear(features, *heads.binary_rows(["c"])),
             F.linear(features, heads.groups["g"].weight, heads.groups["g"].bias),
         ],
         dim=1,
@@ -715,3 +715,17 @@ def test_plain_and_distillation_fingerprints_differ(tmp_path, teacher_path):
     # Changing the recipe starts fresh too.
     assert not fingerprint_matches(distilled, hotter)
     assert fingerprint_matches(distilled, distilled)
+
+
+# -- the GRN layer -------------------------------------------------------------
+
+
+def test_teacher_and_student_both_run_the_lean_grn_layer(mixed_run):
+    from timm.layers.grn import GlobalResponseNorm
+
+    from bittrainer.lean_grn import LeanGlobalResponseNorm
+
+    for model in (mixed_run["teacher"].model, mixed_run["model"]):
+        layers = [m for m in model.modules() if isinstance(m, GlobalResponseNorm)]
+        assert layers
+        assert all(type(layer) is LeanGlobalResponseNorm for layer in layers)

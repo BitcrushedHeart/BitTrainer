@@ -159,8 +159,29 @@ def test_command_line_options_reach_the_run(monkeypatch, tmp_path):
         "workers": 4,
         "amp": "fp16",
         "channels_last": True,
+        "stock_grn": False,
         "init": "timm",
         "min_score": 0.7,
         "device": "cuda",
         "seed": 5,
     }
+
+
+def test_the_stock_grn_layer_can_be_asked_for(monkeypatch, tmp_path):
+    records = proof.make_fixture_dataset(tmp_path, count=12, image_size=48)
+
+    default = proof.build_request(tmp_path, records)["training_config"]
+    stock = proof.build_request(tmp_path, records, stock_grn=True)["training_config"]
+    # Unset means the trainer's own default, which is the lean layer.
+    assert "lean_grn" not in default
+    assert stock["lean_grn"] is False
+
+    seen: dict = {}
+
+    def _fake(root, **kw):
+        seen.update(kw)
+        return {"passed": True, "checks": {}}
+
+    monkeypatch.setattr(proof, "run_proof", _fake)
+    proof.main(["--workdir", str(tmp_path), "--stock-grn"])
+    assert seen["stock_grn"] is True

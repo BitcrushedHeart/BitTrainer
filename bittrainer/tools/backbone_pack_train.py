@@ -104,6 +104,7 @@ def build_request(
     distill: dict | None = None,
     workers: int = 4,
     channels_last: bool = False,
+    stock_grn: bool = False,
     finetune_image_size: int = 0,
     finetune_epochs: int = 0,
     soft_negatives: bool = False,
@@ -125,6 +126,10 @@ def build_request(
     folder once (see ``bittrainer.convnext_v1_init``) and starts from that
     trunk; a resumed run reuses the file. ``teacher`` (a trained candidate)
     turns the run into a distillation of it, tuned by ``distill``.
+
+    ``stock_grn`` trains with timm's own GRN layer instead of the lean one the
+    trainer uses by default (``bittrainer.lean_grn``): slower and heavier under
+    half precision, there for comparison.
     """
     pack, out = Path(pack), Path(out)
     records, counts = pack_records(pack, limit=limit)
@@ -147,6 +152,8 @@ def build_request(
         "backup_every_steps": int(backup_every_steps),
         "progress_every_steps": int(progress_every_steps),
     }
+    if stock_grn:
+        config["lean_grn"] = False
     if device:
         config["device"] = device
     if amp == "off":
@@ -469,6 +476,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--workers", type=int, default=4, help="image loading workers")
     parser.add_argument("--channels-last", action="store_true")
     parser.add_argument(
+        "--stock-grn",
+        action="store_true",
+        help="train with timm's own GRN layer (slower in half precision)",
+    )
+    parser.add_argument(
         "--amp", default="auto", choices=["auto", "fp16", "bf16", "off"]
     )
     parser.add_argument(
@@ -540,6 +552,7 @@ def main(argv: list[str] | None = None) -> int:
         batch_size=args.batch_size,
         workers=args.workers,
         channels_last=args.channels_last,
+        stock_grn=args.stock_grn,
         amp=args.amp,
         device=args.device,
         init=args.init,

@@ -165,6 +165,10 @@ def _backbone_fingerprint(
     # fresh (same accepted precedent as the optimizer key above).
     if resolution is not None:
         fingerprint["resolution"] = resolution
+    # The concept heads are one matrix (see _MultiTaskHeads). A backup taken when
+    # each concept was its own Linear holds optimiser state for a tensor per
+    # concept; without this key it would match and then fail to load.
+    fingerprint["heads"] = "matrix"
     return fingerprint
 
 
@@ -534,17 +538,99 @@ def _collate(batch):
 
 
 class _MultiTaskHeads(nn.Module):
+    """The training heads on the trunk's pooled feature.
+
+    Every yes/no concept is a row of ``binary_weight`` and an entry of
+    ``binary_bias`` (Bitcrush ISSUE-1655); each group keeps a ``Linear``. The
+    concepts used to be a ``Linear`` each, which at 900 concepts gave the
+    optimiser, the gradient scaler, the clipper and the EMA 1,800 small tensors
+    to walk every step: on a T4 a Base step took 4.8 s instead of 1.1 s.
+
+    What is saved keeps the older layout, a weight and a bias per concept
+    (``binary.<concept>.weight`` of shape ``[1, features]``), so candidates,
+    backups and everything that reads them are unaffected, and a file written
+    with a ``Linear`` per concept loads.
+    """
+
     def __init__(self, feature_dim: int, vocab: _Vocab):
         super().__init__()
-        self.binary = nn.ModuleDict(
-            {concept: nn.Linear(feature_dim, 1) for concept in vocab.concepts}
-        )
+        self.binary_names: list[str] = list(vocab.concepts)
+        self.binary_index: dict[str, int] = {
+            name: column for column, name in enumerate(self.binary_names)
+        }
+        weight = torch.empty(len(self.binary_names), feature_dim)
+        bias = torch.empty(len(self.binary_names))
+        if self.binary_names:
+            # What a Linear(feature_dim, 1) per concept drew its values from.
+            bound = 1.0 / math.sqrt(feature_dim)
+            nn.init.uniform_(weight, -bound, bound)
+            nn.init.uniform_(bias, -bound, bound)
+        self.binary_weight = nn.Parameter(weight)
+        self.binary_bias = nn.Parameter(bias)
         self.groups = nn.ModuleDict(
             {
                 group: nn.Linear(feature_dim, len(classes))
                 for group, classes in vocab.groups.items()
             }
         )
+
+    def binary_rows(self, names) -> tuple[torch.Tensor, torch.Tensor]:
+        """The weight rows and biases of the named concepts, in that order."""
+        index = torch.tensor(
+            [self.binary_index[name] for name in names],
+            dtype=torch.long,
+            device=self.binary_weight.device,
+        )
+        return self.binary_weight[index], self.binary_bias[index]
+
+    def _save_to_state_dict(self, destination, prefix, keep_vars):
+        weight, bias = self.binary_weight, self.binary_bias
+        if not keep_vars:
+            weight, bias = weight.detach(), bias.detach()
+        for column, name in enumerate(self.binary_names):
+            destination[f"{prefix}binary.{name}.weight"] = weight[column : column + 1]
+            destination[f"{prefix}binary.{name}.bias"] = bias[column : column + 1]
+
+    def _load_from_state_dict(
+        self,
+        state_dict,
+        prefix,
+        local_metadata,
+        strict,
+        missing_keys,
+        unexpected_keys,
+        error_msgs,
+    ):
+        known: set[str] = set()
+        parts = (("weight", self.binary_weight), ("bias", self.binary_bias))
+        with torch.no_grad():
+            for column, name in enumerate(self.binary_names):
+                for part, parameter in parts:
+                    key = f"{prefix}binary.{name}.{part}"
+                    known.add(key)
+                    row = parameter[column : column + 1]
+                    value = state_dict.get(key)
+                    if value is None:
+                        missing_keys.append(key)
+                    elif value.shape != row.shape:
+                        error_msgs.append(
+                            f"size mismatch for {key}: copying a param with shape "
+                            f"{tuple(value.shape)} from checkpoint, the shape in "
+                            f"current model is {tuple(row.shape)}."
+                        )
+                    else:
+                        row.copy_(value)
+        if strict:
+            for key in state_dict:
+                if not key.startswith(prefix):
+                    continue
+                first = key[len(prefix) :].split(".", 1)[0]
+                if (
+                    (key not in known)
+                    if first == "binary"
+                    else (first not in self._modules)
+                ):
+                    unexpected_keys.append(key)
 
 
 class _BackboneWithHeads(nn.Module):
@@ -581,38 +667,35 @@ def _batch_loss(
     the number of contributing head losses so the gradient scale no longer grows
     with per-batch label density.
 
-    The concept heads run as ONE matrix product over the heads this batch has a
-    label for (Bitcrush ISSUE-1655), instead of a row scan, an index, a Linear
-    and a loss per head: with several hundred concepts that was thousands of
-    tiny calls per batch. Each head's loss is still the mean over its own
-    labelled rows, and a head with no label in the batch stays out of the graph
-    (no gradient, so the optimizer leaves it alone), exactly as before.
+    The concept heads run as ONE matrix product (Bitcrush ISSUE-1655), instead
+    of a row scan, an index, a Linear and a loss per head: with several hundred
+    concepts that was thousands of tiny calls per batch. Each head's loss is
+    still the mean over its own labelled rows. A head with no label in the batch
+    takes no part in the loss; being a row of the one head matrix, it gets a
+    zero gradient rather than none.
     """
     losses: list[torch.Tensor] = []
     bce = nn.functional.binary_cross_entropy_with_logits
     ce = nn.functional.cross_entropy
 
-    # One pass over the labels: a column per concept head present in the batch,
-    # and the (row, column, target) of every label.
-    binary_heads = heads.binary
-    columns: dict[str, int] = {}
+    # One pass over the labels: the (row, column, target) of every label, a
+    # column per concept head.
+    column_of = heads.binary_index
     label_rows: list[int] = []
     label_cols: list[int] = []
     label_values: list[float] = []
     for row, labels in enumerate(binary_labels):
         for concept, value in labels.items():
-            column = columns.get(concept)
+            column = column_of.get(concept)
             if column is None:
-                if concept not in binary_heads:
-                    continue
-                column = columns[concept] = len(columns)
+                continue
             label_rows.append(row)
             label_cols.append(column)
             label_values.append(value)
     if label_rows:
-        weight = torch.cat([binary_heads[concept].weight for concept in columns])
-        bias = torch.cat([binary_heads[concept].bias for concept in columns])
-        logits = nn.functional.linear(features, weight, bias).float()
+        logits = nn.functional.linear(
+            features, heads.binary_weight, heads.binary_bias
+        ).float()
         index = (
             torch.tensor(label_rows, device=device),
             torch.tensor(label_cols, device=device),
@@ -625,13 +708,15 @@ def _batch_loss(
         if pos_weight:
             weights = [
                 1.0 if (value := pos_weight.get(concept)) is None else float(value)
-                for concept in columns
+                for concept in heads.binary_names
             ]
             if any(value != 1.0 for value in weights):
                 head_weight = torch.tensor(weights, device=device, dtype=torch.float32)
         per_label = bce(logits, targets, pos_weight=head_weight, reduction="none")
-        # Mean over each head's own labelled rows (every column has at least one).
-        losses.append((per_label * labelled).sum(0) / labelled.sum(0))
+        # Mean over each head's own labelled rows, for the heads that have any.
+        counts = labelled.sum(0)
+        present = counts > 0
+        losses.append((per_label * labelled).sum(0)[present] / counts[present])
 
     group_heads = heads.groups
     group_rows: dict[str, tuple[list[int], list[int]]] = {}
@@ -681,7 +766,7 @@ def _collect_val_scores(
     """
     backbone.eval()
     heads.eval()
-    concepts = list(heads.binary.keys())
+    concepts = list(heads.binary_names)
     groups = list(heads.groups.keys())
     concept_column = {concept: column for column, concept in enumerate(concepts)}
     # Columns: one per concept, then each group's classes side by side.
@@ -691,9 +776,11 @@ def _collect_val_scores(
         width = heads.groups[group].out_features
         group_span[group] = (offset, offset + width)
         offset += width
-    modules = [heads.binary[c] for c in concepts] + [heads.groups[g] for g in groups]
-    weight = torch.cat([m.weight for m in modules]) if modules else None
-    bias = torch.cat([m.bias for m in modules]) if modules else None
+    group_heads = [heads.groups[g] for g in groups]
+    weight = bias = None
+    if concepts or groups:
+        weight = torch.cat([heads.binary_weight, *[m.weight for m in group_heads]])
+        bias = torch.cat([heads.binary_bias, *[m.bias for m in group_heads]])
 
     bin_columns: list[np.ndarray] = []
     bin_logits: list[np.ndarray] = []
@@ -861,20 +948,27 @@ def _tune_binary_thresholds(
 ) -> dict[str, float]:
     """F1-optimal per-head decision threshold on ``sigmoid(logit)``.
 
-    Reuses :func:`group_validation.find_per_class_thresholds` one column at a time
-    (its F1 grid sweep + min-positive 0.5 fallback), so a head below
-    ``min_positive`` val positives keeps the naive 0.5.
+    The search of :func:`group_validation.find_per_class_thresholds` (its grid,
+    the first best value on a tie, 0.5 for a head with fewer than
+    ``min_positive`` validation positives), done for a head as one numpy
+    comparison against the whole grid. Calling the shared function per head
+    cost 36 scikit-learn calls each: 108 s for 902 heads on a T4 (Bitcrush
+    ISSUE-1655).
     """
-    from bittrainer.group_validation import find_per_class_thresholds
-
+    grid = np.arange(0.05, 0.95, 0.025)
     thresholds: dict[str, float] = {}
     for concept, (logits, targets) in binary_scores.items():
-        probs = 1.0 / (1.0 + np.exp(-np.asarray(logits, dtype=np.float64)))
         labels = np.asarray(targets, dtype=np.float64)
-        column = find_per_class_thresholds(
-            probs.reshape(-1, 1), labels.reshape(-1, 1), min_positive=min_positive
-        )
-        thresholds[concept] = float(column[0])
+        if int(labels.sum()) < min_positive:
+            thresholds[concept] = 0.5
+            continue
+        probs = 1.0 / (1.0 + np.exp(-np.asarray(logits, dtype=np.float64)))
+        positive = labels == 1.0
+        called = probs[None, :] >= grid[:, None]
+        hits = (called & positive).sum(1)
+        # F1 = 2 TP / (called + actual positives); 0 where that is empty.
+        f1 = 2.0 * hits / np.maximum(called.sum(1) + positive.sum(), 1)
+        thresholds[concept] = float(grid[int(np.argmax(f1))])
     return thresholds
 
 

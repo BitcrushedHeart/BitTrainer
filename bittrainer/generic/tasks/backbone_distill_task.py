@@ -53,6 +53,7 @@ import bittrainer.backbone_trainer as bb
 from bittrainer.generic.optimizer import clip_gradients
 from bittrainer.generic.task import TaskContext
 from bittrainer.generic.tasks.backbone_task import BackboneTask
+from bittrainer.lean_grn import use_lean_grn
 from bittrainer.model import create_model
 
 logger = logging.getLogger(__name__)
@@ -204,10 +205,10 @@ def shared_head_logits(
     With hundreds of concepts a call per head would be hundreds of tiny kernels
     per step; stacking the heads' rows keeps it to one.
     """
-    modules = [heads.binary[c] for c in match.concepts]
-    modules += [heads.groups[name] for name, _n in match.groups]
-    weight = torch.cat([m.weight for m in modules])
-    bias = torch.cat([m.bias for m in modules])
+    weight, bias = heads.binary_rows(match.concepts)
+    groups = [heads.groups[name] for name, _n in match.groups]
+    weight = torch.cat([weight, *[m.weight for m in groups]])
+    bias = torch.cat([bias, *[m.bias for m in groups]])
     return F.linear(features, weight, bias).float()
 
 
@@ -437,6 +438,8 @@ class BackboneDistillTask(BackboneTask):
                 "Distillation refused: logit_weight and feature_weight are both 0, "
                 "so the teacher would take no part in training."
             )
+        if self.lean_grn:  # the teacher's forward pass is a third of each step
+            use_lean_grn(self.teacher.model)
         if self.channels_last:
             self.teacher.model.to(memory_format=torch.channels_last)
 

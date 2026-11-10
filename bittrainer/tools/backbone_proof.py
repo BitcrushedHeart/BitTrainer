@@ -150,6 +150,7 @@ def build_request(
     workers: int = 0,
     channels_last: bool = False,
     init: str = "random",
+    stock_grn: bool = False,
 ) -> dict:
     """The ``run_backbone_training`` request for a proof run. Every training
     default the Backbone Builder ships with is left alone; only the settings
@@ -162,6 +163,8 @@ def build_request(
         "dataloader_workers": int(workers),
         "channels_last": bool(channels_last),
     }
+    if stock_grn:  # timm's own GRN layer instead of the trainer's lean one
+        config["lean_grn"] = False
     if device:
         config["device"] = device
     if amp == "off":
@@ -217,6 +220,7 @@ def run_proof(
     workers: int = 0,
     channels_last: bool = False,
     init: str = "random",
+    stock_grn: bool = False,
     min_score: float | None = DEFAULT_MIN_SCORE,
     seed: int = 0,
 ) -> dict:
@@ -247,6 +251,7 @@ def run_proof(
         workers=workers,
         channels_last=channels_last,
         init=init,
+        stock_grn=stock_grn,
     )
 
     if torch.cuda.is_available():
@@ -332,6 +337,7 @@ def run_proof(
         "channels_last": channels_last,
         "amp_dtype": preparing.get("amp_dtype"),
         "grad_scaler": preparing.get("grad_scaler"),
+        "lean_grn": preparing.get("lean_grn"),
         "epochs": epoch_rows,
         "best_images_per_second": max(speeds) if speeds else None,
         "peak_vram_mb": peak_vram_mb,
@@ -368,6 +374,11 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--workers", type=int, default=0, help="DataLoader workers")
     parser.add_argument("--channels-last", action="store_true")
+    parser.add_argument(
+        "--stock-grn",
+        action="store_true",
+        help="train with timm's own GRN layer (slower in half precision)",
+    )
     parser.add_argument("--init", default="random", choices=["random", "timm"])
     parser.add_argument(
         "--min-score",
@@ -392,6 +403,7 @@ def main(argv: list[str] | None = None) -> int:
         "workers": args.workers,
         "amp": args.amp,
         "channels_last": args.channels_last,
+        "stock_grn": args.stock_grn,
         "init": args.init,
         "min_score": None if args.min_score < 0 else args.min_score,
         "device": None if args.device == "auto" else args.device,

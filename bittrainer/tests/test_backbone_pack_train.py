@@ -577,3 +577,33 @@ def test_command_line_options_reach_the_run(monkeypatch, tmp_path):
         and seen["fresh"] is True
     )
     assert seen["extra"] == {"neg_pos_ratio": 3, "positive_cap_mode": "random"}
+
+
+# -- the GRN layer -------------------------------------------------------------
+
+
+def test_the_stock_grn_layer_is_an_option_not_the_default(tmp_path):
+    pack = _make_pack(tmp_path)
+
+    default, _ = runner.build_request(pack, tmp_path / "a", **_options())
+    stock, _ = runner.build_request(pack, tmp_path / "b", **_options(stock_grn=True))
+
+    # Unset means the trainer's own default, which is the lean layer.
+    assert "lean_grn" not in default["training_config"]
+    assert stock["training_config"]["lean_grn"] is False
+
+
+def test_stock_grn_reaches_the_run_from_the_command_line(monkeypatch, tmp_path):
+    seen: dict = {}
+
+    def _fake(pack, out, **kw):
+        seen.update(kw)
+        return {"status": "finished"}
+
+    monkeypatch.setattr(runner, "train_from_pack", _fake)
+    base = ["--pack", str(tmp_path), "--out", str(tmp_path / "run")]
+
+    assert runner.main(base) == 0
+    assert seen["stock_grn"] is False
+    assert runner.main([*base, "--stock-grn"]) == 0
+    assert seen["stock_grn"] is True

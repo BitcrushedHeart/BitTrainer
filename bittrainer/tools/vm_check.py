@@ -47,6 +47,7 @@ _ROUND_TESTS = (
     "test_backbone_pack_train.py",
     "test_backbone_distill.py",
     "test_convnext_v1_init.py",
+    "test_lean_grn.py",
     "test_vm_check.py",
 )
 _OTHER_TESTS = (
@@ -509,6 +510,8 @@ def _proof(context: Context, name: str, minutes: float, *args: str) -> Result:
         "grad_scaler": report.get("grad_scaler"),
         "peak_vram_mb": report.get("peak_vram_mb"),
     }
+    if report.get("lean_grn") is False:
+        numbers["grn"] = "stock"
     if "weakest_family_f1" in report and report.get("min_score") is not None:
         numbers["weakest_family_f1"] = round(report["weakest_family_f1"] or 0.0, 3)
     if code != 0 or not report.get("passed"):
@@ -724,9 +727,9 @@ STAGES: list[Stage] = [
     Stage("speed_nano", "speed: nano at 224px", 2, _speed("speed_nano", "--size", "nano", *_AT_224), ("env",), True),
     Stage("speed_tiny", "speed: tiny at 224px", 3, _speed("speed_tiny", "--size", "tiny", *_AT_224), ("env",), True),
     Stage("speed_base", "speed: base at 224px", 4, _speed("speed_base", "--size", "base", *_AT_224), ("env",), True),
-    Stage("speed_base_384", "speed: base at 384px", 5, _speed("speed_base_384", "--size", "base", "--image-size", "384", "--batch-size", "32"), ("env",), True),
+    Stage("speed_base_384", "speed: base at 384px", 5, _speed("speed_base_384", "--size", "base", "--image-size", "384", "--batch-size", "16"), ("env",), True),
     Stage("speed_base_channels_last", "speed: base, channels-last", 4, _speed("speed_base_channels_last", "--size", "base", *_AT_224, "--channels-last"), ("env",), True),
-    Stage("speed_base_batch128", "speed: base, batch 128", 4, _speed("speed_base_batch128", "--size", "base", "--image-size", "224", "--batch-size", "128"), ("env",), True),
+    Stage("speed_base_stock_grn", "speed: base with timm's own GRN layer, batch 32", 4, _speed("speed_base_stock_grn", "--size", "base", "--image-size", "224", "--batch-size", "32", "--stock-grn"), ("env",), True),
     Stage("speed_base_one_loader", "speed: base, images loaded on the training thread", 6, _speed("speed_base_one_loader", "--size", "base", *_AT_224, "--workers", "0"), ("env",), True),
     Stage("real_pack", "a short run on part of a real pack (needs --pack)", 6, _real_pack, ("env",), True),
 ]  # fmt: skip

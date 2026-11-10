@@ -6,13 +6,19 @@ validation a GPU-to-CPU copy per head as well. With several hundred concepts
 that is thousands of tiny calls per batch. Both now run the concept heads as a
 single matrix product.
 
-The old loops are kept here, verbatim, as the reference: the new code must give
-the same loss, the same gradients, the same heads left untouched, and the same
-validation scores in the same order.
+The old loops are kept here as the reference: the new code must give the same
+loss, the same gradients and the same validation scores in the same order.
+
+Since the first run on the T4 the concept heads are also STORED as one matrix
+(a row per concept) instead of a ``Linear`` each. With 900 concepts the
+optimiser, the gradient scaler, the clipper and the EMA were walking 1,800 small
+tensors one by one every step, and a Base step took 4.8 s instead of 1.1 s. What
+is saved keeps its layout: one weight and one bias per concept.
 """
 
 from __future__ import annotations
 
+import copy
 import random
 from types import SimpleNamespace
 
@@ -30,6 +36,12 @@ FEATURES = 24
 # -- the old per-head loops, as the reference --------------------------------
 
 
+def _one_head(heads, concept, features):
+    """One concept's logits on its own: what the ``Linear`` per concept computed."""
+    weight, bias = heads.binary_rows([concept])
+    return nn.functional.linear(features, weight, bias)
+
+
 def _reference_batch_loss(
     features,
     heads,
@@ -44,11 +56,11 @@ def _reference_batch_loss(
     losses = []
     bce = nn.functional.binary_cross_entropy_with_logits
     ce = nn.functional.cross_entropy
-    for concept, head in heads.binary.items():
+    for concept in heads.binary_names:
         rows = [i for i, labels in enumerate(binary_labels) if concept in labels]
         if not rows:
             continue
-        logits = head(features[rows]).squeeze(-1)
+        logits = _one_head(heads, concept, features[rows]).squeeze(-1)
         targets = torch.tensor(
             [binary_labels[i][concept] for i in rows], device=device, dtype=logits.dtype
         )
@@ -78,17 +90,17 @@ def _reference_batch_loss(
 
 @torch.no_grad()
 def _reference_val_scores(backbone, heads, loader, device):
-    bin_logits = {c: [] for c in heads.binary}
-    bin_targets = {c: [] for c in heads.binary}
+    bin_logits = {c: [] for c in heads.binary_names}
+    bin_targets = {c: [] for c in heads.binary_names}
     grp_logits = {g: [] for g in heads.groups}
     grp_targets = {g: [] for g in heads.groups}
     for images, binary_labels, group_labels in loader:
         features = backbone(images.to(device)).float()
-        for concept, head in heads.binary.items():
+        for concept in heads.binary_names:
             rows = [i for i, labels in enumerate(binary_labels) if concept in labels]
             if not rows:
                 continue
-            logits = head(features[rows]).squeeze(-1)
+            logits = _one_head(heads, concept, features[rows]).squeeze(-1)
             bin_logits[concept].append(
                 logits.detach().cpu().numpy().astype(np.float64).reshape(-1)
             )
@@ -106,7 +118,7 @@ def _reference_val_scores(backbone, heads, loader, device):
             )
     binary_scores = {
         c: (np.concatenate(bin_logits[c]), np.concatenate(bin_targets[c]))
-        for c in heads.binary
+        for c in heads.binary_names
         if bin_logits[c]
     }
     group_scores = {
@@ -219,9 +231,12 @@ def test_gradients_match_the_per_head_loop():
             torch.testing.assert_close(new_p[name], old_grad, rtol=1e-4, atol=1e-6)
 
 
-def test_heads_with_no_label_in_the_batch_get_no_gradient():
-    """An absent head must stay out of the graph: a zero gradient would still
-    move it (momentum, weight decay) on a step it has no evidence for."""
+def test_a_head_with_no_label_in_the_batch_gets_a_row_of_zeros():
+    """The concept heads are rows of one matrix, so a head with no label in the
+    batch gets a zero row rather than no gradient at all, and the optimiser's
+    momentum may still nudge it. That is how a multi-label layer trains
+    everywhere else; these heads only exist to teach the trunk and are retrained
+    afterwards. A group with no label still stays out of the graph."""
     heads, vocab = _heads()
     binary = [{"concept_01": 1.0}, {"concept_01": 0.0, "concept_04": 1.0}, {}]
     group = [{"group_0": 2}, {}, {"group_0": 0}]
@@ -233,24 +248,28 @@ def test_heads_with_no_label_in_the_batch_get_no_gradient():
 
     touched = {name for name, grad in grads.items() if grad is not None}
     assert touched == {
-        "binary.concept_01.weight",
-        "binary.concept_01.bias",
-        "binary.concept_04.weight",
-        "binary.concept_04.bias",
+        "binary_weight",
+        "binary_bias",
         "groups.group_0.weight",
         "groups.group_0.bias",
     }
+    learning = {"concept_01", "concept_04"}
+    for column, concept in enumerate(vocab.concepts):
+        moved = bool(grads["binary_weight"][column].abs().sum() > 0)
+        assert moved == (concept in learning), concept
+        assert bool(grads["binary_bias"][column] != 0) == (concept in learning), concept
 
 
-def test_concept_heads_are_not_called_one_by_one():
-    heads, vocab = _heads()
-    binary, group = _labels(vocab, batch=16, seed=6)
-    calls = []
-    for head in heads.binary.values():
-        head.register_forward_hook(lambda *_args: calls.append(1))
+def test_concept_heads_are_two_tensors_however_many_there_are():
+    few, _ = _heads(concepts=3)
+    many, _ = _heads(concepts=900)
 
-    assert bb._batch_loss(_features(16, seed=7), heads, binary, group, CPU) is not None
-    assert calls == []
+    names = [name for name, _param in many.named_parameters()]
+    assert names[:2] == ["binary_weight", "binary_bias"]
+    # Two for every concept together, two per group (three groups).
+    assert len(names) == len(list(few.parameters())) == 2 + 2 * 3
+    assert many.binary_weight.shape == (900, FEATURES)
+    assert many.binary_bias.shape == (900,)
 
 
 def test_loss_edge_cases_match_the_per_head_loop():
@@ -337,7 +356,7 @@ def test_validation_scores_match_the_per_head_loop():
 def test_validation_does_not_call_heads_one_by_one():
     heads, vocab = _heads()
     calls = []
-    for head in [*heads.binary.values(), *heads.groups.values()]:
+    for head in heads.groups.values():
         head.register_forward_hook(lambda *_args: calls.append(1))
 
     binary_scores, group_scores = bb._collect_val_scores(
@@ -359,3 +378,137 @@ def test_validation_leaves_the_modules_in_training_mode():
     backbone = nn.Identity()
     bb._collect_val_scores(backbone, heads, _loader(vocab, batches=1), CPU)
     assert backbone.training and heads.training
+
+
+# -- what is saved ------------------------------------------------------------
+
+
+def _small():
+    return _heads(concepts=3, groups=(2,))
+
+
+def test_saved_layout_is_still_a_weight_and_a_bias_per_concept():
+    heads, _vocab = _small()
+
+    state = heads.state_dict()
+
+    assert list(state) == [
+        "binary.concept_00.weight",
+        "binary.concept_00.bias",
+        "binary.concept_01.weight",
+        "binary.concept_01.bias",
+        "binary.concept_02.weight",
+        "binary.concept_02.bias",
+        "groups.group_0.weight",
+        "groups.group_0.bias",
+    ]
+    assert state["binary.concept_01.weight"].shape == (1, FEATURES)
+    assert state["binary.concept_01.bias"].shape == (1,)
+    assert torch.equal(state["binary.concept_01.weight"][0], heads.binary_weight[1])
+    assert torch.equal(state["binary.concept_01.bias"][0], heads.binary_bias[1])
+    assert not state["binary.concept_01.weight"].requires_grad
+
+
+def test_a_file_from_the_linear_per_concept_layout_loads():
+    """What every earlier run saved, and what a candidate file still holds."""
+    _heads_unused, vocab = _small()
+    torch.manual_seed(3)
+    old = nn.ModuleDict(
+        {
+            "binary": nn.ModuleDict(
+                {c: nn.Linear(FEATURES, 1) for c in vocab.concepts}
+            ),
+            "groups": nn.ModuleDict(
+                {g: nn.Linear(FEATURES, len(cs)) for g, cs in vocab.groups.items()}
+            ),
+        }
+    )
+    heads = bb._MultiTaskHeads(FEATURES, vocab)
+
+    heads.load_state_dict(old.state_dict())
+
+    features = _features(4, seed=1)
+    for concept in vocab.concepts:
+        torch.testing.assert_close(
+            _one_head(heads, concept, features), old["binary"][concept](features)
+        )
+    torch.testing.assert_close(
+        heads.groups["group_0"](features), old["groups"]["group_0"](features)
+    )
+
+
+def test_loading_names_the_heads_that_are_missing_or_unknown():
+    heads, _vocab = _small()
+    state = dict(heads.state_dict())
+    del state["binary.concept_01.bias"]
+    state["binary.stranger.weight"] = torch.zeros(1, FEATURES)
+
+    with pytest.raises(RuntimeError) as refused:
+        heads.load_state_dict(state)
+    assert "binary.concept_01.bias" in str(refused.value)
+    assert "binary.stranger.weight" in str(refused.value)
+
+    result = heads.load_state_dict(state, strict=False)
+    assert result.missing_keys == ["binary.concept_01.bias"]
+    assert result.unexpected_keys == ["binary.stranger.weight"]
+
+
+def test_a_head_of_another_width_is_refused():
+    heads, _vocab = _small()
+    state = dict(heads.state_dict())
+    state["binary.concept_02.weight"] = torch.zeros(1, FEATURES + 1)
+
+    with pytest.raises(RuntimeError, match="binary.concept_02.weight"):
+        heads.load_state_dict(state)
+
+
+def test_the_layout_holds_inside_a_model_and_for_its_copy():
+    heads, _vocab = _small()
+    model = bb._BackboneWithHeads(nn.Linear(4, FEATURES), heads)
+
+    keys = list(model.state_dict())
+    assert "heads.binary.concept_00.weight" in keys
+    assert not any("binary_weight" in key for key in keys)
+
+    clone = copy.deepcopy(model)  # how the EMA takes its copy
+    with torch.no_grad():
+        clone.heads.binary_weight.add_(1.0)
+    clone.load_state_dict(model.state_dict())
+    assert torch.equal(clone.heads.binary_weight, heads.binary_weight)
+
+
+def test_backups_of_the_older_layout_do_not_resume():
+    """Their optimiser state has a tensor per concept; the fingerprint keeps a
+    run from loading it."""
+    vocab = SimpleNamespace(concepts=["a"], groups={})
+    assert bb._backbone_fingerprint(vocab, "atto", 1)["heads"] == "matrix"
+
+
+# -- thresholds ---------------------------------------------------------------
+
+
+def test_thresholds_match_the_shared_search_without_its_cost():
+    """The per-head threshold search called scikit-learn 36 times per head: 108 s
+    for 902 heads on the T4. The same search in numpy must pick the same values."""
+    from bittrainer.group_validation import find_per_class_thresholds
+
+    rng = np.random.default_rng(0)
+    scores = {}
+    for index in range(40):
+        size = int(rng.integers(3, 200))
+        targets = (rng.random(size) < rng.uniform(0.05, 0.9)).astype(np.float64)
+        logits = rng.normal(0, 2, size) + 2.5 * targets
+        scores[f"head_{index}"] = (logits, targets)
+    scores["no_yes"] = (rng.normal(0, 1, 30), np.zeros(30))
+    scores["all_yes"] = (rng.normal(0, 1, 30), np.ones(30))
+    scores["one_row"] = (np.array([0.3]), np.array([1.0]))
+
+    for min_positive in (1, 5):
+        tuned = bb._tune_binary_thresholds(scores, min_positive=min_positive)
+        assert list(tuned) == list(scores)
+        for concept, (logits, targets) in scores.items():
+            probs = 1.0 / (1.0 + np.exp(-logits))
+            expected = find_per_class_thresholds(
+                probs.reshape(-1, 1), targets.reshape(-1, 1), min_positive=min_positive
+            )[0]
+            assert tuned[concept] == pytest.approx(float(expected), abs=1e-12), concept
