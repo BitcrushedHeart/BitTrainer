@@ -43,7 +43,7 @@ import threading
 import traceback
 from pathlib import Path
 
-from bittrainer.backbone_pack import PackError, pack_records
+from bittrainer.backbone_pack import PackError, pack_geometry_sensitive, pack_records
 from bittrainer.convnext_v1_init import write_v1_trunk
 from bittrainer.convnextv2_catalog import get_convnextv2_pretrained_source
 
@@ -108,6 +108,9 @@ def build_request(
     finetune_image_size: int = 0,
     finetune_epochs: int = 0,
     soft_negatives: bool = False,
+    hill_negatives: bool = False,
+    reject_rate: float = 0.0,
+    mask_common: float | None = None,
     validation_split: float | None = None,
     backup_every_steps: int = 2000,
     progress_every_steps: int = 50,
@@ -161,11 +164,19 @@ def build_request(
     else:
         config["use_amp"] = True
         config["amp_dtype"] = _AMP_CHOICES[amp]
-    if soft_negatives:
+    # The three options act on unlabelled images taken as negatives, so asking
+    # for any of them turns those on (see label_policy in backbone_trainer).
+    if soft_negatives or hill_negatives or reject_rate or mask_common is not None:
         config["label_policy"] = {
             "mode": "soft_implicit_negative",
             "implicit_negative_value": 0.1,
         }
+        if hill_negatives:
+            config["label_policy"]["implicit_negative_loss"] = "hill"
+        if reject_rate:
+            config["label_policy"]["reject_rate"] = float(reject_rate)
+        if mask_common is not None:
+            config["label_policy"]["implicit_negative_max_prior"] = float(mask_common)
     if validation_split is not None:
         config["validation_split"] = float(validation_split)
     if max_steps is not None:
@@ -185,6 +196,9 @@ def build_request(
         "external_pretrained_used": False,
         "license_provenance": "locally_trained",
     }
+    geometry_sensitive = pack_geometry_sensitive(pack)
+    if geometry_sensitive:
+        request["geometry_sensitive"] = geometry_sensitive
     if init_checkpoint:
         request["backbone_init"] = {
             "source": "local_candidate",
@@ -513,6 +527,35 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="unlabelled images count as a soft no (0.1) for a head, under its cap",
     )
+    parser.add_argument(
+        "--hill-negatives",
+        action="store_true",
+        help=(
+            "soft negatives with the Hill term in place of the 0.1 target: it "
+            "stops pushing an unlabelled image down once the model scores it high"
+        ),
+    )
+    parser.add_argument(
+        "--reject-rate",
+        type=float,
+        default=0.0,
+        metavar="SHARE",
+        help=(
+            "soft negatives with large-loss rejection: from the second epoch each "
+            "batch's highest-scoring unlabelled negatives are left out, this share "
+            "more of them every epoch (0.01 = 1%% in epoch 2, 2%% in epoch 3, ...)"
+        ),
+    )
+    parser.add_argument(
+        "--mask-common",
+        type=float,
+        default=None,
+        metavar="PRIOR",
+        help=(
+            "soft negatives for the rarer concepts only: a concept with a human yes "
+            "on more than this share of the training images takes none (try 0.05)"
+        ),
+    )
     parser.add_argument("--validation-split", type=float, default=None)
     parser.add_argument(
         "--backup-every", type=int, default=2000, help="steps between backups"
@@ -570,6 +613,9 @@ def main(argv: list[str] | None = None) -> int:
             if value is not None
         },
         soft_negatives=args.soft_negatives,
+        hill_negatives=args.hill_negatives,
+        reject_rate=args.reject_rate,
+        mask_common=args.mask_common,
         validation_split=args.validation_split,
         backup_every_steps=args.backup_every,
         progress_every_steps=args.progress_every,

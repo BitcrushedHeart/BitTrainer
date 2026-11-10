@@ -579,6 +579,8 @@ class BackboneDistillTask(BackboneTask):
                 pos_weight=self._pos_weight,
                 group_label_smoothing=self.group_label_smoothing,
                 reduction=self.loss_reduction,
+                label_policy=self.label_policy,
+                epoch=self._planned_epoch,
             )
             if supervised is not None:
                 terms["supervised"] = supervised

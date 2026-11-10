@@ -27,6 +27,16 @@ progress_callback=...)`` with a request assembled from the suite DB:
                                                      # explicit negatives, as soft targets.
                                                      # Training only — validation always
                                                      # stays masked-unknown.
+                                                     # Optional keys for those implied
+                                                     # negatives, all off by default
+                                                     # (Bitcrush ISSUE-1655):
+                                                     #  "implicit_negative_loss": "bce"
+                                                     #    | "hill" (see _batch_loss),
+                                                     #  "reject_rate": 0.0 and
+                                                     #  "reject_from_epoch": 2
+                                                     #    (see _reject_share),
+                                                     #  "implicit_negative_max_prior":
+                                                     #    None (see _plan_epoch_samples).
                             use_pos_weight,          # BCE pos_weight from the residual
                                                      # post-cap ratio, clamped to [1, 10]
                             max_positives_per_class, # per-head positive cap, default 1000;
@@ -47,8 +57,15 @@ progress_callback=...)`` with a request assembled from the suite DB:
                                                      # selected at the tail resolution.
                                                      # Note: early stopping can still
                                                      # end a run before the tail.
+                            hflip,                   # mirror half the training
+                                                     # images; default false (see
+                                                     # _train_transform)
                             ...},
         "backbone_init": {...},             # see bittrainer.backbone_init
+        "geometry_sensitive": [...],        # optional: groups and yes/no heads
+                                            # whose answer depends on framing,
+                                            # position or tilt; see
+                                            # _GeometryCarefulTransform
         "distillation": {...},              # optional: a teacher candidate to
                                             # distil from; see
                                             # generic.tasks.backbone_distill_task
@@ -222,10 +239,25 @@ class _Vocab:
             for name, classes in sorted(group_classes.items())
             if len(classes) >= 2
         }
+        # Each concept's prior, written by _plan_epoch_samples from the training
+        # images; validation bands its recall figures by it.
+        self.priors: dict[str, float] = {}
 
     @property
     def has_targets(self) -> bool:
         return bool(self.concepts or self.groups)
+
+
+class _ImpliedNegative(float):
+    """The target of a label nobody gave: an unlabelled image drawn as a negative.
+
+    It is still a float, so it travels in a sample's ``binary`` dict through the
+    dataset, the loader workers and the collate like any other target. The type
+    is what tells ``_batch_loss`` the pair is implied, never the value: a human
+    no is a plain ``0.0``, and the implied target may be set to ``0.0`` too.
+    """
+
+    __slots__ = ()
 
 
 class _Sample:
@@ -343,10 +375,21 @@ def _plan_epoch_samples(
 
     Pure function of ``(samples, epoch, seed, config)``; an epoch-restart
     resume rebuilds the identical plan. Group labels are never capped.
+
+    Implied negatives are written as :class:`_ImpliedNegative`, so the loss can
+    tell them from a human no. A concept's prior is the share of the training
+    images that carry a human yes for it: a lower bound of the true prior,
+    since unlabelled images hold positives too. It is reported in the stats and
+    kept on ``vocab.priors``. With ``implicit_negative_max_prior`` set, a
+    concept whose prior is above it takes no implied negatives: unlabelled as
+    negative helps rare classes and hurts common ones (Ben-Baruch et al. 2022,
+    arXiv 2110.10955, who used 0.05 on OpenImages and 0.5 in a COCO example).
     """
     policy = label_policy or {}
     soft = str(policy.get("mode") or "masked_unknown") == "soft_implicit_negative"
-    implicit_value = float(policy.get("implicit_negative_value", 0.1))
+    implicit_value = _ImpliedNegative(policy.get("implicit_negative_value", 0.1))
+    max_prior = policy.get("implicit_negative_max_prior")
+    priors: dict[str, float] = {}
 
     eff_binary: list[dict[str, float]] = [{} for _ in samples]
     replicas: list[_Sample] = []
@@ -357,6 +400,8 @@ def _plan_epoch_samples(
         pos = [i for i, s in enumerate(samples) if s.binary.get(concept) == 1.0]
         neg = [i for i, s in enumerate(samples) if s.binary.get(concept) == 0.0]
         pos_total = len(pos)
+        priors[concept] = pos_total / max(len(samples), 1)
+        common = max_prior is not None and priors[concept] > float(max_prior)
         if 0 < positive_cap < len(pos):
             if positive_cap_mode == "random":
                 # Plain seeded uniform draw: density-first selection systematically
@@ -374,7 +419,7 @@ def _plan_epoch_samples(
         ratio = _effective_neg_ratio(len(pos), neg_pos_ratio)
         unlabelled = (
             [i for i, s in enumerate(samples) if concept not in s.binary]
-            if soft
+            if soft and not common
             else []
         )
         cap = (
@@ -417,7 +462,9 @@ def _plan_epoch_samples(
             "neg_implicit": len(implicit_selected),
             "effective_ratio": ratio,
             "oversample_factor": factor,
+            "prior": priors[concept],
         }
+    vocab.priors = priors
 
     planned = [
         _Sample(sample.path, eff_binary[i], dict(sample.groups))
@@ -452,6 +499,36 @@ def _head_pos_weights(
     return weights
 
 
+class _GeometryCarefulTransform:
+    """The training transform of a run that names geometry-sensitive heads.
+
+    Some answers depend on framing, position or tilt: a camera-roll group, a
+    subject-location head. RandomResizedCrop reframes an image, and
+    RandAugment(2, 9) may rotate it by 9 degrees, shear it or shift it by 13%,
+    so for those heads the usual pipeline trains wrong labels. An image with a
+    human label for a listed head is therefore prepared like a validation image
+    and gets the colour jitter alone, as the group trainer does for its spatial
+    groups (``gpu_augment``: ``photometric_only``). Every other image gets
+    ``usual``. The choice is per image, so it is made here with the labels in
+    hand, by the dataset, and not inside one shared pipeline.
+
+    An implied negative is not a label for this purpose: which images get the
+    full augmentation must not change with the label policy being compared.
+    """
+
+    def __init__(self, sensitive, usual, colour_only):
+        self.sensitive = frozenset(_safe_module_key(str(name)) for name in sensitive)
+        self.usual = usual
+        self.colour_only = colour_only
+
+    def __call__(self, image, binary: dict, groups: dict) -> torch.Tensor:
+        careful = not self.sensitive.isdisjoint(groups) or any(
+            head in self.sensitive and not isinstance(value, _ImpliedNegative)
+            for head, value in binary.items()
+        )
+        return (self.colour_only if careful else self.usual)(image)
+
+
 class _BackboneDataset(Dataset):
     def __init__(self, samples: list[_Sample], transform):
         self.samples = samples
@@ -463,14 +540,20 @@ class _BackboneDataset(Dataset):
     def __getitem__(self, index: int):
         sample = self.samples[index]
         with Image.open(sample.path) as img:
-            tensor = self.transform(img.convert("RGB"))
+            image = img.convert("RGB")
+            if isinstance(self.transform, _GeometryCarefulTransform):
+                tensor = self.transform(image, sample.binary, sample.groups)
+            else:
+                tensor = self.transform(image)
         return tensor, sample.binary, sample.groups
 
 
 _NORMALIZE = transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
 
 
-def _train_transform(image_size: int, aug: dict | None = None) -> transforms.Compose:
+def _train_transform(
+    image_size: int, aug: dict | None = None
+) -> transforms.Compose | _GeometryCarefulTransform:
     """Backbone train transform, defaulting to the group trainer's recipe.
 
     ``aug=None`` == every knob at its parity default (RandomResizedCrop replacing
@@ -483,6 +566,14 @@ def _train_transform(image_size: int, aug: dict | None = None) -> transforms.Com
     * ``randaugment_n`` / ``randaugment_m`` (2 / 9) -> ``RandAugment``; either 0
       disables it (applied on the PIL image before ToTensor).
     * ``random_erasing_p`` (0.25) -> ``RandomErasing`` after Normalize; 0 disables.
+    * ``hflip`` (False) -> ``RandomHorizontalFlip``. Off since Bitcrush
+      ISSUE-1655: a mirror changes the answer for direction, roll and position
+      groups (a gaze to the left becomes a gaze to the right), every image was
+      flipped half the time whatever it was labelled, and nobody can vouch for
+      every concept. The knob stays so the two can be compared.
+    * ``geometry_sensitive`` (none) -> the names of heads whose images take the
+      colour jitter only; the result is then a
+      :class:`_GeometryCarefulTransform`, which is called with the labels.
     """
     aug = aug or {}
     use_rrc = bool(aug.get("use_random_resized_crop", True))
@@ -490,23 +581,38 @@ def _train_transform(image_size: int, aug: dict | None = None) -> transforms.Com
     ra_n = int(aug.get("randaugment_n", 2))
     ra_m = int(aug.get("randaugment_m", 9))
     erasing_p = float(aug.get("random_erasing_p", 0.25))
+    sensitive = aug.get("geometry_sensitive")
+    jitter = transforms.ColorJitter(
+        brightness=0.1, contrast=0.1, saturation=0.1, hue=0.02
+    )
 
     ops: list = []
     if use_rrc:
         ops.append(transforms.RandomResizedCrop(image_size, scale=(rrc_scale_min, 1.0)))
     else:
         ops.append(transforms.Resize((image_size, image_size)))
-    ops.append(transforms.RandomHorizontalFlip(p=0.5))
+    if aug.get("hflip", False):
+        ops.append(transforms.RandomHorizontalFlip(p=0.5))
     if ra_n > 0 and ra_m > 0:
         ops.append(transforms.RandAugment(num_ops=ra_n, magnitude=ra_m))
-    ops.append(
-        transforms.ColorJitter(brightness=0.1, contrast=0.1, saturation=0.1, hue=0.02)
-    )
+    ops.append(jitter)
     ops.append(transforms.ToTensor())
     ops.append(_NORMALIZE)
     if erasing_p > 0:
         ops.append(transforms.RandomErasing(p=erasing_p))
-    return transforms.Compose(ops)
+    usual = transforms.Compose(ops)
+    if not sensitive:
+        return usual
+    colour_only = transforms.Compose(
+        [
+            transforms.Resize(image_size),
+            transforms.CenterCrop(image_size),
+            jitter,
+            transforms.ToTensor(),
+            _NORMALIZE,
+        ]
+    )
+    return _GeometryCarefulTransform(sensitive, usual, colour_only)
 
 
 def _val_transform(image_size: int) -> transforms.Compose:
@@ -648,6 +754,23 @@ class _BackboneWithHeads(nn.Module):
         self.heads = heads
 
 
+def _reject_share(policy: dict, epoch: int | None) -> float:
+    """The share of a batch's implied negatives that large-loss rejection drops.
+
+    Large-loss rejection (Kim et al. 2022, "Large Loss Matters", arXiv
+    2206.03740): nothing in the first epoch, then a share that grows by
+    ``reject_rate`` every epoch, because a network fits the clean labels first
+    and memorises the wrong ones later. ``epoch`` counts from 0, as in the
+    planner; ``reject_from_epoch`` (default 2, the paper's) counts from 1.
+    Off without a rate, and for a caller that gives no epoch.
+    """
+    rate = float(policy.get("reject_rate") or 0.0)
+    if rate <= 0 or epoch is None:
+        return 0.0
+    first = int(policy.get("reject_from_epoch") or 2)
+    return min(1.0, rate * max(0, epoch + 2 - first))
+
+
 def _batch_loss(
     features: torch.Tensor,
     heads: _MultiTaskHeads,
@@ -658,8 +781,26 @@ def _batch_loss(
     pos_weight: dict[str, float] | None = None,
     group_label_smoothing: float = 0.0,
     reduction: str = "sum",
+    label_policy: dict | None = None,
+    epoch: int | None = None,
 ) -> torch.Tensor | None:
     """Masked multi-task loss over whichever heads each row carries a label for.
+
+    ``label_policy`` and ``epoch`` bring two options for implied negatives
+    (targets of type :class:`_ImpliedNegative`); a human yes or no is plain BCE
+    whatever they say, and with neither set the loss is what it always was.
+
+    * ``implicit_negative_loss: "hill"`` swaps BCE towards the soft target for
+      the negative part of the Hill loss, ``(1.5 - p) * p**2`` (Zhang et al.
+      2021, arXiv 2112.07368). BCE pushes an implied negative harder the higher
+      the model scores it; this term pushes hardest near 0.5 and lets go as the
+      score nears 1, where the pair is more likely a positive nobody labelled.
+    * ``reject_rate`` drops the highest-scoring share of the batch's implied
+      negatives (see :func:`_reject_share`). A dropped pair is treated as
+      unlabelled for the step; it is never trained towards yes.
+
+    Both are worked out in float32 from the logits and stay finite for any
+    logit.
 
     ``group_label_smoothing`` smooths the group-CE targets (parity with the group
     trainer's default). ``reduction`` combines the per-head losses: ``"sum"`` (the
@@ -677,13 +818,17 @@ def _batch_loss(
     losses: list[torch.Tensor] = []
     bce = nn.functional.binary_cross_entropy_with_logits
     ce = nn.functional.cross_entropy
+    policy = label_policy or {}
+    hill = str(policy.get("implicit_negative_loss") or "bce") == "hill"
+    reject = _reject_share(policy, epoch)
 
     # One pass over the labels: the (row, column, target) of every label, a
-    # column per concept head.
+    # column per concept head, and whether the label is an implied negative.
     column_of = heads.binary_index
     label_rows: list[int] = []
     label_cols: list[int] = []
     label_values: list[float] = []
+    label_implied: list[bool] = []
     for row, labels in enumerate(binary_labels):
         for concept, value in labels.items():
             column = column_of.get(concept)
@@ -692,6 +837,7 @@ def _batch_loss(
             label_rows.append(row)
             label_cols.append(column)
             label_values.append(value)
+            label_implied.append(isinstance(value, _ImpliedNegative))
     if label_rows:
         logits = nn.functional.linear(
             features, heads.binary_weight, heads.binary_bias
@@ -713,6 +859,23 @@ def _batch_loss(
             if any(value != 1.0 for value in weights):
                 head_weight = torch.tensor(weights, device=device, dtype=torch.float32)
         per_label = bce(logits, targets, pos_weight=head_weight, reduction="none")
+        if (hill or reject > 0) and any(label_implied):
+            implied = torch.zeros(logits.shape, device=device, dtype=torch.bool)
+            implied[index] = torch.tensor(label_implied, device=device)
+            if hill:
+                prob = torch.sigmoid(logits)
+                per_label = torch.where(implied, (1.5 - prob) * prob * prob, per_label)
+            if reject > 0:
+                # Ranked by score, which is the paper's ranking by loss towards
+                # 0. Not by the loss towards the soft target: that one is also
+                # large for a pair the model is sure is a no. The share is
+                # rounded to whole pairs, so a small batch may drop none.
+                scores = logits.detach()
+                implied_scores = scores[implied]
+                drop = min(int(reject * len(implied_scores) + 0.5), len(implied_scores))
+                if drop:
+                    cut = torch.topk(implied_scores, drop).values[-1]
+                    labelled = labelled.masked_fill(implied & (scores >= cut), 0.0)
         # Mean over each head's own labelled rows, for the heads that have any.
         counts = labelled.sum(0)
         present = counts > 0
@@ -736,6 +899,8 @@ def _batch_loss(
     if not losses:
         return None
     stacked = torch.cat(losses)
+    if stacked.numel() == 0:  # every label of the batch was a rejected one
+        return None
     return stacked.mean() if reduction == "mean" else stacked.sum()
 
 
@@ -850,9 +1015,70 @@ def _collect_val_scores(
     return binary_scores, group_scores
 
 
+# A head needs this many validation labels of each kind before its recall at a
+# fixed precision means much: with fewer, one image moves it by a tenth or more.
+_RAP_MIN_LABELS = 10
+_RAP_TARGETS = ((90, 0.90), (95, 0.95))
+# Concept frequency bands: a prior (see _plan_epoch_samples) below each bound.
+# 0.05 is where Ben-Baruch et al. 2022 began masking a class on OpenImages;
+# 0.01 has no source.
+_PRIOR_BANDS = (("rare", 0.01), ("medium", 0.05), ("common", math.inf))
+
+
+def _precision_recall(
+    probs: np.ndarray, positive: np.ndarray
+) -> tuple[np.ndarray, np.ndarray]:
+    """A head's precision and recall at every score it gave, best score first.
+
+    scikit-learn's ``precision_recall_curve`` without its cost per call: one
+    point per distinct score, calling a yes on everything that scores at least
+    that much. ``positive`` must hold at least one True.
+    """
+    order = np.argsort(-probs)  # how tied scores fall does not matter below
+    ranked = probs[order]
+    # The last row of each run of equal scores.
+    ends = np.flatnonzero(np.r_[np.diff(ranked) != 0, True])
+    hits = np.cumsum(positive[order])[ends]
+    return hits / (ends + 1), hits / hits[-1]
+
+
+def _recall_at_precision(precision: np.ndarray, recall: np.ndarray) -> dict[int, float]:
+    """The best recall with precision at least 0.90 and 0.95, keyed 90 and 95;
+    0.0 where no threshold reaches the precision."""
+    return {
+        tag: float(recall[precision >= target].max(initial=0.0))
+        for tag, target in _RAP_TARGETS
+    }
+
+
+def _confusion(
+    targets: np.ndarray, predictions: np.ndarray, classes: int
+) -> np.ndarray:
+    """Counts ``[true class, predicted class]`` for one group."""
+    return np.bincount(
+        targets * classes + predictions, minlength=classes * classes
+    ).reshape(classes, classes)
+
+
+def _per_class_scores(
+    confusion: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Precision, recall and F1 per class; 0 where there is nothing to divide by
+    (scikit-learn's ``zero_division=0``)."""
+    hits = np.diag(confusion).astype(np.float64)
+    actual, called = confusion.sum(1), confusion.sum(0)
+    return (
+        hits / np.maximum(called, 1),
+        hits / np.maximum(actual, 1),
+        2.0 * hits / np.maximum(actual + called, 1),
+    )
+
+
 def _backbone_metrics(
     binary_scores: dict[str, tuple[np.ndarray, np.ndarray]],
     group_scores: dict[str, tuple[np.ndarray, np.ndarray]],
+    *,
+    priors: dict[str, float] | None = None,
 ) -> dict[str, float]:
     """Per-head F1/AP + per-group macro-F1 + a defensible ``selection`` aggregate.
 
@@ -864,13 +1090,23 @@ def _backbone_metrics(
     from ``binary_macro_f1``; a panel's aggregate is omitted (not zeroed) when it
     has no qualifying member. ``selection`` is the equal-weight mean of whichever
     of the two panel aggregates exist, else 0.0.
+
+    Recall at precision 0.90 and 0.95 (Bitcrush ISSUE-1655) is the figure that
+    compares ways of treating unlabelled images: a tag is only written above a
+    precision target, so what matters is how much is still found there. A head
+    with at least ``_RAP_MIN_LABELS`` validation yes and as many no gets
+    ``binary_r_at_p90/<c>`` and ``binary_r_at_p95/<c>``. Their macro averages are
+    ``binary_macro_r_at_p90`` / ``..._p95`` and, for the concepts ``priors``
+    covers, the same with ``_rare`` / ``_medium`` / ``_common`` appended;
+    ``binary_r_at_p_heads`` (and its band forms) count the heads averaged.
+
+    All of it is numpy. Two scikit-learn calls per concept head and a dozen per
+    group cost 4.75 s for 900 heads on 582 validation images on a T4, and grow
+    with the validation set.
     """
-    from sklearn.metrics import average_precision_score, f1_score
-
-    from bittrainer.group_validation import compute_multiclass_metrics
-
     metrics: dict[str, float] = {}
     binary_f1s: list[float] = []
+    ranked_heads: list[str] = []
     for concept, (logits, targets) in binary_scores.items():
         logits = np.asarray(logits, dtype=np.float64)
         tgt_int = np.asarray(targets, dtype=np.float64).astype(np.int64)
@@ -880,13 +1116,37 @@ def _backbone_metrics(
         support = int(tgt_int.sum())
         metrics[f"binary_support/{concept}"] = support
         if support >= 1:
-            f1 = float(f1_score(tgt_int, preds, zero_division=0))
-            probs = 1.0 / (1.0 + np.exp(-logits))
+            positive = tgt_int == 1
+            # F1 = 2 TP / (called + actual positives).
+            f1 = float(2.0 * preds[positive].sum() / (preds.sum() + support))
+            precision, recall = _precision_recall(
+                1.0 / (1.0 + np.exp(-logits)), positive
+            )
             metrics[f"binary_f1/{concept}"] = f1
+            # Average precision: each gain in recall, weighted by the precision
+            # it was reached at.
             metrics[f"binary_ap/{concept}"] = float(
-                average_precision_score(tgt_int, probs)
+                np.sum(np.diff(recall, prepend=0.0) * precision)
             )
             binary_f1s.append(f1)
+            if min(support, n - support) >= _RAP_MIN_LABELS:
+                ranked_heads.append(concept)
+                for tag, value in _recall_at_precision(precision, recall).items():
+                    metrics[f"binary_r_at_p{tag}/{concept}"] = value
+
+    if ranked_heads:
+        bands: dict[str, list[str]] = {"": ranked_heads}
+        for concept in ranked_heads:
+            prior = (priors or {}).get(concept)
+            if prior is not None:
+                band = next(name for name, below in _PRIOR_BANDS if prior < below)
+                bands.setdefault(f"_{band}", []).append(concept)
+        for suffix, members in bands.items():
+            metrics[f"binary_r_at_p_heads{suffix}"] = len(members)
+            for tag, _target in _RAP_TARGETS:
+                metrics[f"binary_macro_r_at_p{tag}{suffix}"] = float(
+                    np.mean([metrics[f"binary_r_at_p{tag}/{c}"] for c in members])
+                )
 
     group_f1s: list[float] = []
     for group, (logits, targets) in group_scores.items():
@@ -897,10 +1157,9 @@ def _backbone_metrics(
         metrics[f"group/{group}"] = float((preds == tgt).mean()) if n else 0.0
         metrics[f"group_val_support/{group}"] = n
         if n:
-            gm = compute_multiclass_metrics(
-                tgt.tolist(), preds.tolist(), int(logits.shape[1])
-            )
-            f1 = float(gm["macro_f1"])
+            # Macro F1 over every class of the head, seen in validation or not.
+            confusion = _confusion(tgt, preds, int(logits.shape[1]))
+            f1 = float(_per_class_scores(confusion)[2].mean())
             metrics[f"group_f1/{group}"] = f1
             group_f1s.append(f1)
 
@@ -913,6 +1172,87 @@ def _backbone_metrics(
         aggregates.append(metrics["group_macro_f1"])
     metrics["selection"] = float(np.mean(aggregates)) if aggregates else 0.0
     return metrics
+
+
+def _group_validation_report(
+    group_scores: dict[str, tuple[np.ndarray, np.ndarray]],
+    classes: dict[str, list[str]] | None = None,
+) -> dict[str, dict]:
+    """Per single-label group, how validation went class by class.
+
+    From the scores :func:`_collect_val_scores` returns::
+
+        {group: {"classes": [name, ...],
+                 "support": [validation images of each class],
+                 "precision": [...], "recall": [...], "f1": [...],
+                 "confusion": [[count, ...], ...]}}
+
+    Every list has one entry per class in the head's own order;
+    ``confusion[t][p]`` counts the images of class ``t`` that were called
+    class ``p``. ``classes`` (``vocab.groups``) names the classes; without it
+    they are numbered. Plain lists and numbers, ready for JSON. Separate from
+    :func:`_backbone_metrics`, whose flat dict feeds epoch selection.
+    """
+    report: dict[str, dict] = {}
+    for group, (logits, targets) in group_scores.items():
+        logits = np.asarray(logits, dtype=np.float64)
+        width = int(logits.shape[1])
+        confusion = _confusion(
+            np.asarray(targets, dtype=np.int64), logits.argmax(axis=1), width
+        )
+        precision, recall, f1 = _per_class_scores(confusion)
+        report[group] = {
+            "classes": list((classes or {}).get(group) or map(str, range(width))),
+            "support": confusion.sum(1).tolist(),
+            "precision": precision.tolist(),
+            "recall": recall.tolist(),
+            "f1": f1.tolist(),
+            "confusion": confusion.tolist(),
+        }
+    return report
+
+
+def _binary_validation_report(
+    binary_scores: dict[str, tuple[np.ndarray, np.ndarray]],
+    thresholds: dict[str, float] | None = None,
+) -> dict[str, dict]:
+    """Per yes/no head, how validation went at the threshold it will use.
+
+    From the scores :func:`_collect_val_scores` returns::
+
+        {concept: {"yes": validation yes labels, "no": validation no labels,
+                   "threshold": on sigmoid(logit); 0.5 if ``thresholds`` has none,
+                   "called": images at or above it, "hits": the yes among them,
+                   "precision": hits / called, None when nothing was called,
+                   "recall": hits / yes, None when there is no yes,
+                   "recall_at_p90": ..., "recall_at_p95": ...}}
+
+    The last two are the figures of :func:`_backbone_metrics`, None for a head
+    with too few labels of either kind to have them.
+    """
+    report: dict[str, dict] = {}
+    for concept, (logits, targets) in binary_scores.items():
+        probs = 1.0 / (1.0 + np.exp(-np.asarray(logits, dtype=np.float64)))
+        positive = np.asarray(targets, dtype=np.float64) == 1.0
+        yes, no = int(positive.sum()), int((~positive).sum())
+        threshold = float((thresholds or {}).get(concept, 0.5))
+        called = probs >= threshold
+        hits = int((called & positive).sum())
+        entry = {
+            "yes": yes,
+            "no": no,
+            "threshold": threshold,
+            "called": int(called.sum()),
+            "hits": hits,
+            "precision": hits / int(called.sum()) if called.any() else None,
+            "recall": hits / yes if yes else None,
+        }
+        at: dict[int, float | None] = dict.fromkeys((tag for tag, _ in _RAP_TARGETS))
+        if min(yes, no) >= _RAP_MIN_LABELS:
+            at = _recall_at_precision(*_precision_recall(probs, positive))
+        entry.update({f"recall_at_p{tag}": value for tag, value in at.items()})
+        report[concept] = entry
+    return report
 
 
 @torch.no_grad()
@@ -933,6 +1273,9 @@ def _evaluate(
     When ``score_sink`` is provided the raw ``{"binary": ..., "groups": ...}``
     scores of THIS pass are stashed there so calibration can fit on the winning
     epoch's logits; fakes that ignore the kwarg simply leave the sink empty.
+
+    The recall-at-precision figures are banded by the priors the epoch plan
+    left on ``vocab``.
     """
     binary_scores, group_scores = _collect_val_scores(
         backbone, heads, loader, device, amp_enabled=amp_enabled, amp_dtype=amp_dtype
@@ -940,36 +1283,86 @@ def _evaluate(
     if score_sink is not None:
         score_sink["binary"] = binary_scores
         score_sink["groups"] = group_scores
-    return _backbone_metrics(binary_scores, group_scores)
+    return _backbone_metrics(
+        binary_scores, group_scores, priors=getattr(vocab, "priors", None)
+    )
 
 
-def _tune_binary_thresholds(
-    binary_scores: dict[str, tuple[np.ndarray, np.ndarray]], *, min_positive: int = 1
-) -> dict[str, float]:
-    """F1-optimal per-head decision threshold on ``sigmoid(logit)``.
+def _binary_threshold_tuning(
+    binary_scores: dict[str, tuple[np.ndarray, np.ndarray]],
+    *,
+    min_positive: int = 1,
+    min_negative: int = 0,
+) -> tuple[dict[str, float], dict[str, bool]]:
+    """F1-optimal per-head decision threshold on ``sigmoid(logit)``, and which
+    heads had the labels to be tuned.
 
     The search of :func:`group_validation.find_per_class_thresholds` (its grid,
-    the first best value on a tie, 0.5 for a head with fewer than
-    ``min_positive`` validation positives), done for a head as one numpy
-    comparison against the whole grid. Calling the shared function per head
-    cost 36 scikit-learn calls each: 108 s for 902 heads on a T4 (Bitcrush
-    ISSUE-1655).
+    the first best value on a tie), done for a head as one numpy comparison
+    against the whole grid. Calling the shared function per head cost 36
+    scikit-learn calls each: 108 s for 902 heads on a T4 (Bitcrush ISSUE-1655).
+
+    A head with fewer than ``min_positive`` validation yes or ``min_negative``
+    validation no keeps 0.5 and is False in the second dict: a threshold tuned
+    on a handful of labels is noise.
     """
     grid = np.arange(0.05, 0.95, 0.025)
     thresholds: dict[str, float] = {}
+    tuned: dict[str, bool] = {}
     for concept, (logits, targets) in binary_scores.items():
         labels = np.asarray(targets, dtype=np.float64)
-        if int(labels.sum()) < min_positive:
+        positive = labels == 1.0
+        tuned[concept] = (
+            int(labels.sum()) >= min_positive and int((~positive).sum()) >= min_negative
+        )
+        if not tuned[concept]:
             thresholds[concept] = 0.5
             continue
         probs = 1.0 / (1.0 + np.exp(-np.asarray(logits, dtype=np.float64)))
-        positive = labels == 1.0
         called = probs[None, :] >= grid[:, None]
         hits = (called & positive).sum(1)
         # F1 = 2 TP / (called + actual positives); 0 where that is empty.
         f1 = 2.0 * hits / np.maximum(called.sum(1) + positive.sum(), 1)
         thresholds[concept] = float(grid[int(np.argmax(f1))])
-    return thresholds
+    return thresholds, tuned
+
+
+def _tune_binary_thresholds(
+    binary_scores: dict[str, tuple[np.ndarray, np.ndarray]],
+    *,
+    min_positive: int = 1,
+    min_negative: int = 0,
+) -> dict[str, float]:
+    """The thresholds of :func:`_binary_threshold_tuning`, without the record of
+    which heads were tuned."""
+    return _binary_threshold_tuning(
+        binary_scores, min_positive=min_positive, min_negative=min_negative
+    )[0]
+
+
+def _fit_group_temperature(logits: np.ndarray, targets: np.ndarray) -> float:
+    """:func:`_fit_binary_temperature` for a softmax head.
+
+    The ``T`` on the same grid that minimises the mean cross-entropy of
+    ``softmax(logits / T)`` over one group's validation images (``logits``
+    ``[N, classes]``, ``targets`` ``[N]`` class indices); 1.0 for a group with
+    none.
+    """
+    logits = np.asarray(logits, dtype=np.float64)
+    targets = np.asarray(targets, dtype=np.int64)
+    rows = np.arange(targets.shape[0])
+    best_t = 1.0
+    best_nll = np.inf
+    if not rows.size:
+        return best_t
+    for t in np.geomspace(0.25, 4.0, 33):
+        scaled = logits / t
+        scaled -= scaled.max(axis=1, keepdims=True)  # keeps exp() from overflowing
+        nll = float((np.log(np.exp(scaled).sum(axis=1)) - scaled[rows, targets]).mean())
+        if nll < best_nll:
+            best_nll = nll
+            best_t = float(t)
+    return best_t
 
 
 def _fit_binary_temperature(logits: np.ndarray, targets: np.ndarray) -> float:
@@ -1047,6 +1440,10 @@ def _train_backbone(
     task = backbone_task_class(request)(
         request, cancel_event=stop, stop_event=stop_event
     )
+    # The task hands its augmentation settings to _train_transform as they are,
+    # so these two reach the training dataset through them.
+    task._aug["hflip"] = bool(task.config.get("hflip", False))
+    task._aug["geometry_sensitive"] = request.get("geometry_sensitive")
     return GenericTrainer().run(
         task,
         progress_callback=emit,

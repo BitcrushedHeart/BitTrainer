@@ -512,3 +512,115 @@ def test_thresholds_match_the_shared_search_without_its_cost():
                 probs.reshape(-1, 1), targets.reshape(-1, 1), min_positive=min_positive
             )[0]
             assert tuned[concept] == pytest.approx(float(expected), abs=1e-12), concept
+
+
+# -- the metric panel ---------------------------------------------------------
+
+
+def _reference_metrics(binary_scores, group_scores):
+    """The panel as it was: two scikit-learn calls per concept head and a dozen
+    per group. 4.75 s for 900 heads on 582 validation images on the T4, and more
+    with every validation image."""
+    from sklearn.metrics import average_precision_score, f1_score
+
+    from bittrainer.group_validation import compute_multiclass_metrics
+
+    metrics = {}
+    binary_f1s = []
+    for concept, (logits, targets) in binary_scores.items():
+        logits = np.asarray(logits, dtype=np.float64)
+        tgt_int = np.asarray(targets, dtype=np.float64).astype(np.int64)
+        preds = (logits > 0).astype(np.int64)
+        n = int(tgt_int.shape[0])
+        metrics[f"binary/{concept}"] = float((preds == tgt_int).mean()) if n else 0.0
+        support = int(tgt_int.sum())
+        metrics[f"binary_support/{concept}"] = support
+        if support >= 1:
+            f1 = float(f1_score(tgt_int, preds, zero_division=0))
+            probs = 1.0 / (1.0 + np.exp(-logits))
+            metrics[f"binary_f1/{concept}"] = f1
+            metrics[f"binary_ap/{concept}"] = float(
+                average_precision_score(tgt_int, probs)
+            )
+            binary_f1s.append(f1)
+    group_f1s = []
+    for group, (logits, targets) in group_scores.items():
+        logits = np.asarray(logits, dtype=np.float64)
+        tgt = np.asarray(targets, dtype=np.int64)
+        n = int(tgt.shape[0])
+        preds = logits.argmax(axis=1)
+        metrics[f"group/{group}"] = float((preds == tgt).mean()) if n else 0.0
+        metrics[f"group_val_support/{group}"] = n
+        if n:
+            gm = compute_multiclass_metrics(
+                tgt.tolist(), preds.tolist(), int(logits.shape[1])
+            )
+            metrics[f"group_f1/{group}"] = float(gm["macro_f1"])
+            group_f1s.append(metrics[f"group_f1/{group}"])
+    aggregates = []
+    if binary_f1s:
+        metrics["binary_macro_f1"] = float(np.mean(binary_f1s))
+        aggregates.append(metrics["binary_macro_f1"])
+    if group_f1s:
+        metrics["group_macro_f1"] = float(np.mean(group_f1s))
+        aggregates.append(metrics["group_macro_f1"])
+    metrics["selection"] = float(np.mean(aggregates)) if aggregates else 0.0
+    return metrics
+
+
+def _panel_scores():
+    rng = np.random.default_rng(1)
+    binary = {}
+    for index in range(40):
+        size = int(rng.integers(1, 300))
+        targets = (rng.random(size) < rng.uniform(0.05, 0.9)).astype(np.float64)
+        logits = rng.normal(0, 2, size) + 2.5 * targets
+        if index % 3 == 0:
+            logits = np.round(logits)  # many images share a score
+        binary[f"head_{index}"] = (logits, targets)
+    binary["no_yes"] = (rng.normal(0, 1, 30), np.zeros(30))
+    binary["all_yes"] = (rng.normal(0, 1, 30), np.ones(30))
+    binary["one_row"] = (np.array([0.3]), np.array([1.0]))
+    # Different logits that are all 1.0 as a probability: one tied score.
+    binary["saturated"] = (
+        np.array([50.0, 45.0, 40.0, -50.0, 60.0]),
+        np.array([1.0, 0.0, 1.0, 0.0, 0.0]),
+    )
+    groups = {}
+    for index in range(6):
+        size, classes = int(rng.integers(1, 200)), int(rng.integers(2, 7))
+        # Every other group has a class no validation image belongs to.
+        targets = rng.integers(0, classes - index % 2, size)
+        groups[f"group_{index}"] = (rng.normal(0, 1, (size, classes)), targets)
+    return binary, groups
+
+
+def test_metric_panel_matches_the_scikit_learn_one():
+    binary, groups = _panel_scores()
+
+    new = bb._backbone_metrics(binary, groups)
+    old = _reference_metrics(binary, groups)
+
+    # Everything the old panel reported, under the same keys; what is new is
+    # the recall at fixed precision.
+    assert set(old) <= set(new)
+    assert all("r_at_p" in key for key in set(new) - set(old))
+    for key, value in old.items():
+        assert type(new[key]) is type(value), key
+        assert new[key] == pytest.approx(value, rel=1e-12, abs=1e-12), key
+
+
+def test_metric_panel_makes_no_scikit_learn_call(monkeypatch):
+    import sklearn.metrics
+
+    import bittrainer.group_validation as group_validation
+
+    def _refuse(*_args, **_kwargs):
+        raise AssertionError("the metric panel called scikit-learn")
+
+    for name in ("f1_score", "average_precision_score", "precision_recall_curve"):
+        monkeypatch.setattr(sklearn.metrics, name, _refuse)
+    monkeypatch.setattr(group_validation, "compute_multiclass_metrics", _refuse)
+    binary, groups = _panel_scores()
+
+    assert bb._backbone_metrics(binary, groups)["selection"] > 0

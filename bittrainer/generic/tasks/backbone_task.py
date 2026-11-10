@@ -354,6 +354,8 @@ class BackboneTask(TrainingTask):
         return str(self.image_size)
 
     def _plan_epoch(self, epoch: int):
+        # The loss follows the epoch its labels were planned for (bb._reject_share).
+        self._planned_epoch = epoch
         return bb._plan_epoch_samples(
             self.train_samples,
             self.vocab,
@@ -605,6 +607,8 @@ class BackboneTask(TrainingTask):
                     pos_weight=self._pos_weight,
                     group_label_smoothing=self.group_label_smoothing,
                     reduction=self.loss_reduction,
+                    label_policy=self.label_policy,
+                    epoch=self._planned_epoch,
                 )
             if loss is None:
                 continue
