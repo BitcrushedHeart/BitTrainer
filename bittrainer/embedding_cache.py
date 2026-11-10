@@ -50,6 +50,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 
+from bittrainer.autobatch import is_out_of_memory
 from bittrainer.gpu_augment import apply_val_transform
 from bittrainer.model import pooled_features
 
@@ -472,8 +473,11 @@ class EmbeddingCache:
                     for start in range(0, len(tensors), sub)
                 ]
                 return chunks[0] if len(chunks) == 1 else np.concatenate(chunks, axis=0)
-            except torch.cuda.OutOfMemoryError:
-                if sub <= 1:
+            except RuntimeError as exc:
+                # Out of memory however it is worded (Bitcrush ISSUE-1690): a
+                # full T4 also says CUDNN_STATUS_ALLOC_FAILED. Anything else is
+                # a broken forward and is raised as itself.
+                if sub <= 1 or not is_out_of_memory(exc):
                     raise
                 self._forward_cap = max(1, sub // 2)
                 if torch.cuda.is_available():

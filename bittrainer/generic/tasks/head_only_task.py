@@ -32,12 +32,15 @@ import torch
 from torch.utils.data import DataLoader
 
 import bittrainer.group_trainer as gt
+from bittrainer.amp import resolve_amp_dtype, wants_grad_scaler
 from bittrainer.cached_eval import CachedValScorer, val_inputs_are_cache_inputs
 from bittrainer.dataset import resolution_ckpt_meta
 from bittrainer.embedding_cache import EmbeddingCache
 from bittrainer.generic.task import BestTracker, LoopSpec, TaskContext, TrainingTask
+from bittrainer.generic.tasks.group_task import precision_frame
 from bittrainer.group_dataset import build_group_bucket_sampler, labelled_samples
 from bittrainer.head_probe import prepare_head_probe_tensors
+from bittrainer.lean_grn import use_lean_grn
 from bittrainer.model import backbone_feature_hash, backbone_state_hash
 from bittrainer.ordinal_threshold import (
     ORDINAL_HEADS,
@@ -205,6 +208,10 @@ class HeadOnlyTask(TrainingTask):
         # Crop-assisted groups (Bitcrush ISSUE-0993).
         self.region_manifest = None
         self.region_proposer = "none"
+        # Cards without native bf16 (Bitcrush ISSUE-1690), decided in
+        # make_context: does the run autocast in fp16, and is GRN kept there.
+        self.half_card = False
+        self.lean_grn = False
 
     def _region_meta(self, model) -> dict:
         """Checkpoint metadata for the model's region head; empty without one."""
@@ -253,7 +260,15 @@ class HeadOnlyTask(TrainingTask):
         for note in notes:
             em.raw({"type": "training_progress", "stage": "preparing", "status_text": note})
         device = torch.device(config.device)
-        dtype = gt._get_dtype(config.dtype)
+        # Fitted to the card (Bitcrush ISSUE-1690): bf16 on a card without it (a
+        # T4) becomes fp16, with GRN kept in half precision. No GradScaler: the
+        # trunk only runs forward here, and the head trains in fp32 on cached
+        # vectors. A bf16 card and a CPU get exactly the dtype they always got.
+        dtype = resolve_amp_dtype(gt._get_dtype(config.dtype), device)
+        self.half_card = wants_grad_scaler(device, dtype, True)
+        self.lean_grn = bool(config.lean_grn) and self.half_card
+        if self.half_card:
+            em.raw(precision_frame(dtype, scaler=False, lean_grn=self.lean_grn))
         configure_cuda_backend()
         group_folder = Path(config.group_folder)
         checkpoint_dir = (
@@ -295,6 +310,8 @@ class HeadOnlyTask(TrainingTask):
             config, device=ctx.device, dtype=ctx.dtype,
             head_hidden_size=self.head_hidden, checkpoint_dir=ctx.checkpoint_dir,
         )
+        if self.lean_grn:  # fp16 cards only; weights and names are unchanged
+            use_lean_grn(model)
         # A probe trains the classifier head only. Keep the incumbent's region
         # head when the trunk under it is unchanged; otherwise ship none.
         self.region_proposer = settle_head_only_region_head(
@@ -606,6 +623,9 @@ class HeadOnlyTask(TrainingTask):
         result["embedding_cache_stats"] = self.stats
         if self.region_proposer != "none":
             result["region_proposer"] = self.region_proposer
+        if self.half_card:  # fp16 only: a bf16 / CPU result is unchanged
+            result["amp_dtype"] = "float16"
+            result["lean_grn"] = self.lean_grn
         self._finalize_regions(ctx, result)
 
         promoted = result.get("promotion_reason") not in (None, "incumbent_wins")

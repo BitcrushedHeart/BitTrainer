@@ -11,9 +11,13 @@ The checks that decide whether the real run can start come first: the GPU-only
 tests, a model learning in this card's precision, the real weight conversion,
 training / pausing / resuming from a pack, the switch to the 384px tail at its
 own batch size (and a tail that cannot fit being refused before anything
-trains), and distillation with a teacher wider than its student. Speed
-comparisons come last and are the first thing dropped when ``--budget-minutes``
-(default 120) runs short. Estimates are for a T4.
+trains), and distillation with a teacher wider than its student. Then the
+group trainers (Bitcrush ISSUE-1690), through ``bittrainer.tools.group_proof``:
+head-only, scoped export and a sourceless full update in this card's precision
+for Base (compiled), nano and tiny at 512px, an oversize batch refused before it
+trains, and a paused update resumed. Speed comparisons come last and are the
+first thing dropped when ``--budget-minutes`` (default 120) runs short.
+Estimates are for a T4.
 
 It is safe to stop and run again: a stage that passed is not repeated
 (``--redo`` repeats everything). Everything it writes goes under ``--work``:
@@ -59,14 +63,23 @@ _ROUND_TESTS = (
     "test_backbone_geometry.py",
     "test_backbone_validation_report.py",
     "test_backbone_status.py",
+    # The group trainers on fp16 cards (Bitcrush ISSUE-1690).
+    "test_group_amp.py",
+    "test_group_lean_grn.py",
+    "test_group_preflight.py",
+    "test_group_proof.py",
+    "test_autobatch.py",
 )
-# The files with tests that only run on a GPU (named ..._real_gpu, or the one
-# that checks the precision matches the card).
+# The files with tests that only run on a GPU (named ..._real_gpu, or the ones
+# that check the precision matches the card).
 _GPU_TESTS = (
     "test_backbone_amp.py",
     "test_backbone_tail_batch.py",
     "test_backbone_skipped_steps.py",
     "test_backbone_auto_batch.py",
+    "test_group_amp.py",
+    "test_group_lean_grn.py",
+    "test_group_preflight.py",
 )
 _OTHER_TESTS = (
     "test_backbone_generic.py",
@@ -856,12 +869,95 @@ def _real_pack(context: Context) -> Result:
     return result
 
 
+# --------------------------------------------------------------------------- #
+# The group trainers (Bitcrush ISSUE-1690)                                    #
+# --------------------------------------------------------------------------- #
+
+_GROUP_512 = ("--bucket-size", "512", "--workers", "4")
+_GROUP_SMALL = (*_GROUP_512, "--images-per-class", "24", "--no-compile")
+
+
+def group_numbers(report: dict) -> dict:
+    """What a group proof run reported, for the summary."""
+    numbers = {
+        "images_per_second": round(report.get("best_images_per_second") or 0.0, 1),
+        "precision": report.get("amp_dtype"),
+        "grad_scaler": report.get("grad_scaler"),
+        "lean_grn": report.get("lean_grn"),
+        "compiled": report.get("compiled"),
+        "batch_size": report.get("batch_size_used") or report.get("batch_size"),
+        "peak_vram_mb": report.get("peak_vram_mb"),
+        "preflight_mb": report.get("preflight_mb"),
+        "skipped_steps": report.get("skipped_steps"),
+    }
+    for key in ("refused", "resumed"):
+        if report.get(key):
+            numbers[key] = report[key]
+    return numbers
+
+
+def group_problem(report: dict, args: tuple[str, ...], *, native_bf16: bool) -> str:
+    """What is wrong with a group proof run that passed its own checks, on a
+    card that does (or does not) have native bf16; empty when nothing is. The
+    proof cannot know the card: a T4 must have trained in fp16 through a
+    GradScaler, with the lean GRN layer unless the stock one was asked for, and
+    a compile that was asked for must not have fallen back to eager."""
+    if "--expect-refusal" in args:
+        return ""
+    want = "bfloat16" if native_bf16 else "float16"
+    if report.get("amp_dtype") != want:
+        return f"trained in {report.get('amp_dtype')}; this card should train in {want}"
+    if report.get("grad_scaler") is native_bf16:
+        return f"GradScaler {'on' if native_bf16 else 'off'} in {want}"
+    lean = not native_bf16 and "--stock-grn" not in args
+    if report.get("lean_grn") is not lean:
+        return f"lean GRN was {report.get('lean_grn')}, expected {lean}"
+    if "--no-compile" not in args and not report.get("compiled"):
+        return "compile was asked for and fell back to eager"
+    return ""
+
+
+def _group(name: str, *args: str, minutes: float, against: str | None = None):
+    """One ``group_proof`` run on this card. ``against`` names an earlier group
+    stage whose speed this one is compared with."""
+
+    def _run(context: Context) -> Result:
+        import torch
+
+        from bittrainer.amp import native_bf16
+
+        out = _fresh_run_folder(context, name)
+        argv = _module(
+            context, "bittrainer.tools.group_proof",
+            "--device", "cuda", "--workdir", str(out), *args,
+        )  # fmt: skip
+        code, output = _command(context, name, argv, minutes)
+        report = last_json(output) or {}
+        numbers = group_numbers(report)
+        if against:
+            baseline = (
+                context.report["stages"].get(against, {}).get("numbers", {})
+            ).get("images_per_second")
+            if baseline and numbers["images_per_second"]:
+                numbers[f"speed_against_{against}"] = round(
+                    numbers["images_per_second"] / baseline, 2
+                )
+        if code != 0 or not report.get("passed"):
+            return Result("failed", numbers, f"exit {code}; see logs/{name}.log")
+        problem = group_problem(
+            report, args, native_bf16=native_bf16(torch.device("cuda"))
+        )
+        return Result("failed", numbers, problem) if problem else Result("passed", numbers)
+
+    return _run
+
+
 _AT_224 = ("--image-size", "224", "--batch-size", "64")
 
 STAGES: list[Stage] = [
     Stage("env", "the GPU, its driver and the precision it trains in", 0.1, _env),
-    Stage("gpu_tests", "the GPU-only tests: fp16 scaler, precision by card, preflight, skipped steps", 0.5, _gpu_tests, ("env",)),
-    Stage("round_tests", "this round's test files on this machine", 3, _round_tests),
+    Stage("gpu_tests", "the GPU-only tests: fp16 scaler, precision by card, preflight, skipped steps, lean GRN", 1, _gpu_tests, ("env",)),
+    Stage("round_tests", "this round's test files on this machine", 4, _round_tests),
     Stage("learn_fp16", "a model learns in this card's precision", 1, _learn_fp16, ("env",)),
     Stage("convert_base", "real Apache V1 weights convert into a Base trunk", 0.5, _convert("base")),
     Stage("convert_small", "the same for the student sizes", 0.5, _convert("nano", "atto")),
@@ -880,6 +976,13 @@ STAGES: list[Stage] = [
     Stage("geometry", "colour-only augmentation for images with a geometry-sensitive label", 1.5, _geometry, ("env", "synth_packs")),
     Stage("auto_batch", "automatic batch size: Base with its tail, then with a teacher loaded", 4, _auto_batch, ("teacher",)),
     Stage("many_heads", "Base with 900 sparse heads: what the head count costs", 4, _many_heads, ("teacher",)),
+    # The group trainers (Bitcrush ISSUE-1690): head-only, scoped export and a
+    # sourceless full update, in this card's precision, on generated images.
+    Stage("group_base", "group, Base at 512px: head-only, export, sourceless update; compiled, lean GRN, automatic batch", 5, _group("group_base", "--size", "base", *_GROUP_512, minutes=5), ("env",)),
+    Stage("group_nano", "group, nano at 512px, eager", 1.5, _group("group_nano", "--size", "nano", *_GROUP_SMALL, minutes=1.5), ("env",)),
+    Stage("group_tiny", "group, tiny at 512px, eager", 2, _group("group_tiny", "--size", "tiny", *_GROUP_SMALL, minutes=2), ("env",)),
+    Stage("group_refuses", "group, Base at 512px and batch 64: refused before it trains, no backup left", 1.5, _group("group_refuses", "--size", "base", *_GROUP_512, "--images-per-class", "8", "--batch-size", "64", "--preflight", "--expect-refusal", minutes=1.5), ("env",)),
+    Stage("group_pause_resume", "group, nano: pause the update at step 5 (mid-epoch), resume it from its backup", 2.5, _group("group_pause_resume", "--size", "nano", *_GROUP_SMALL, "--batch-size", "16", "--epochs", "3", "--pause-after-steps", "5", minutes=2.5), ("env",)),
     # Speed comparisons and extras: dropped first when the budget runs short.
     Stage("other_tests", "the older backbone tests on this machine", 2.5, _other_tests, optional=True),
     Stage("speed_atto", "speed: atto at 224px", 1, _speed("speed_atto", "--size", "atto", *_AT_224), ("env",), True),
@@ -890,6 +993,8 @@ STAGES: list[Stage] = [
     Stage("speed_base_channels_last", "speed: base, channels-last", 3, _speed("speed_base_channels_last", "--size", "base", *_AT_224, "--channels-last"), ("env",), True),
     Stage("speed_base_stock_grn", "speed: base with timm's own GRN layer, batch 32", 4.5, _speed("speed_base_stock_grn", "--size", "base", "--image-size", "224", "--batch-size", "32", "--stock-grn"), ("env",), True),
     Stage("speed_base_one_loader", "speed: base, images loaded on the training thread", 4, _speed("speed_base_one_loader", "--size", "base", *_AT_224, "--workers", "0"), ("env",), True),
+    Stage("group_base_eager", "group speed: Base at 512px, not compiled", 3.5, _group("group_base_eager", "--size", "base", *_GROUP_512, "--no-compile", minutes=3.5, against="group_base"), ("env",), True),
+    Stage("group_base_stock_grn", "group speed: Base at 512px, eager, timm's own GRN layer", 4, _group("group_base_stock_grn", "--size", "base", *_GROUP_512, "--no-compile", "--stock-grn", minutes=4, against="group_base_eager"), ("env",), True),
     Stage("real_pack", "a short run on part of a real pack (needs --pack)", 6, _real_pack, ("env",), True),
 ]  # fmt: skip
 

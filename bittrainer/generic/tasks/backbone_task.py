@@ -48,9 +48,11 @@ import bittrainer.backbone_trainer as bb
 from bittrainer.amp import amp_label, make_grad_scaler
 from bittrainer.autobatch import (
     _OPT_STATE_MULT,
-    _allocator_cap_bytes,
+    RunRefused,
     _apply_trust_bound,
     _linear_fit,
+    is_out_of_memory,
+    vram_room,
 )
 from bittrainer.backbone_init import apply_backbone_init, wants_timm_pretrained
 from bittrainer.ema import ModelEMA
@@ -70,7 +72,6 @@ from bittrainer.lean_grn import use_lean_grn
 from bittrainer.model import create_model, default_drop_path_rate
 from bittrainer.training_state import (
     BackupCoordinator,
-    _looks_like_oom,
     capture_rng_states,
     restore_optimizer_state,
     restore_rng_states,
@@ -89,7 +90,7 @@ _AUTO_SHARE = 0.85
 _SKIP_WARN_SHARE = 0.02
 
 
-class BackboneRunRefused(RuntimeError):
+class BackboneRunRefused(RunRefused):
     """Raised before the first epoch when the run cannot work as configured:
     a training step does not fit the card. Nothing has been trained."""
 
@@ -105,22 +106,11 @@ def _gb(size: float) -> str:
     return f"{size / 2**30:.1f}"
 
 
-def _out_of_memory(exc: BaseException) -> bool:
-    """Running out of GPU memory, however it is worded: torch's own error, or
-    cuDNN / cuBLAS failing to get their workspace on a card that is full."""
-    return _looks_like_oom(exc) or "ALLOC_FAILED" in str(exc)
-
-
-def _vram_room(device) -> int | None:
-    """The most this process can hold on *device*, in bytes: what it holds now
-    plus what is free, under any cap set on the allocator. None off a GPU."""
-    if torch.device(device).type != "cuda":
-        return None
-    torch.cuda.empty_cache()
-    free, total = torch.cuda.mem_get_info(device)
-    room = free + torch.cuda.memory_reserved(device)
-    cap = _allocator_cap_bytes(device, total)
-    return room if cap is None else min(room, cap)
+# Running out of GPU memory, however it is worded, and the room a card can give
+# the run: shared with the group trainers (bittrainer.autobatch), under the
+# names this module and its tests use.
+_out_of_memory = is_out_of_memory
+_vram_room = vram_room
 
 
 def _largest_fitting_batch(measure, budget: float, max_batch: int) -> dict | None:

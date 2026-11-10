@@ -1,5 +1,6 @@
 """Tests for autobatch.py — sparse buckets must not clamp the batch size."""
 
+import pytest
 import torch
 import torch.nn as nn
 
@@ -11,6 +12,7 @@ from bittrainer.autobatch import (
     _make_default_inputs,
     _probe_budget_bytes,
     determine_batch_size,
+    is_out_of_memory,
     profile_vram_batch_size,
 )
 
@@ -167,3 +169,95 @@ class TestAllocatorCapBudget:
         assert _allocator_cap_bytes(torch.device("cpu"), 24 * self.GB) is None
         monkeypatch.delattr(torch.cuda, "get_per_process_memory_fraction", raising=False)
         assert _allocator_cap_bytes(torch.device("cpu"), 24 * self.GB) is None
+
+
+class _FailsFrom(nn.Module):
+    """Runs a real forward / backward until the batch reaches ``at``, then
+    raises ``message`` the way a full card (or a broken step) would."""
+
+    def __init__(self, at: int, message: str) -> None:
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(1))
+        self.at, self.message = at, message
+        self.seen: list[int] = []
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        self.seen.append(int(x.shape[0]))
+        if x.shape[0] >= self.at:
+            raise RuntimeError(self.message)
+        return x.mean(dim=(1, 2, 3)) * self.weight
+
+
+@pytest.fixture
+def _fake_card(monkeypatch):
+    """A 15 GiB card with 12 GiB free, simulated on the CPU: each image of a
+    rung costs 64 MiB at its peak."""
+    gib = 1024**3
+    peak = {"bytes": 0}
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda device=None: (12 * gib, 15 * gib))
+    monkeypatch.setattr(torch.cuda, "memory_allocated", lambda device=None: 0)
+    monkeypatch.setattr(torch.cuda, "reset_peak_memory_stats", lambda device=None: None)
+    monkeypatch.setattr(torch.cuda, "max_memory_allocated", lambda device=None: peak["bytes"])
+    monkeypatch.setattr(
+        torch.cuda, "get_per_process_memory_fraction", lambda device: 1.0, raising=False
+    )
+
+    def _inputs(batch: int):
+        peak["bytes"] = batch * 64 * 1024**2
+        return (torch.ones(batch, 3, 4, 4),)
+
+    return _inputs
+
+
+def _probe(model, make_inputs):
+    return profile_vram_batch_size(
+        model, make_inputs, torch.device("cuda"), dtype=torch.float32
+    )
+
+
+class TestOnlyMemoryErrorsAreSizedAround:
+    """Bitcrush ISSUE-1690: the probe read every ``RuntimeError`` as "out of
+    memory". A broken step at a batch of one then fell back to batch 8 and
+    failed later, somewhere else. Only running out of memory says "does not
+    fit"; anything else is raised as itself."""
+
+    def test_a_broken_step_is_raised_not_sized_around(self, _fake_card):
+        model = _FailsFrom(1, "mat1 and mat2 shapes cannot be multiplied")
+        model.eval()
+        with pytest.raises(RuntimeError, match="cannot be multiplied"):
+            _probe(model, _fake_card)
+        assert model.seen == [1]
+        assert model.training is False  # left as it was found
+        assert model.weight.grad is None
+
+    def test_running_out_of_memory_still_ends_the_ladder(self, _fake_card):
+        model = _FailsFrom(4, "CUDA out of memory. Tried to allocate 2.00 GiB.")
+        result = _probe(model, _fake_card)
+        assert model.seen == [1, 2, 4]
+        assert result["max_fitted_rung"] == 2
+        assert result["vram_limit"] == 2  # the last rung that fitted is the ceiling
+
+    def test_the_t4s_cudnn_wording_counts_as_out_of_memory(self, _fake_card):
+        model = _FailsFrom(8, "cuDNN error: CUDNN_STATUS_ALLOC_FAILED")
+        result = _probe(model, _fake_card)
+        assert model.seen == [1, 2, 4, 8]
+        assert result["max_fitted_rung"] == 4
+
+    def test_the_shared_test_reads_every_wording(self):
+        assert is_out_of_memory(torch.cuda.OutOfMemoryError("CUDA out of memory"))
+        assert is_out_of_memory(RuntimeError("CUDA out of memory. Tried to allocate"))
+        assert is_out_of_memory(RuntimeError("cuDNN error: CUDNN_STATUS_ALLOC_FAILED"))
+        assert is_out_of_memory(RuntimeError("CUBLAS_STATUS_ALLOC_FAILED when calling"))
+        assert not is_out_of_memory(RuntimeError("shapes cannot be multiplied"))
+        assert not is_out_of_memory(NotImplementedError("missing the forward function"))
+
+    def test_every_trainer_asks_the_same_test(self):
+        import bittrainer.embedding_cache as embedding_cache
+        import bittrainer.generic.tasks.backbone_task as backbone_task
+        import bittrainer.generic.tasks.group_task as group_task
+        import bittrainer.training_state as training_state
+
+        assert backbone_task._out_of_memory is is_out_of_memory
+        for module in (embedding_cache, group_task, training_state):
+            assert module.is_out_of_memory is is_out_of_memory

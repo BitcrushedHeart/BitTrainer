@@ -40,6 +40,40 @@ _BIG_CARD_BYTES = 16 * (1024 ** 3)
 _FALLBACK_BATCH = 8
 
 
+def is_out_of_memory(exc: BaseException) -> bool:
+    """Running out of GPU memory, however it is worded: torch's own error, or
+    cuDNN / cuBLAS failing to get their workspace on a card that is full (the
+    T4 says ``CUDNN_STATUS_ALLOC_FAILED``).
+
+    The one test every trainer uses (Bitcrush ISSUE-1690): the batch probe, the
+    preflights, the feature warm-up's back-off and the exception backup. Any
+    other error is a broken step, never a sign that a smaller batch would fit.
+    """
+    if isinstance(exc, getattr(torch.cuda, "OutOfMemoryError", ())):
+        return True
+    text = str(exc)
+    lowered = text.lower()
+    return "out of memory" in lowered or "cuda oom" in lowered or "ALLOC_FAILED" in text
+
+
+class RunRefused(RuntimeError):
+    """Raised before the first epoch when a run cannot work as configured: a
+    training step does not fit the card. Nothing has been trained, and no
+    backup is left behind for the next attempt to trip over."""
+
+
+def vram_room(device) -> int | None:
+    """The most this process can hold on *device*, in bytes: what it holds now
+    plus what is free, under any cap set on the allocator. None off a GPU."""
+    if torch.device(device).type != "cuda":
+        return None
+    torch.cuda.empty_cache()
+    free, total = torch.cuda.mem_get_info(device)
+    room = free + torch.cuda.memory_reserved(device)
+    cap = _allocator_cap_bytes(device, total)
+    return room if cap is None else min(room, cap)
+
+
 def _make_default_inputs(
     batch: int, bucket: tuple[int, int], device: torch.device, dtype: torch.dtype,
     memory_format: torch.memory_format | None = None,
@@ -196,9 +230,15 @@ def profile_vram_batch_size(
             else:
                 xs.append(b)
                 ys.append(float(max(0, peak - alloc_before)))
-        except RuntimeError:
+        except RuntimeError as exc:
             model.zero_grad(set_to_none=True)
             torch.cuda.empty_cache()
+            if not is_out_of_memory(exc):
+                # A broken step must stop the run, not size it (Bitcrush
+                # ISSUE-1690): read as "out of memory" at a batch of one, it
+                # used to fall back to batch 8 and fail later, somewhere else.
+                model.train(was_training)
+                raise
             failed_at = b
             status = "oom"
         if progress_callback is not None:

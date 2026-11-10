@@ -51,6 +51,8 @@ from typing import Callable, Iterator
 import numpy as np
 import torch
 
+from bittrainer.autobatch import is_out_of_memory
+
 logger = logging.getLogger(__name__)
 
 BACKUP_FORMAT_VERSION = 1
@@ -454,13 +456,6 @@ class TrainingStateManager:
 # ---------------------------------------------------------------------------
 
 
-def _looks_like_oom(exc: BaseException) -> bool:
-    if isinstance(exc, getattr(torch.cuda, "OutOfMemoryError", ())):
-        return True
-    text = str(exc).lower()
-    return "out of memory" in text or "cuda oom" in text
-
-
 class BackupCoordinator:
     """Per-run bundle of the state manager, the pause event and the cadence.
 
@@ -529,7 +524,7 @@ class BackupCoordinator:
         try:
             yield
         except Exception as exc:
-            if _looks_like_oom(exc):
+            if is_out_of_memory(exc):
                 try:
                     if torch.cuda.is_available():
                         torch.cuda.empty_cache()

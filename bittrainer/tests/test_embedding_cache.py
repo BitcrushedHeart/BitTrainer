@@ -171,6 +171,48 @@ def test_cuda_oom_backoff_halves_batch_and_remembers_cap(monkeypatch, tmp_path):
         assert cache.get_vector(sample["path"], None) is not None
 
 
+def test_cudnn_alloc_failed_backs_off_like_an_oom(monkeypatch, tmp_path):
+    """Bitcrush ISSUE-1690: a full T4 can say CUDNN_STATUS_ALLOC_FAILED instead
+    of raising torch's OutOfMemoryError. The feature warm-up starts at batch
+    256, so it must back off on that wording too."""
+    samples = _samples(tmp_path, n=8)
+    cache = EmbeddingCache(tmp_path / "embed", "0123456789abcdef", 4)
+    sizes: list[int] = []
+
+    def _forward(batch, _backbone, _device, _dtype):
+        sizes.append(len(batch))
+        if len(batch) > 2:
+            raise RuntimeError("cuDNN error: CUDNN_STATUS_ALLOC_FAILED")
+        return np.ones((len(batch), 4), dtype=np.float32)
+
+    monkeypatch.setattr(cache, "_forward_pooled", _forward)
+
+    stats = cache.ensure(
+        samples, torch.nn.Identity(), None, device=_DEV, dtype=_DT, batch_size=4
+    )
+
+    assert stats == {"built": 8, "reused": 0, "total": 8}
+    assert sizes == [4, 2, 2, 2, 2]
+
+
+def test_an_error_that_is_not_about_memory_is_not_backed_off(monkeypatch, tmp_path):
+    samples = _samples(tmp_path, n=8)
+    cache = EmbeddingCache(tmp_path / "embed", "0123456789abcdef", 4)
+    sizes: list[int] = []
+
+    def _forward(batch, _backbone, _device, _dtype):
+        sizes.append(len(batch))
+        raise RuntimeError("mat1 and mat2 shapes cannot be multiplied")
+
+    monkeypatch.setattr(cache, "_forward_pooled", _forward)
+
+    with pytest.raises(RuntimeError, match="cannot be multiplied"):
+        cache.ensure(
+            samples, torch.nn.Identity(), None, device=_DEV, dtype=_DT, batch_size=4
+        )
+    assert sizes == [4]  # raised as itself, at the size it was asked for
+
+
 def test_save_failure_surfaces_and_leaves_era_incomplete(monkeypatch, tmp_path):
     """A vector write failure must fail the build (never mark the era complete
     over missing vectors), even though writes drain through a background

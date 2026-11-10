@@ -79,8 +79,10 @@ def _card(cost, *, runs_out_at=None):
 
 
 def test_why_auto_chose_eight(monkeypatch):
-    """The cause, pinned. The shared probe is left as it is for the other
-    trainers, whose models do have a ``forward``."""
+    """The cause, pinned. The shared probe read the wrapper's missing
+    ``forward`` as "out of memory" at a batch of one and fell back to 8. Since
+    Bitcrush ISSUE-1690 only running out of memory counts as "does not fit":
+    the same call now raises the error as itself instead of sizing around it."""
     heads = bb._MultiTaskHeads(4, SimpleNamespace(concepts=["a"], groups={}))
     model = bb._BackboneWithHeads(torch.nn.Identity(), heads)
     with pytest.raises(NotImplementedError):
@@ -93,12 +95,12 @@ def test_why_auto_chose_eight(monkeypatch):
     monkeypatch.setattr(torch.cuda, "max_memory_allocated", lambda device: 0)
     monkeypatch.setattr(torch.cuda, "reset_peak_memory_stats", lambda device: None)
 
-    probe = profile_vram_batch_size(
-        model, lambda batch: (torch.zeros(batch, 4),), CUDA, dtype=torch.float32
-    )
-
-    # "Out of memory" at a batch of one, on an empty 15 GB card.
-    assert probe["max_fitted_rung"] is None and probe["vram_limit"] == 8
+    # It used to answer "out of memory at a batch of one, on an empty 15 GB
+    # card": max_fitted_rung None, vram_limit 8.
+    with pytest.raises(NotImplementedError, match="forward"):
+        profile_vram_batch_size(
+            model, lambda batch: (torch.zeros(batch, 4),), CUDA, dtype=torch.float32
+        )
 
 
 # -- the search ---------------------------------------------------------------

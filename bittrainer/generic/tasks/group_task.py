@@ -15,12 +15,15 @@ from __future__ import annotations
 import logging
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import torch
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader
 
 import bittrainer.group_trainer as gt
+from bittrainer.amp import amp_label, make_grad_scaler, resolve_amp_dtype, wants_grad_scaler
+from bittrainer.autobatch import _OPT_STATE_MULT, RunRefused, is_out_of_memory, vram_room
 from bittrainer.dataset import resolution_ckpt_meta
 from bittrainer.dynamic_class_weights import DynamicClassWeightController
 from bittrainer.ema import ModelEMA
@@ -34,6 +37,7 @@ from bittrainer.generic.task import (
 )
 from bittrainer.backbones import is_siglip
 from bittrainer.group_dataset import build_group_bucket_sampler
+from bittrainer.lean_grn import use_lean_grn
 from bittrainer.model import _infer_region_head, create_model, prepare_for_finetune
 from bittrainer.model_soup import greedy_soup
 from bittrainer.ordinal_threshold import (
@@ -59,6 +63,30 @@ from bittrainer.training_state import (
 from bittrainer.view_calibration import finalize_region_views
 
 logger = logging.getLogger(__name__)
+
+# The share of the memory a card can give the run that one training step may
+# take (the backbone trainer's figure). The rest is for what a single step does
+# not show: validation, partial batches, and the allocator's fragmentation.
+_PREFLIGHT_SHARE = 0.95
+# A settled GradScaler skips about one step in 2000 as it probes upwards; more
+# than this share of an epoch's steps skipped after it settled is logged.
+_SKIP_WARN_SHARE = 0.02
+
+
+def precision_frame(dtype: torch.dtype, *, scaler: bool, lean_grn: bool) -> dict:
+    """The progress frame an fp16 run opens with (Bitcrush ISSUE-1690)."""
+    text = "No native bf16 on this card: training in float16"
+    if scaler:
+        text += " with a GradScaler"
+    text += ", GRN kept in half precision" if lean_grn else ", timm's GRN"
+    return {
+        "type": "training_progress",
+        "stage": "preparing",
+        "status_text": text,
+        "amp_dtype": amp_label(dtype != torch.float32, dtype),
+        "grad_scaler": scaler,
+        "lean_grn": lean_grn,
+    }
 
 
 class GroupTask(TrainingTask):
@@ -117,6 +145,18 @@ class GroupTask(TrainingTask):
         # (None = an ordinary group) and the last epoch's mean detector loss.
         self.region_manifest = None
         self._train_region_loss: float | None = None
+        # Cards without native bf16 (Bitcrush ISSUE-1690), decided in
+        # make_context: the fp16 run's GradScaler (None on a bf16 card and on a
+        # CPU), whether GRN stays in half precision, and the optimizer steps
+        # the scaler skipped (over the run, and in the current epoch).
+        self.scaler = None
+        self.lean_grn = False
+        self.skipped_steps = 0
+        self._scaler_settled = False
+        self._grad_scale: float | None = None
+        self._epoch_skipped = 0
+        self._epoch_late_skipped = 0
+        self._epoch_steps = 0
 
     def _region_meta(self, model) -> dict:
         """Checkpoint metadata for the model's region head; empty without one."""
@@ -143,7 +183,15 @@ class GroupTask(TrainingTask):
         for note in notes:
             em.raw({"type": "training_progress", "stage": "preparing", "status_text": note})
         device = torch.device(config.device)
-        dtype = gt._get_dtype(config.dtype)
+        # The precision the card trains in (Bitcrush ISSUE-1690): what was
+        # asked for, except that bf16 on a card without it (a T4) becomes fp16,
+        # which steps through a GradScaler and keeps GRN in half precision. A
+        # bf16 card and a CPU get exactly the dtype they always got, no scaler.
+        dtype = resolve_amp_dtype(gt._get_dtype(config.dtype), device)
+        self.scaler = make_grad_scaler(device, dtype, dtype != torch.float32)
+        self.lean_grn = bool(config.lean_grn) and wants_grad_scaler(device, dtype, True)
+        if self.scaler is not None:
+            em.raw(precision_frame(dtype, scaler=True, lean_grn=self.lean_grn))
         configure_cuda_backend()
         group_folder = Path(config.group_folder)
         checkpoint_dir = (
@@ -246,6 +294,7 @@ class GroupTask(TrainingTask):
                 head_hidden_size=self.head_hidden_size,
                 checkpoint_dir=ctx.checkpoint_dir,
             )
+            self._use_lean_grn(model)
             if self.memory_format is not None:
                 model = model.to(memory_format=self.memory_format)
             return model
@@ -277,11 +326,19 @@ class GroupTask(TrainingTask):
         if region_shape is not None:
             install_region_head(model, region_shape[0], region_shape[1])
         model.load_state_dict(resume_state["model"])
+        self._use_lean_grn(model)
         model = model.to(device)
         if self.memory_format is not None:
             model = model.to(memory_format=self.memory_format)
         prepare_for_finetune(model, getattr(config, "finetune_blocks", 4))
         return model
+
+    def _use_lean_grn(self, model) -> None:
+        """fp16 runs only (Bitcrush ISSUE-1690): GRN in half precision. Same
+        weights and state-dict names; the EMA's copy and every checkpoint
+        follow. A bf16 card and a CPU keep timm's layer."""
+        if self.lean_grn:
+            use_lean_grn(model)
 
     def pre_loop(self, ctx: TaskContext, model) -> None:
         # Head warmup on cached features (replaces the fixed 1-epoch frozen
@@ -485,6 +542,12 @@ class GroupTask(TrainingTask):
             if self.ema is not None and resume_state.get("ema") is not None:
                 self.ema.load_full_state_dict(resume_state["ema"])
 
+        # Refuse a run whose training step does not fit (Bitcrush ISSUE-1690):
+        # before compile (whose warm-up swallows every error, running out of
+        # memory included) and outside the epoch loop, so a refusal leaves no
+        # backup behind for the next attempt to trip over.
+        self._preflight(ctx, model, eff_bs, optimizer)
+
         # fwd_model shares parameters with the eager model — optimizer, EMA and
         # checkpoint saves keep operating on `model`; only forward calls go through
         # the compiled wrapper.
@@ -508,8 +571,169 @@ class GroupTask(TrainingTask):
         self.soup_dir = ctx.checkpoint_dir / "soup_cands"
         return optimizer, scheduler, scheduler_t_max
 
+    # -- before compile and the first epoch: a step with nothing kept ---------
+    def _largest_bucket(self) -> tuple[int, int]:
+        """``(width, height)`` of the largest bucket this run trains."""
+        active = [bucket for bucket, count in self.bucket_counts.items() if count > 0]
+        if not active:
+            side = int(self.config.train_resolution or 512)
+            return side, side
+        return tuple(max(active, key=lambda bucket: bucket[0] * bucket[1]))
+
+    def _dry_step(self, ctx: TaskContext, model, batch_size: int) -> int | None:
+        """One real training step at *batch_size*, with nothing kept of it.
+
+        The epoch loop itself runs on one made-up batch of the largest bucket
+        the run trains, so the precision, the GRN layer, the loss and the
+        GradScaler are all in it, and stops after the backward pass: no
+        optimizer, no scaler update, no EMA. Weights, RNG streams and gradients
+        are as they were afterwards. Returns the step's peak in bytes on a GPU,
+        else None.
+        """
+        config = self.config
+        device = ctx.device
+        on_gpu = device.type == "cuda"
+        width, height = self._largest_bucket()
+        images = torch.zeros(batch_size, 3, height, width, dtype=torch.uint8)
+        rows = torch.arange(batch_size)
+        if config.multi_label:
+            labels = torch.zeros(batch_size, config.num_classes)
+            labels[rows, rows % config.num_classes] = 1.0
+        else:
+            labels = rows % config.num_classes
+        rng = capture_rng_states(device)
+        was_training = model.training
+        if on_gpu:
+            torch.cuda.empty_cache()
+            torch.cuda.reset_peak_memory_stats(device)
+        try:
+            gt._train_one_epoch(
+                model,
+                [(images, labels)],
+                # The loop only clears gradients before the step it never takes.
+                SimpleNamespace(zero_grad=model.zero_grad),
+                config,
+                device,
+                ctx.dtype,
+                use_soft_targets=self.use_soft,
+                class_weights=self.class_weights,
+                mixup_enabled=self.mixup_enabled,
+                scaler=self.scaler,
+                dry_run=True,
+            )
+            return torch.cuda.max_memory_allocated(device) if on_gpu else None
+        finally:
+            model.zero_grad(set_to_none=True)
+            model.train(was_training)
+            restore_rng_states(rng, device)
+            if on_gpu:
+                torch.cuda.empty_cache()
+
+    def _preflight(self, ctx: TaskContext, model, eff_bs: int, optimizer) -> None:
+        """Refuse, before any training, a run whose step does not fit the card.
+
+        On by default on an fp16 card only, so a bf16 card and a CPU run
+        exactly as before; ``config.preflight`` True forces it, False skips it.
+        Never without a run context (a tool or a test building the optimizer).
+        Raises :class:`~bittrainer.autobatch.RunRefused`; any error that is
+        not about memory is raised as itself.
+        """
+        config = self.config
+        wanted = self.scaler is not None if config.preflight is None else bool(config.preflight)
+        if ctx is None or not wanted:
+            return
+        room = vram_room(ctx.device)
+        # A fresh optimizer builds its state on its first real step and keeps
+        # it; a resumed one already holds it.
+        to_come = 0
+        if not optimizer.state:
+            to_come = int(
+                _OPT_STATE_MULT
+                * sum(
+                    p.numel() * p.element_size()
+                    for p in model.parameters()
+                    if p.requires_grad
+                )
+            )
+        width, height = self._largest_bucket()
+        precision = amp_label(ctx.dtype != torch.float32, ctx.dtype)
+        what = f"batch size {eff_bs} at {width}x{height}, precision {precision}"
+        try:
+            peak = self._dry_step(ctx, model, eff_bs)
+        except RuntimeError as exc:
+            if not is_out_of_memory(exc):
+                raise  # a broken step must stop the run as itself
+            raise RunRefused(
+                f"Preflight: one training step ({what}) ran out of memory on this "
+                "card. Lower batch_size."
+            ) from exc
+        needed = None if peak is None else peak + to_come
+        if needed is not None and room and needed > _PREFLIGHT_SHARE * room:
+            raise RunRefused(
+                f"Preflight: one training step ({what}) needs {needed / 2**30:.1f} GB "
+                f"of the {room / 2**30:.1f} GB this card can give the run, more than "
+                f"the {_PREFLIGHT_SHARE:.0%} a run can rely on: it would run out of "
+                "memory. Lower batch_size."
+            )
+        fits = f"Preflight: {what} fits"
+        if needed is not None and room:
+            fits += f": {needed / 2**30:.1f} of {room / 2**30:.1f} GB"
+        ctx.cb(
+            {
+                "type": "training_progress",
+                "stage": "preflight",
+                "status_text": fits,
+                "batch_size": eff_bs,
+                "bucket": [width, height],
+                "peak_vram_mb": None if needed is None else round(needed / 2**20),
+            }
+        )
+
+    # -- steps the fp16 GradScaler skipped -----------------------------------
+    def _start_skip_count(self) -> None:
+        """Start an epoch's count. Called at the top of every fp16 epoch."""
+        self._epoch_skipped = 0
+        self._epoch_late_skipped = 0
+        self._epoch_steps = 0
+        self._grad_scale = self.scaler.get_scale()
+
+    def _count_skip(self, scaler) -> None:
+        """Called after every ``scaler.update()``.
+
+        The scaler lowers its scale only when a gradient was not finite, and
+        then it has left the optimizer alone: that step was skipped. The first
+        step that lands ends the opening descent from the scaler's start value
+        (expected, once per run); a skip after it is a late one.
+        """
+        scale = scaler.get_scale()
+        self._epoch_steps += 1
+        if self._grad_scale is not None and scale < self._grad_scale:
+            self.skipped_steps += 1
+            self._epoch_skipped += 1
+            if self._scaler_settled:
+                self._epoch_late_skipped += 1
+        else:
+            self._scaler_settled = True
+        self._grad_scale = scale
+
+    def _scaler_numbers(self) -> dict:
+        """What the fp16 run's scaler did, for its frames and result."""
+        return {
+            "skipped_steps": self._epoch_skipped,
+            "skipped_steps_total": self.skipped_steps,
+            "grad_scale": self._grad_scale,
+        }
+
     def restore_resume_extra(self, ctx: TaskContext, resume_state: dict) -> None:
         self.soup_pool = [tuple(t) for t in (resume_state.get("soup_pool") or [])]
+        # fp16 (Bitcrush ISSUE-1690): the scaler's running scale and its count
+        # continue where they stopped. A bf16 backup carries neither; resumed
+        # in fp16, its scaler starts fresh, opening descent still to come.
+        self.skipped_steps = int(resume_state.get("skipped_steps", 0))
+        self._scaler_settled = bool(resume_state.get("scaler_settled", False))
+        scaler_state = resume_state.get("grad_scaler")
+        if self.scaler is not None and scaler_state:
+            self.scaler.load_state_dict(scaler_state)
 
     def resumed_message(
         self, ctx: TaskContext, best: BestTracker, global_step: int, start_epoch: int
@@ -755,12 +979,17 @@ class GroupTask(TrainingTask):
         start_batch: int,
     ):
         config = self.config
-        # The detector-loss sink is only wired for a crop-assisted run, so an
-        # ordinary group's call is the one it has always been.
+        # The detector-loss sink is only wired for a crop-assisted run, and the
+        # GradScaler only for an fp16 one, so an ordinary bf16 / CPU group's
+        # call is the one it has always been.
         region_kwargs: dict = {}
         if self.region_manifest is not None:
             self._train_region_loss = None
             region_kwargs["region_loss_sink"] = self._record_region_loss
+        if self.scaler is not None:
+            self._start_skip_count()
+            region_kwargs["scaler"] = self.scaler
+            region_kwargs["scaler_sink"] = self._count_skip
         return gt._train_one_epoch(
             self.fwd_model,
             train_loader,
@@ -1005,6 +1234,17 @@ class GroupTask(TrainingTask):
         )
         if self._train_region_loss is not None:
             msg["train_region_loss"] = self._train_region_loss
+        if self.scaler is not None:
+            msg.update(self._scaler_numbers())
+            late = self._epoch_late_skipped
+            if late >= 3 and late > _SKIP_WARN_SHARE * self._epoch_steps:
+                logger.warning(
+                    "GradScaler skipped %d of %d steps in epoch %d after it settled: "
+                    "the run may have stopped learning",
+                    late,
+                    self._epoch_steps,
+                    epoch + 1,
+                )
         return msg
 
     def collect_extra_state(
@@ -1013,7 +1253,16 @@ class GroupTask(TrainingTask):
         swa_payload = None
         if self.swa is not None and self.swa.state_dict() is not None:
             swa_payload = {"avg": self.swa.state_dict(), "n": self.swa.n}
+        # fp16 only (Bitcrush ISSUE-1690): a bf16 / CPU backup is unchanged.
+        scaler_state: dict = {}
+        if self.scaler is not None:
+            scaler_state = {
+                "grad_scaler": self.scaler.state_dict(),
+                "skipped_steps": self.skipped_steps,
+                "scaler_settled": self._scaler_settled,
+            }
         return {
+            **scaler_state,
             "ema": self.ema.full_state_dict() if self.ema is not None else None,
             "swa": swa_payload,
             "soup_pool": [list(t) for t in self.soup_pool],
@@ -1206,6 +1455,15 @@ class GroupTask(TrainingTask):
             cb=cb,
         )
         self._finalize_regions(ctx, result)
+        if self.scaler is not None and isinstance(result, dict):
+            # fp16 only (Bitcrush ISSUE-1690): a bf16 / CPU result is unchanged.
+            result.update(
+                amp_dtype=amp_label(dtype != torch.float32, dtype),
+                grad_scaler=True,
+                lean_grn=self.lean_grn,
+                skipped_steps=self.skipped_steps,
+                grad_scale=self._grad_scale,
+            )
         stats_path = self._write_sample_stats(ctx.checkpoint_dir)
         if stats_path is not None and isinstance(result, dict):
             result["sample_stats_path"] = str(stats_path)

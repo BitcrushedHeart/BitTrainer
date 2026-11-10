@@ -489,6 +489,18 @@ class GroupTrainConfig:
     backup_every_steps: int = 500
     resume_from: str | None = None
     dataloader_workers: int = 6
+    # --- Cards without native bf16 (Bitcrush ISSUE-1690) ---
+    # ``dtype`` is what a run asks for. On a card without native bf16 (a
+    # Turing T4) bf16 becomes fp16 and the full fine-tune steps through a
+    # GradScaler; a bf16 card and a CPU train exactly as before. The two knobs
+    # below act only on such an fp16 card (unless ``preflight`` forces it).
+    # GRN kept in fp16 (bittrainer.lean_grn): same weights, names and fp32
+    # results, faster and leaner. False keeps timm's own layer.
+    lean_grn: bool = True
+    # One real training step at the chosen batch size before compile and the
+    # first epoch; a step that does not fit refuses the run (RunRefused).
+    # None: on an fp16 card only. True forces it, False skips it.
+    preflight: bool | None = None
 
 
 def resolve_region_manifest(config: GroupTrainConfig):
@@ -1129,13 +1141,21 @@ class _SWA:
 
 
 def _fused_back_pass_plan(
-    optimizer: torch.optim.Optimizer, config: GroupTrainConfig
+    optimizer: torch.optim.Optimizer, config: GroupTrainConfig, scaler=None
 ) -> tuple[bool, str]:
     """Decide whether this epoch runs the optimizer inside ``backward()``.
 
     Returns ``(enabled, reason)``; ``reason`` is the human-readable "why" the
     loop reports once per run.
     """
+    if scaler is not None:
+        # fp16 (Bitcrush ISSUE-1690): the hooks would clip and step on SCALED
+        # gradients, and step before the scaler could see that one of them was
+        # inf / nan and skip the whole step.
+        return (
+            False,
+            "fp16 GradScaler: every gradient is unscaled and checked before any step",
+        )
     if not getattr(config, "fused_back_pass", True):
         return False, "fused back pass disabled by config (exact global-norm clipping)"
     if not getattr(optimizer, "supports_fused_back_pass", False):
@@ -1268,8 +1288,21 @@ def _train_one_epoch(
     start_batch: int = 0,
     sample_loss_sink: Callable[[int, torch.Tensor], None] | None = None,
     region_loss_sink: Callable[[float], None] | None = None,
+    scaler=None,
+    scaler_sink: Callable[[object], None] | None = None,
+    dry_run: bool = False,
 ) -> tuple[float, dict[str, float]]:
     """One training epoch.
+
+    ``scaler`` (Bitcrush ISSUE-1690) is the fp16 run's GradScaler: backward on
+    the scaled loss, then at each step boundary unscale, clip, ``scaler.step``
+    and ``scaler.update`` (the backbone trainer's sequence), after which
+    ``scaler_sink(scaler)`` is told. No fused back pass under a scaler. Without
+    one the loop is the bf16 / CPU loop it has always been.
+
+    ``dry_run`` runs the first batch to the end of its backward pass and stops:
+    no optimizer, scaler update, EMA, hook or counter. The preflight measures a
+    step with it.
 
     ``sample_loss_sink(batch_index, per_example_loss)`` receives the hard-label
     per-example CE (CPU tensor, batch order) for every non-MixUp batch, keyed by
@@ -1344,8 +1377,12 @@ def _train_one_epoch(
         )
 
     memory_format = torch.channels_last if config.channels_last else None
-    fused, fused_reason = _fused_back_pass_plan(optimizer, config)
-    _announce_back_pass_mode(optimizer, config, fused, fused_reason)
+    if dry_run:
+        # A step for its memory only: nothing may step, so no hooks either.
+        fused = False
+    else:
+        fused, fused_reason = _fused_back_pass_plan(optimizer, config, scaler)
+        _announce_back_pass_mode(optimizer, config, fused, fused_reason)
 
     # Clears anything a previous phase left behind. In fused mode this is the
     # ONLY zero_grad of the epoch: the hooks free each gradient as they consume
@@ -1471,7 +1508,13 @@ def _train_one_epoch(
                 region_batches += 1
 
             scaled = loss / accum if accum > 1 else loss
-            scaled.backward()
+            if scaler is not None:
+                scaler.scale(scaled).backward()
+            else:
+                scaled.backward()
+            if dry_run:
+                # The backward pass is the step's peak; see GroupTask._dry_step.
+                break
             num_batches += 1
             ran += 1
             boundary_signal = None
@@ -1486,6 +1529,18 @@ def _train_one_epoch(
                     # calculate_d -> init_step.
                     optimizer.calculate_d()
                     optimizer.init_step()
+                elif scaler is not None:
+                    # fp16: unscale first so the clipper sees true norms. The
+                    # scaler leaves the optimizer alone (and lowers its scale)
+                    # when a gradient came back inf / nan.
+                    scaler.unscale_(optimizer)
+                    if config.clip_grad_norm and config.clip_grad_norm > 0:
+                        clip_gradients(model, config.clip_grad_norm)
+                    scaler.step(optimizer)
+                    scaler.update()
+                    if scaler_sink is not None:
+                        scaler_sink(scaler)
+                    optimizer.zero_grad()
                 else:
                     # Clip on the SUMMED gradients at the real accumulation boundary
                     # (never mid-window, where the grads are only half-accumulated).

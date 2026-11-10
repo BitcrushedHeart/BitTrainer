@@ -463,6 +463,117 @@ def test_a_run_that_never_pauses_fails_the_check(tmp_path):
     assert "exit" in result.note
 
 
+# -- the group trainers (Bitcrush ISSUE-1690) -----------------------------------
+
+
+def _value(argv, flag):
+    return argv[argv.index(flag) + 1]
+
+
+def _by_name():
+    return {stage.name: stage for stage in vm.STAGES}
+
+
+def test_the_plan_covers_the_group_trainers_on_the_t4():
+    stages = _by_name()
+    for name in ("group_base", "group_nano", "group_tiny", "group_refuses", "group_pause_resume"):
+        assert not stages[name].optional, name
+    for name in ("group_base_eager", "group_base_stock_grn"):
+        assert stages[name].optional, name
+    group_tests = {
+        "test_group_amp.py",
+        "test_group_lean_grn.py",
+        "test_group_preflight.py",
+        "test_group_proof.py",
+    }
+    assert group_tests <= set(vm._ROUND_TESTS)
+    assert group_tests - {"test_group_proof.py"} <= set(vm._GPU_TESTS)
+
+
+def test_the_group_stages_ask_for_what_they_prove(tmp_path, monkeypatch):
+    ran = _commands(monkeypatch)
+    context = _context(tmp_path)
+    names = (
+        "group_base", "group_nano", "group_tiny", "group_refuses",
+        "group_pause_resume", "group_base_eager", "group_base_stock_grn",
+    )  # fmt: skip
+    for name in names:
+        assert _by_name()[name].run(context).status == "failed"  # no report: no pass
+    argvs = dict(zip(names, ran, strict=True))
+
+    for name, argv in argvs.items():
+        assert argv[1:3] == ["-m", "bittrainer.tools.group_proof"], name
+        assert _value(argv, "--device") == "cuda" and _value(argv, "--bucket-size") == "512"
+        assert _value(argv, "--workdir").endswith(name)
+    sizes = {name: _value(argv, "--size") for name, argv in argvs.items()}
+    assert sizes["group_base"] == sizes["group_refuses"] == "base"
+    assert (sizes["group_nano"], sizes["group_tiny"]) == ("nano", "tiny")
+    # Base trains as Engine runs it: compiled, lean GRN, automatic batch size.
+    base = argvs["group_base"]
+    assert "--no-compile" not in base and "--stock-grn" not in base
+    assert "--batch-size" not in base
+    assert "--no-compile" in argvs["group_base_eager"]
+    assert "--stock-grn" in argvs["group_base_stock_grn"]
+    refuse = argvs["group_refuses"]
+    assert "--expect-refusal" in refuse and "--preflight" in refuse
+    assert _value(refuse, "--batch-size") == "64"
+    pause = argvs["group_pause_resume"]
+    assert _value(pause, "--pause-after-steps") == "5"
+    # Mid-epoch: more steps in an epoch than the pause waits for.
+    assert int(_value(pause, "--epochs")) >= 2
+
+
+def test_a_group_run_must_have_trained_the_way_this_card_trains():
+    t4 = {"amp_dtype": "float16", "grad_scaler": True, "lean_grn": True, "compiled": True}
+    assert vm.group_problem(t4, ("--size", "base"), native_bf16=False) == ""
+    assert "float16" in vm.group_problem({**t4, "amp_dtype": "bfloat16"}, (), native_bf16=False)
+    assert "GradScaler" in vm.group_problem({**t4, "grad_scaler": False}, (), native_bf16=False)
+    assert "lean GRN" in vm.group_problem({**t4, "lean_grn": False}, (), native_bf16=False)
+    assert vm.group_problem({**t4, "lean_grn": False}, ("--stock-grn",), native_bf16=False) == ""
+    assert "eager" in vm.group_problem({**t4, "compiled": False}, (), native_bf16=False)
+    assert vm.group_problem({**t4, "compiled": False}, ("--no-compile",), native_bf16=False) == ""
+    ampere = {"amp_dtype": "bfloat16", "grad_scaler": False, "lean_grn": False, "compiled": True}
+    assert vm.group_problem(ampere, (), native_bf16=True) == ""
+    assert vm.group_problem({}, ("--expect-refusal",), native_bf16=False) == ""
+
+
+def test_a_group_stage_reports_its_speed_and_passes_on_a_passing_proof(
+    tmp_path, monkeypatch
+):
+    import bittrainer.amp as amp
+
+    monkeypatch.setattr(amp, "native_bf16", lambda device: False)  # a T4
+    report = {
+        "passed": True, "amp_dtype": "float16", "grad_scaler": True, "lean_grn": True,
+        "compiled": True, "best_images_per_second": 12.04, "batch_size_used": 8,
+        "peak_vram_mb": 11800, "preflight_mb": 11200, "skipped_steps": 14,
+    }  # fmt: skip
+    _commands(monkeypatch, output=json.dumps(report, indent=2))
+    context = _context(tmp_path)
+
+    base = _by_name()["group_base"].run(context)
+
+    assert base.status == "passed", base.note
+    assert base.numbers["images_per_second"] == 12.0
+    assert base.numbers["precision"] == "float16" and base.numbers["grad_scaler"] is True
+    assert base.numbers["batch_size"] == 8 and base.numbers["skipped_steps"] == 14
+
+    # The eager run is held against the compiled one's speed.
+    context.report["stages"]["group_base"] = {"numbers": base.numbers}
+    eager_report = {**report, "compiled": False, "best_images_per_second": 9.0}
+    _commands(monkeypatch, output=json.dumps(eager_report, indent=2))
+    eager = _by_name()["group_base_eager"].run(context)
+    assert eager.status == "passed", eager.note
+    assert eager.numbers["speed_against_group_base"] == 0.75
+
+    # A proof that trained in the wrong precision fails the stage, as does one
+    # that failed its own checks.
+    _commands(monkeypatch, output=json.dumps({**report, "grad_scaler": False}, indent=2))
+    assert "GradScaler" in _by_name()["group_nano"].run(context).note
+    _commands(monkeypatch, exit_code=1, output=json.dumps({**report, "passed": False}, indent=2))
+    assert _by_name()["group_tiny"].run(context).status == "failed"
+
+
 def test_base_stages_ask_for_what_a_16gb_card_holds():
     """First run on the T4: Base ran out of memory at batch 128, and at 384px
     with batch 32. The comparison that replaced them measures what the lean GRN
