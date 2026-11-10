@@ -771,3 +771,83 @@ def test_a_refused_run_says_so_in_its_status_file(tmp_path, monkeypatch):
     assert summary["status"] == "refused"
     ended = json.loads((out / "status.json").read_text(encoding="utf-8"))
     assert ended["status"] == "refused" and "does not fit" in ended["reason"]
+
+
+# -- a finished run is not trained again ----------------------------------------
+
+
+def _finished_folder(out: Path) -> None:
+    out.mkdir(parents=True)
+    result = {"validation_score": 0.91, "best_epoch": 5, "epochs_completed": 6}
+    (out / "result.json").write_text(json.dumps(result), encoding="utf-8")
+    (out / "status.json").write_text(
+        json.dumps({"status": "finished", "ended": 1.0}), encoding="utf-8"
+    )
+    (out / "backbone_candidate.safetensors").write_bytes(b"the finished model")
+
+
+def test_a_finished_run_is_not_trained_again(tmp_path, monkeypatch):
+    """The service that runs this command on the VM starts it at every boot, so
+    an interrupted run resumes by itself. A run that had already finished
+    started again from epoch 1 (seen on the T4, 2026-11-10) and would have
+    written over its own finished model."""
+    import bittrainer.backbone_trainer as trainer
+
+    async def _never(request, **_kwargs):
+        raise AssertionError("a finished run must not be trained again")
+
+    monkeypatch.setattr(trainer, "run_backbone_training", _never)
+    out = tmp_path / "run"
+    _finished_folder(out)
+    before = {path.name: path.read_bytes() for path in out.iterdir()}
+
+    summary = runner.train_from_pack(_make_pack(tmp_path), out, **_options())
+
+    assert summary["status"] == "finished" and summary["already_finished"] is True
+    assert summary["validation_score"] == 0.91
+    assert (summary["best_epoch"], summary["epochs_completed"]) == (5, 6)
+    # Nothing in the folder was touched: no new status, progress or backups.
+    assert {path.name: path.read_bytes() for path in out.iterdir()} == before
+
+
+def test_fresh_trains_a_finished_run_again_and_forgets_its_old_result(
+    tmp_path, monkeypatch
+):
+    import bittrainer.backbone_trainer as trainer
+
+    out = tmp_path / "run"
+    _finished_folder(out)
+    seen: list[bool] = []
+
+    async def _train(request, **_kwargs):
+        seen.append((out / "result.json").exists())
+        return {"paused": True, "backup_path": None}
+
+    monkeypatch.setattr(trainer, "run_backbone_training", _train)
+
+    summary = runner.train_from_pack(_make_pack(tmp_path), out, **_options(fresh=True))
+
+    # The old result was gone before training began: cut short, the new run
+    # must be resumed at the next start, not read as finished.
+    assert seen == [False]
+    assert summary["status"] == "paused"
+
+
+def test_the_command_says_a_finished_run_was_left_alone(monkeypatch, tmp_path, capsys):
+    monkeypatch.setattr(
+        runner,
+        "train_from_pack",
+        lambda pack, out, **kw: {
+            "status": "finished",
+            "already_finished": True,
+            "validation_score": 0.91,
+            "best_epoch": 5,
+            "epochs_completed": 6,
+        },
+    )
+
+    code = runner.main(["--pack", str(tmp_path), "--out", str(tmp_path / "run")])
+
+    assert code == 0  # a proper ending: the service does not start it again
+    printed = capsys.readouterr().out
+    assert "already finished" in printed and "--fresh" in printed

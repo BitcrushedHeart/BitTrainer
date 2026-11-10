@@ -29,7 +29,10 @@ Stopping and resuming. The run backs itself up at every epoch end and every
     STOP    finish early: export the best epoch so far and exit
 
 Ctrl-C and a terminate signal pause the same way. Running the same command
-again resumes from the newest backup. If the backups belong to a different run
+again resumes from the newest backup. A run that has finished (it left a
+``result.json``) is left alone, so a service that starts this command at every
+boot never trains a finished run again; ``--fresh`` does. If the backups belong
+to a different run
 (another size, epoch count, resolution or pack) the command refuses rather than
 train over them; ``--fresh`` discards them. The batch sizes are not part of
 that: a paused run can come back with another ``--batch-size`` or
@@ -385,6 +388,19 @@ def _write_status(out: Path, status: str, **fields) -> None:
     scratch.replace(path)
 
 
+def _finished_result(out: Path) -> dict | None:
+    """The result of the run that finished in *out*, or None when none has.
+    ``result.json`` is only ever written by a run that finished."""
+    path = Path(out) / "result.json"
+    if not path.is_file():
+        return None
+    try:
+        result = json.loads(path.read_text(encoding="utf-8"))
+    except ValueError:
+        return {}
+    return result if isinstance(result, dict) else {}
+
+
 def train_from_pack(
     pack: Path,
     out: Path,
@@ -402,6 +418,19 @@ def train_from_pack(
     the run through *control*.
     """
     pack, out = Path(pack), Path(out)
+    done = _finished_result(out)
+    if done is not None and not options.get("fresh"):
+        # Running the same command again resumes an interrupted run, and a
+        # service does exactly that at every boot. A finished run has nothing
+        # to resume: starting over would train it all again and write over its
+        # finished model.
+        return {
+            "status": "finished",
+            "already_finished": True,
+            "validation_score": done.get("validation_score"),
+            "best_epoch": done.get("best_epoch"),
+            "epochs_completed": done.get("epochs_completed"),
+        }
     teacher = options.get("teacher")
     if teacher and not _can_distil():
         return {
@@ -453,6 +482,9 @@ def train_from_pack(
         torch.backends.cudnn.benchmark = True
 
     out.mkdir(parents=True, exist_ok=True)
+    # Only --fresh brings a finished run this far. Its result goes first: cut
+    # short, the new run must be resumed at the next start, not read as finished.
+    (out / "result.json").unlink(missing_ok=True)
     control = Control(out)
     control.clear_files()
     plan = {key: request["training_config"].get(key) for key in _PLAN_KEYS}
@@ -718,7 +750,13 @@ def main(argv: list[str] | None = None) -> int:
         extra=dict(args.extra),
     )
     status = summary["status"]
-    if status == "finished":
+    if status == "finished" and summary.get("already_finished"):
+        _log(
+            f"already finished (validation {summary.get('validation_score')}, best epoch "
+            f"{summary.get('best_epoch')} of {summary.get('epochs_completed')}): nothing was "
+            f"trained. To train again, use a new --out folder or pass --fresh."
+        )
+    elif status == "finished":
         _log(
             f"finished: validation {summary.get('validation_score')}, best epoch "
             f"{summary.get('best_epoch')} of {summary.get('epochs_completed')}"
