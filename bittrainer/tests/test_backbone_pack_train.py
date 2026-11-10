@@ -327,6 +327,134 @@ def test_leftover_control_files_do_not_stop_the_next_run(tmp_path):
     assert not control.pause_event.is_set() and not control.stop_event.is_set()
 
 
+# -- starting weights and teachers --------------------------------------------
+
+
+def test_an_apache_start_converts_a_v1_trunk_into_the_run_once(tmp_path, monkeypatch):
+    pack = _make_pack(tmp_path)
+    out = tmp_path / "run"
+    calls = []
+
+    def _convert(size, path, weights=None):
+        calls.append((size, weights))
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        Path(path).write_bytes(b"a converted trunk")
+        return {
+            "model_id": "timm/convnext_atto.d2_in1k",
+            "license": "apache-2.0",
+            "source_url": "https://huggingface.co/timm/convnext_atto.d2_in1k",
+            "max_abs_difference": 1e-6,
+            "path": str(path),
+        }
+
+    monkeypatch.setattr(runner, "write_v1_trunk", _convert)
+
+    first, _ = runner.build_request(pack, out, **_options(init="apache"))
+    resumed, _ = runner.build_request(pack, out, **_options(init="apache"))
+
+    assert calls == [("atto", None)]  # a resumed run does not download it again
+    for request in (first, resumed):
+        assert request["backbone_init"] == {
+            "source": "local_candidate",
+            "checkpoint_path": str(out / "init_trunk.safetensors"),
+        }
+        assert request["initialization_source"] == "convnext_v1_converted"
+        assert request["pretrained_model_id"] == "timm/convnext_atto.d2_in1k"
+        assert request["pretrained_license"] == "apache-2.0"
+        assert request["non_commercial_only"] is False
+        assert request["external_pretrained_used"] is True
+
+
+def test_weights_that_are_refused_refuse_the_run(tmp_path, monkeypatch):
+    pack = _make_pack(tmp_path)
+
+    def _refuse(size, path, weights=None):
+        raise ValueError("convnext_x is declared cc-by-nc-4.0")
+
+    monkeypatch.setattr(runner, "write_v1_trunk", _refuse)
+
+    refused = runner.train_from_pack(pack, tmp_path / "run", **_options(init="apache"))
+
+    assert refused["status"] == "refused"
+    assert "cc-by-nc-4.0" in refused["reason"]
+
+
+def test_a_teacher_turns_the_run_into_a_distillation(tmp_path):
+    pack = _make_pack(tmp_path)
+    teacher = tmp_path / "base" / "backbone_candidate.safetensors"
+
+    distilled, _ = runner.build_request(
+        pack,
+        tmp_path / "nano",
+        **_options(teacher=str(teacher), distill={"temperature": 3.0}),
+    )
+    plain, _ = runner.build_request(pack, tmp_path / "plain", **_options())
+
+    assert distilled["distillation"] == {
+        "teacher_checkpoint_path": str(teacher),
+        "temperature": 3.0,
+    }
+    assert "distillation" not in plain
+
+
+def test_a_teacher_is_refused_when_this_build_cannot_distil(tmp_path, monkeypatch):
+    """Without the distillation task the trainer would ignore the teacher and
+    train an ordinary run, under a name that says otherwise."""
+    pack = _make_pack(tmp_path)
+    teacher = tmp_path / "teacher.safetensors"
+    teacher.write_bytes(b"x")
+    monkeypatch.setattr(runner, "_can_distil", lambda: False)
+
+    refused = runner.train_from_pack(
+        pack, tmp_path / "run", **_options(teacher=str(teacher))
+    )
+
+    assert refused["status"] == "refused"
+    assert "distil" in refused["reason"]
+    assert not (tmp_path / "run").exists()
+
+
+def test_a_missing_teacher_file_is_refused(tmp_path, monkeypatch):
+    pack = _make_pack(tmp_path)
+    monkeypatch.setattr(runner, "_can_distil", lambda: True)
+
+    refused = runner.train_from_pack(
+        pack,
+        tmp_path / "run",
+        **_options(teacher=str(tmp_path / "nowhere.safetensors")),
+    )
+
+    assert refused["status"] == "refused"
+    assert "teacher" in refused["reason"]
+
+
+def test_weight_and_teacher_options_reach_the_run(monkeypatch, tmp_path):
+    seen: dict = {}
+
+    def _fake(pack, out, **kw):
+        seen.update(kw)
+        return {"status": "finished"}
+
+    monkeypatch.setattr(runner, "train_from_pack", _fake)
+    code = runner.main(
+        [
+            "--pack", str(tmp_path / "pack"),
+            "--out", str(tmp_path / "nano"),
+            "--size", "nano",
+            "--init", "apache",
+            "--v1-weights", "convnext_nano.in12k",
+            "--teacher", "base/backbone_candidate.safetensors",
+            "--distill-temperature", "3",
+            "--distill-feature-weight", "0.5",
+        ]
+    )  # fmt: skip
+
+    assert code == 0
+    assert seen["init"] == "apache" and seen["v1_weights"] == "convnext_nano.in12k"
+    assert seen["teacher"] == "base/backbone_candidate.safetensors"
+    assert seen["distill"] == {"temperature": 3.0, "feature_weight": 0.5}
+
+
 # -- the command --------------------------------------------------------------
 
 

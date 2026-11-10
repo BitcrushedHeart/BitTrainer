@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import importlib.util
 import json
 import signal
 import threading
@@ -43,6 +44,7 @@ import traceback
 from pathlib import Path
 
 from bittrainer.backbone_pack import PackError, pack_records
+from bittrainer.convnext_v1_init import write_v1_trunk
 from bittrainer.convnextv2_catalog import get_convnextv2_pretrained_source
 
 _AMP_CHOICES = {"auto": "auto", "fp16": "float16", "bf16": "bfloat16"}
@@ -97,6 +99,9 @@ def build_request(
     amp: str = "auto",
     init: str = "timm",
     init_checkpoint: str | None = None,
+    v1_weights: str | None = None,
+    teacher: str | None = None,
+    distill: dict | None = None,
     workers: int = 4,
     channels_last: bool = False,
     finetune_image_size: int = 0,
@@ -115,6 +120,11 @@ def build_request(
     Every training default the Backbone Builder ships with is left alone; only
     what is named here is set. ``extra`` is merged into ``training_config``
     last, for one-off experiments. ``fresh`` deletes old backups first.
+
+    ``init="apache"`` converts Apache-2.0 ConvNeXt V1 weights into the run's
+    folder once (see ``bittrainer.convnext_v1_init``) and starts from that
+    trunk; a resumed run reuses the file. ``teacher`` (a trained candidate)
+    turns the run into a distillation of it, tuned by ``distill``.
     """
     pack, out = Path(pack), Path(out)
     records, counts = pack_records(pack, limit=limit)
@@ -188,10 +198,44 @@ def build_request(
             non_commercial_only=source.non_commercial_only,
             external_pretrained_used=True,
         )
+    elif init == "apache":
+        # Converted once into the run's folder; the note beside it carries
+        # where it came from, so a resumed run does not download it again.
+        trunk, note = out / "init_trunk.safetensors", out / "init_trunk.json"
+        if trunk.is_file() and note.is_file():
+            source = json.loads(note.read_text(encoding="utf-8"))
+        else:
+            source = write_v1_trunk(size, trunk, v1_weights)
+            note.write_text(json.dumps(source, indent=1), encoding="utf-8")
+        request["backbone_init"] = {
+            "source": "local_candidate",
+            "checkpoint_path": str(trunk),
+        }
+        request.update(
+            initialization_source="convnext_v1_converted",
+            license_provenance=source["model_id"],
+            pretrained_model_id=source["model_id"],
+            pretrained_license=source["license"],
+            pretrained_source_url=source["source_url"],
+            non_commercial_only=False,
+            external_pretrained_used=True,
+        )
     else:
         request["backbone_init"] = {"source": "random_init", "checkpoint_path": None}
         request["initialization_source"] = "random_init"
+    if teacher:
+        request["distillation"] = {
+            "teacher_checkpoint_path": str(teacher),
+            **(distill or {}),
+        }
     return request, counts
+
+
+def _can_distil() -> bool:
+    """Whether this build has the distillation task. Without it the trainer
+    would ignore the teacher and quietly run an ordinary training."""
+    name = "bittrainer.generic.tasks.backbone_distill_task"
+    return importlib.util.find_spec(name) is not None
 
 
 def _backups_fit(request: dict) -> bool:
@@ -272,9 +316,25 @@ def train_from_pack(
     the run through *control*.
     """
     pack, out = Path(pack), Path(out)
+    teacher = options.get("teacher")
+    if teacher and not _can_distil():
+        return {
+            "status": "refused",
+            "reason": (
+                "this build of BitTrainer cannot distil yet, so the teacher would be "
+                "ignored and the run would be an ordinary training"
+            ),
+        }
+    if teacher and not Path(teacher).is_file():
+        return {
+            "status": "refused",
+            "reason": f"the teacher file was not found: {teacher}",
+        }
     try:
         request, counts = build_request(pack, out, **options)
-    except PackError as exc:
+    except (PackError, ValueError, RuntimeError) as exc:
+        # An unreadable pack, or starting weights that were refused or did not
+        # convert cleanly.
         return {"status": "refused", "reason": str(exc)}
     total = counts["images"] + counts["missing_files"]
     if counts["missing_files"] and not allow_missing:
@@ -302,9 +362,8 @@ def train_from_pack(
     from bittrainer.backbone_trainer import run_backbone_training
 
     if torch.cuda.is_available():
-        torch.backends.cudnn.benchmark = (
-            True  # fixed input sizes: let cuDNN pick kernels
-        )
+        # Fixed input sizes: let cuDNN pick its fastest kernels.
+        torch.backends.cudnn.benchmark = True
 
     out.mkdir(parents=True, exist_ok=True)
     control = Control(out)
@@ -413,12 +472,25 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--init",
         default="timm",
-        choices=["timm", "random"],
-        help="timm = the published ConvNeXt V2 weights (CC-BY-NC-4.0); random = from nothing",
+        choices=["timm", "apache", "random"],
+        help=(
+            "timm = the published ConvNeXt V2 weights (CC-BY-NC-4.0); apache = ConvNeXt "
+            "V1 weights (Apache-2.0) converted into a V2 trunk; random = from nothing"
+        ),
+    )
+    parser.add_argument(
+        "--v1-weights", default=None, help="with --init apache: another timm V1 weight"
     )
     parser.add_argument(
         "--init-checkpoint", default=None, help="start from a local trunk"
     )
+    parser.add_argument(
+        "--teacher", default=None, help="distil this trained candidate into the run"
+    )
+    parser.add_argument("--distill-temperature", type=float, default=None)
+    parser.add_argument("--distill-logit-weight", type=float, default=None)
+    parser.add_argument("--distill-feature-weight", type=float, default=None)
+    parser.add_argument("--distill-supervised-weight", type=float, default=None)
     parser.add_argument(
         "--soft-negatives",
         action="store_true",
@@ -467,6 +539,18 @@ def main(argv: list[str] | None = None) -> int:
         device=args.device,
         init=args.init,
         init_checkpoint=args.init_checkpoint,
+        v1_weights=args.v1_weights,
+        teacher=args.teacher,
+        distill={
+            key: value
+            for key, value in {
+                "temperature": args.distill_temperature,
+                "logit_weight": args.distill_logit_weight,
+                "feature_weight": args.distill_feature_weight,
+                "supervised_weight": args.distill_supervised_weight,
+            }.items()
+            if value is not None
+        },
         soft_negatives=args.soft_negatives,
         validation_split=args.validation_split,
         backup_every_steps=args.backup_every,
