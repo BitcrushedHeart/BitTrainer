@@ -416,6 +416,9 @@ def train_from_pack(
         return {"status": "failed", "reason": failure}
     if result.get("paused"):
         return {"status": "paused", "backup": result.get("backup_path")}
+    if torch.cuda.is_available():
+        # What the run needed at its peak, to size the batch for the next one.
+        result["peak_vram_mb"] = round(torch.cuda.max_memory_allocated() / 2**20)
     (out / "result.json").write_text(
         json.dumps(result, indent=1, default=_jsonable), encoding="utf-8"
     )

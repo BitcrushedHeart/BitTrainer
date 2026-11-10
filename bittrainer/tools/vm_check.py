@@ -1,0 +1,786 @@
+"""Check this round's work on the rented GPU, inside a time budget (Bitcrush ISSUE-1655).
+
+Nothing built for the Azure T4 has run on a GPU. This runs all of it there, in
+stages, on generated images, and writes down what passed and how fast it went::
+
+    python -m bittrainer.tools.vm_check --work /mnt/vmcheck
+    python -m bittrainer.tools.vm_check --work /mnt/vmcheck --list      # the plan
+    python -m bittrainer.tools.vm_check --work /mnt/vmcheck --pack /data/pack
+
+The checks that decide whether the real run can start come first: the GPU-only
+tests, a model learning in this card's precision, the real weight conversion,
+training / pausing / resuming from a pack, and distillation with a teacher wider
+than its student. Speed comparisons come last and are the first thing dropped
+when ``--budget-minutes`` (default 120) runs short. Estimates are for a T4.
+
+It is safe to stop and run again: a stage that passed is not repeated
+(``--redo`` repeats everything). Everything it writes goes under ``--work``:
+
+    report.json   every stage's result and numbers
+    summary.txt   the same, readable
+    logs/         each stage's full output
+    packs/ runs/  the generated packs and the training runs
+
+No real image is needed. ``--pack`` adds one stage that trains briefly on part of
+a real pack, for the speed that matters: real images and the real head count.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import random
+import re
+import shutil
+import subprocess
+import sys
+import time
+from dataclasses import asdict, dataclass, field
+from pathlib import Path
+from typing import Callable
+
+_TESTS = Path(__file__).resolve().parents[1] / "tests"
+_ROUND_TESTS = (
+    "test_backbone_amp.py",
+    "test_backbone_head_vectorised.py",
+    "test_backbone_proof.py",
+    "test_backbone_pack_train.py",
+    "test_backbone_distill.py",
+    "test_convnext_v1_init.py",
+    "test_vm_check.py",
+)
+_OTHER_TESTS = (
+    "test_backbone_generic.py",
+    "test_backbone_trainer.py",
+    "test_backbone_heads_task.py",
+    "test_backbone_resolution.py",
+    "test_backbone_augment_parity.py",
+    "test_backbone_calibration_export.py",
+    "test_backbone_sampling.py",
+    "test_backbone_selection_metrics.py",
+    "test_backbone_soft_negatives.py",
+    "test_backbone_init.py",
+    "test_backbone_hash.py",
+    "test_generic_trainer.py",
+)
+
+
+@dataclass
+class Result:
+    status: str  # passed | failed | skipped
+    numbers: dict = field(default_factory=dict)
+    note: str = ""
+    seconds: float = 0.0
+
+
+@dataclass(frozen=True)
+class Stage:
+    name: str
+    title: str
+    minutes: float  # estimate on a T4
+    run: Callable[["Context"], Result]
+    needs: tuple[str, ...] = ()
+    optional: bool = False  # a speed comparison: dropped first when time is short
+
+
+class Context:
+    """Where a run of the plan keeps its files, and how it tells the time."""
+
+    def __init__(
+        self,
+        work: Path,
+        *,
+        pack: Path | None = None,
+        clock: Callable[[], float] = time.monotonic,
+        python: str = sys.executable,
+    ) -> None:
+        self.work = Path(work)
+        self.pack = Path(pack) if pack else None
+        self.clock = clock
+        self.python = python
+        self.report: dict = {"stages": {}}
+
+
+def _log(message: str) -> None:
+    print(f"[check] {message}", flush=True)
+
+
+# --------------------------------------------------------------------------- #
+# Running the plan                                                            #
+# --------------------------------------------------------------------------- #
+
+
+def run_plan(
+    stages: list[Stage],
+    context: Context,
+    *,
+    budget_minutes: float,
+    only: set[str] | None = None,
+    skip: set[str] | None = None,
+    redo: bool = False,
+) -> dict:
+    """Run *stages* in order and return the report (also saved after each one).
+
+    A stage is skipped when something it needs did not pass, when it is a speed
+    comparison that no longer fits the budget, or when the budget is spent. A
+    stage that passed in an earlier run of the same ``--work`` is kept, not
+    repeated. A stage that raises is a failure of that stage, not of the plan.
+    """
+    context.work.mkdir(parents=True, exist_ok=True)
+    report_path = context.work / "report.json"
+    if report_path.is_file() and not redo:
+        context.report = json.loads(report_path.read_text(encoding="utf-8"))
+    results: dict = context.report.setdefault("stages", {})
+    started = context.clock()
+
+    def _save(name: str, result: Result) -> None:
+        results[name] = asdict(result)
+        report_path.write_text(json.dumps(context.report, indent=1), encoding="utf-8")
+
+    for stage in stages:
+        if (only and stage.name not in only) or (skip and stage.name in skip):
+            continue
+        if results.get(stage.name, {}).get("status") == "passed":
+            continue
+        used = (context.clock() - started) / 60
+        unmet = [n for n in stage.needs if results.get(n, {}).get("status") != "passed"]
+        if unmet:
+            _save(stage.name, Result("skipped", note=f"needs {', '.join(unmet)}"))
+        elif used >= budget_minutes:
+            _save(stage.name, Result("skipped", note="the time budget is spent"))
+        elif stage.optional and used + stage.minutes > budget_minutes:
+            _save(stage.name, Result("skipped", note="no longer fits the time budget"))
+        else:
+            _log(f"{stage.name}: {stage.title} (about {stage.minutes:g} min)")
+            began = context.clock()
+            try:
+                result = stage.run(context)
+            except Exception as exc:  # a stage's own failure, reported as one
+                result = Result("failed", note=f"{type(exc).__name__}: {exc}")
+            result.seconds = round(context.clock() - began, 1)
+            _save(stage.name, result)
+            _log(f"{stage.name}: {result.status} in {result.seconds:g}s {result.note}")
+    return context.report
+
+
+def summary_lines(stages: list[Stage], report: dict) -> list[str]:
+    """One readable line per stage: status, time, title, then its numbers."""
+    labels = {"passed": "passed ", "failed": "FAILED ", "skipped": "skipped"}
+    lines = []
+    for stage in stages:
+        result = report.get("stages", {}).get(stage.name)
+        if result is None:
+            lines.append(f"not run  {stage.name}: {stage.title}")
+            continue
+        line = f"{labels.get(result['status'], result['status'])}  {stage.name}: {stage.title}"
+        if result.get("seconds"):
+            line += f" [{result['seconds']:g}s]"
+        if result.get("note"):
+            line += f" ({result['note']})"
+        lines.append(line)
+        numbers = ", ".join(
+            f"{key}={value}" for key, value in result["numbers"].items()
+        )
+        if numbers:
+            lines.append(f"         {numbers}")
+    return lines
+
+
+# --------------------------------------------------------------------------- #
+# Reading what a stage produced                                               #
+# --------------------------------------------------------------------------- #
+
+
+def last_json(output: str) -> dict | None:
+    """The last pretty-printed JSON object in *output* (the proof tool's report)."""
+    lines = output.splitlines()
+    for end in range(len(lines) - 1, -1, -1):
+        if lines[end] != "}":
+            continue
+        for start in range(end, -1, -1):
+            if lines[start] == "{":
+                try:
+                    return json.loads("\n".join(lines[start : end + 1]))
+                except ValueError:
+                    break
+    return None
+
+
+def run_numbers(out: Path) -> dict:
+    """What a pack training run reported: speed, precision, epochs, resume."""
+    numbers: dict = {}
+    progress = Path(out) / "progress.jsonl"
+    if not progress.is_file():
+        return numbers
+    speeds = []
+    epochs = 0
+    for raw in progress.read_text(encoding="utf-8").splitlines():
+        try:
+            frame = json.loads(raw)
+        except ValueError:
+            continue
+        if frame.get("stage") == "preparing" and "amp_dtype" in frame:
+            numbers["precision"] = frame.get("amp_dtype")
+            numbers["grad_scaler"] = frame.get("grad_scaler")
+        elif frame.get("stage") == "training" and "loss" in frame:
+            epochs += 1
+            if frame.get("images_per_second"):
+                speeds.append(frame["images_per_second"])
+            if frame.get("loss_terms"):
+                numbers["loss_terms"] = frame["loss_terms"]
+        elif frame.get("type") == "autobatch":
+            numbers["auto_batch_size"] = frame.get("batch_size")
+        elif frame.get("type") == "training_resumed":
+            numbers["resumed"] = True
+    numbers["epochs"] = epochs
+    if speeds:
+        numbers["images_per_second"] = round(max(speeds), 1)
+    result = Path(out) / "result.json"
+    if result.is_file():
+        saved = json.loads(result.read_text(encoding="utf-8"))
+        for key in ("validation_score", "peak_vram_mb"):
+            if saved.get(key) is not None:
+                numbers[key] = saved[key]
+    return numbers
+
+
+# --------------------------------------------------------------------------- #
+# A pack of generated images                                                  #
+# --------------------------------------------------------------------------- #
+
+
+def write_synthetic_pack(
+    root: Path,
+    *,
+    images: int,
+    image_size: int,
+    extra_heads: int = 0,
+    labels_per_image: int = 30,
+    seed: int = 0,
+) -> Path:
+    """A format-1 pack drawn by the proof tool: two concepts and one group.
+
+    ``extra_heads`` adds that many more yes/no heads, each labelled on a sparse
+    random share of the images (about ``labels_per_image`` answers per image in
+    all) and each repeating one of the two real signals, so they can be learned.
+    That is the shape of a real pool: hundreds of heads, a few dozen answers per
+    image.
+    """
+    from bittrainer.tools.backbone_proof import make_fixture_dataset
+
+    root = Path(root)
+    drawn = root / "_drawn"
+    rng = random.Random(seed)
+    rate = min(1.0, labels_per_image / extra_heads) if extra_heads else 0.0
+    classes = {"side_by_side": "k1", "stacked": "k2", "centre_blob": "k3"}
+    lines = []
+    records = make_fixture_dataset(
+        drawn, count=images, image_size=image_size, seed=seed
+    )
+    for record in records:
+        digest = record["content_hash"]
+        target = root / "images" / digest[:2] / f"{digest}.jpg"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(record["file_paths"][0], target)
+        answers = {name: int(a == "positive") for name, a in record["binary"].items()}
+        binary = {
+            head: answers[name]
+            for head, name in (("c1", "striped"), ("c2", "ringed"))
+            if name in answers
+        }
+        for index in range(extra_heads):
+            signal = "striped" if index % 2 == 0 else "ringed"
+            if signal in answers and rng.random() < rate:
+                binary[f"c{101 + index}"] = answers[signal]
+        line: dict = {"h": digest}
+        if binary:
+            line["b"] = binary
+        if record["groups"]:
+            line["g"] = {"g1": classes[record["groups"]["layout"]]}
+        if len(line) > 1:
+            lines.append(json.dumps(line, separators=(",", ":")))
+    shutil.rmtree(drawn, ignore_errors=True)
+    lines.sort()
+    (root / "labels.jsonl").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    manifest = {"format": 1, "images": len(lines), "short_side": image_size}
+    (root / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+    return root
+
+
+# --------------------------------------------------------------------------- #
+# Running commands                                                            #
+# --------------------------------------------------------------------------- #
+
+
+def _command(
+    context: Context, name: str, argv: list[str], minutes: float
+) -> tuple[int, str]:
+    """Run *argv* to completion, its output into ``logs/<name>.log``."""
+    log = context.work / "logs" / f"{name}.log"
+    log.parent.mkdir(parents=True, exist_ok=True)
+    limit = max(300.0, minutes * 60 * 3)
+    with log.open("w", encoding="utf-8") as handle:
+        try:
+            done = subprocess.run(  # noqa: S603 - our own interpreter and modules
+                argv,
+                stdout=handle,
+                stderr=subprocess.STDOUT,
+                timeout=limit,
+                check=False,
+            )
+            code = done.returncode
+        except subprocess.TimeoutExpired:
+            code = -1
+    return code, log.read_text(encoding="utf-8", errors="replace")
+
+
+def _module(context: Context, module: str, *args: str) -> list[str]:
+    return [context.python, "-m", module, *args]
+
+
+def _fresh_run_folder(context: Context, name: str) -> Path:
+    out = context.work / "runs" / name
+    shutil.rmtree(out, ignore_errors=True)
+    return out
+
+
+def _train(
+    context: Context, name: str, pack: Path, args: list[str], minutes: float
+) -> tuple[Result, Path]:
+    """One ``backbone_pack_train`` run into a fresh folder under ``runs/``."""
+    out = _fresh_run_folder(context, name)
+    argv = _module(
+        context,
+        "bittrainer.tools.backbone_pack_train",
+        "--pack", str(pack), "--out", str(out), *args,
+    )  # fmt: skip
+    code, _output = _command(context, name, argv, minutes)
+    numbers = run_numbers(out)
+    if code != 0:
+        return Result("failed", numbers, f"exit {code}; see logs/{name}.log"), out
+    return Result("passed", numbers), out
+
+
+def pause_then_resume(
+    context: Context,
+    name: str,
+    argv: list[str],
+    out: Path,
+    *,
+    poll_seconds: float = 1.0,
+    limit_seconds: float = 1500.0,
+) -> Result:
+    """Start a run, pause it through its ``PAUSE`` file once it is training,
+    then run the same command again and expect it to resume and finish."""
+    out = Path(out)
+    log = context.work / "logs" / f"{name}.log"
+    log.parent.mkdir(parents=True, exist_ok=True)
+    progress = out / "progress.jsonl"
+    with log.open("w", encoding="utf-8") as handle:
+        process = subprocess.Popen(argv, stdout=handle, stderr=subprocess.STDOUT)  # noqa: S603
+        deadline = time.monotonic() + limit_seconds
+        asked = False
+        while process.poll() is None and time.monotonic() < deadline:
+            if (
+                not asked
+                and progress.is_file()
+                and "training_step"
+                in progress.read_text(encoding="utf-8", errors="replace")
+            ):
+                (out / "PAUSE").touch()
+                asked = True
+            time.sleep(poll_seconds)
+        if process.poll() is None:
+            process.kill()
+            process.wait()
+            return Result("failed", note="the run did not stop within its time limit")
+        if process.returncode != 3:
+            return Result(
+                "failed",
+                run_numbers(out),
+                f"expected the paused run to exit 3, got exit {process.returncode}",
+            )
+        handle.write("\n--- resuming ---\n")
+        handle.flush()
+        try:
+            again = subprocess.run(  # noqa: S603
+                argv,
+                stdout=handle,
+                stderr=subprocess.STDOUT,
+                timeout=limit_seconds,
+                check=False,
+            )
+        except subprocess.TimeoutExpired:
+            return Result("failed", note="the resumed run did not finish in time")
+    numbers = run_numbers(out)
+    if again.returncode != 0:
+        return Result(
+            "failed", numbers, f"the resumed run ended with exit {again.returncode}"
+        )
+    if not numbers.get("resumed"):
+        return Result(
+            "failed", numbers, "the second run started over instead of resuming"
+        )
+    return Result("passed", numbers)
+
+
+# --------------------------------------------------------------------------- #
+# The stages                                                                  #
+# --------------------------------------------------------------------------- #
+
+_BASE = ["--size", "base", "--init", "apache", "--batch-size", "64", "--workers", "4"]
+_NANO = ["--size", "nano", "--init", "apache", "--batch-size", "64", "--workers", "4"]
+
+
+def _small_pack(context: Context) -> Path:
+    return context.work / "packs" / "small"
+
+
+def _teacher_file(context: Context) -> str:
+    return str(context.work / "runs" / "teacher" / "backbone_candidate.safetensors")
+
+
+def _env(context: Context) -> Result:
+    import torch
+
+    from bittrainer.amp import native_bf16
+
+    if not torch.cuda.is_available():
+        return Result("failed", note="torch sees no CUDA device")
+    card = torch.cuda.get_device_properties(0)
+    return Result(
+        "passed",
+        {
+            "gpu": card.name,
+            "capability": f"{card.major}.{card.minor}",
+            "vram_gb": round(card.total_memory / 2**30, 1),
+            "torch": torch.__version__,
+            "precision": "bfloat16" if native_bf16(torch.device("cuda")) else "float16",
+        },
+    )
+
+
+def _pytest(context: Context, name: str, files, minutes: float, *extra: str):
+    argv = _module(
+        context,
+        "pytest",
+        *[str(_TESTS / f) for f in files],
+        "-q",
+        "-p",
+        "no:cacheprovider",
+        *extra,
+    )
+    code, output = _command(context, name, argv, minutes)
+    tail = next(
+        (line for line in reversed(output.splitlines()) if " passed" in line), ""
+    )
+    return code, output, {"result": tail.strip(" =")}
+
+
+def _gpu_tests(context: Context) -> Result:
+    code, output, numbers = _pytest(
+        context, "gpu_tests", ["test_backbone_amp.py"], 1.5,
+        "-k", "real_gpu or matches_the_card",
+    )  # fmt: skip
+    if code != 0 or "2 passed" not in output:
+        return Result("failed", numbers, "both GPU tests must run and pass (not skip)")
+    return Result("passed", numbers)
+
+
+def _round_tests(context: Context) -> Result:
+    code, _output, numbers = _pytest(context, "round_tests", _ROUND_TESTS, 9)
+    return Result("passed" if code == 0 else "failed", numbers)
+
+
+def _other_tests(context: Context) -> Result:
+    code, _output, numbers = _pytest(context, "other_tests", _OTHER_TESTS, 7)
+    return Result("passed" if code == 0 else "failed", numbers)
+
+
+def _proof(context: Context, name: str, minutes: float, *args: str) -> Result:
+    argv = _module(
+        context, "bittrainer.tools.backbone_proof", "--device", "cuda", *args
+    )
+    code, output = _command(context, name, argv, minutes)
+    report = last_json(output) or {}
+    numbers = {
+        "images_per_second": round(report.get("best_images_per_second") or 0.0, 1),
+        "precision": report.get("amp_dtype"),
+        "grad_scaler": report.get("grad_scaler"),
+        "peak_vram_mb": report.get("peak_vram_mb"),
+    }
+    if "weakest_family_f1" in report and report.get("min_score") is not None:
+        numbers["weakest_family_f1"] = round(report["weakest_family_f1"] or 0.0, 3)
+    if code != 0 or not report.get("passed"):
+        return Result("failed", numbers, f"exit {code}; see logs/{name}.log")
+    return Result("passed", numbers)
+
+
+def _learn_fp16(context: Context) -> Result:
+    # The proof's own defaults, with its learning floor on: both head families
+    # must learn in whatever precision this card trains in.
+    return _proof(context, "learn_fp16", 2)
+
+
+def _speed(name: str, *args: str) -> Callable[[Context], Result]:
+    def _run(context: Context) -> Result:
+        return _proof(
+            context, name, 5,
+            "--images", "4000", "--epochs", "3", "--workers", "4", "--min-score", "-1", *args,
+        )  # fmt: skip
+
+    return _run
+
+
+def _convert(*sizes: str) -> Callable[[Context], Result]:
+    def _run(context: Context) -> Result:
+        numbers = {}
+        for size in sizes:
+            target = context.work / "trunks" / f"{size}.safetensors"
+            argv = _module(
+                context, "bittrainer.tools.convnext_v1_trunk",
+                "--size", size, "--out", str(target),
+            )  # fmt: skip
+            code, output = _command(context, f"convert_{size}", argv, 2)
+            found = re.search(r"features match to ([0-9.e+-]+)", output)
+            numbers[f"{size}_difference"] = (
+                found.group(1).rstrip(".") if found else None
+            )
+            if code != 0:
+                return Result("failed", numbers, f"{size}: exit {code}")
+        return Result("passed", numbers)
+
+    return _run
+
+
+def _synth_packs(context: Context) -> Result:
+    small = _small_pack(context)
+    many = context.work / "packs" / "many_heads"
+    for pack, extra in ((small, 0), (many, 900)):
+        if not (pack / "manifest.json").is_file():
+            shutil.rmtree(pack, ignore_errors=True)
+            write_synthetic_pack(pack, images=4000, image_size=256, extra_heads=extra)
+    return Result("passed", {"images": 4000, "many_heads": 902})
+
+
+def _teacher(context: Context) -> Result:
+    result, _out = _train(
+        context, "teacher", _small_pack(context),
+        [*_BASE, "--epochs", "2", "--progress-every", "20"], 5,
+    )  # fmt: skip
+    return result
+
+
+def _pause_resume(context: Context) -> Result:
+    out = _fresh_run_folder(context, "pause_resume")
+    argv = _module(
+        context, "bittrainer.tools.backbone_pack_train",
+        "--pack", str(_small_pack(context)), "--out", str(out),
+        *_BASE, "--epochs", "3", "--progress-every", "5",
+    )  # fmt: skip
+    return pause_then_resume(context, "pause_resume", argv, out)
+
+
+def _tail(context: Context) -> Result:
+    result, out = _train(
+        context, "tail", _small_pack(context),
+        ["--size", "tiny", "--init", "apache", "--batch-size", "32", "--workers", "4",
+         "--limit", "1000", "--epochs", "2",
+         "--finetune-image-size", "384", "--finetune-epochs", "1"], 3,
+    )  # fmt: skip
+    progress = out / "progress.jsonl"
+    switched = progress.is_file() and "finetune_image_size" in progress.read_text(
+        "utf-8"
+    )
+    if result.status == "passed" and not switched:
+        return Result(
+            "failed", result.numbers, "the run never switched to the tail size"
+        )
+    return result
+
+
+def _distill(context: Context) -> Result:
+    result, out = _train(
+        context, "distill", _small_pack(context),
+        [*_NANO, "--teacher", _teacher_file(context), "--epochs", "2"], 4,
+    )  # fmt: skip
+    if result.status != "passed":
+        return result
+    from safetensors import safe_open
+
+    with safe_open(
+        str(out / "backbone_candidate.safetensors"), framework="pt"
+    ) as handle:
+        metadata = handle.metadata() or {}
+    if "distilled_from" not in metadata:
+        return Result(
+            "failed", result.numbers, "the candidate does not say it was distilled"
+        )
+    if not result.numbers.get("loss_terms"):
+        return Result("failed", result.numbers, "no distillation terms were reported")
+    return result
+
+
+def _distill_pause_resume(context: Context) -> Result:
+    out = _fresh_run_folder(context, "distill_pause_resume")
+    argv = _module(
+        context, "bittrainer.tools.backbone_pack_train",
+        "--pack", str(_small_pack(context)), "--out", str(out),
+        *_NANO, "--teacher", _teacher_file(context), "--epochs", "3", "--progress-every", "5",
+    )  # fmt: skip
+    return pause_then_resume(context, "distill_pause_resume", argv, out)
+
+
+def _distill_channels_last(context: Context) -> Result:
+    result, _out = _train(
+        context, "distill_channels_last", _small_pack(context),
+        [*_NANO, "--teacher", _teacher_file(context), "--channels-last",
+         "--epochs", "2", "--max-steps", "60"], 2,
+    )  # fmt: skip
+    return result
+
+
+def _soft_negatives(context: Context) -> Result:
+    result, _out = _train(
+        context, "soft_negatives", _small_pack(context),
+        [*_NANO, "--soft-negatives", "--epochs", "2", "--max-steps", "100"], 2,
+    )  # fmt: skip
+    return result
+
+
+def _auto_batch(context: Context) -> Result:
+    # Alone, then with a teacher loaded: the probe sizes the batch on the student
+    # only, so the second run is where running out of memory would show.
+    numbers = {}
+    runs = (
+        ("auto_batch_base", ["--size", "base", "--init", "apache", "--workers", "4"]),
+        (
+            "auto_batch_distill",
+            [*_NANO[:4], "--workers", "4", "--teacher", _teacher_file(context)],
+        ),
+    )
+    for name, args in runs:
+        result, _out = _train(
+            context, name, _small_pack(context),
+            [*args, "--batch-size", "auto", "--epochs", "1", "--max-steps", "30"], 2.5,
+        )  # fmt: skip
+        numbers[name] = result.numbers.get("auto_batch_size")
+        numbers[f"{name}_vram_mb"] = result.numbers.get("peak_vram_mb")
+        if result.status != "passed":
+            return Result("failed", numbers, f"{name}: {result.note}")
+    return Result("passed", numbers)
+
+
+def _many_heads(context: Context) -> Result:
+    result, _out = _train(
+        context, "many_heads", context.work / "packs" / "many_heads",
+        [*_BASE, "--epochs", "3", "--max-steps", "150"], 5,
+    )  # fmt: skip
+    plain = context.report["stages"].get("teacher", {}).get("numbers", {})
+    speed, baseline = (
+        result.numbers.get("images_per_second"),
+        plain.get("images_per_second"),
+    )
+    if speed and baseline:
+        result.numbers["speed_against_three_heads"] = round(speed / baseline, 2)
+    return result
+
+
+def _real_pack(context: Context) -> Result:
+    if context.pack is None:
+        return Result("skipped", note="no --pack was given")
+    result, _out = _train(
+        context,
+        "real_pack",
+        context.pack,
+        [*_BASE, "--limit", "5000", "--epochs", "1"],
+        6,
+    )
+    return result
+
+
+_AT_224 = ("--image-size", "224", "--batch-size", "64")
+
+STAGES: list[Stage] = [
+    Stage("env", "the GPU, its driver and the precision it trains in", 0.2, _env),
+    Stage("gpu_tests", "the two GPU-only tests: fp16 scaler, precision by card", 1.5, _gpu_tests, ("env",)),
+    Stage("round_tests", "this round's test files on this machine", 9, _round_tests),
+    Stage("learn_fp16", "a model learns in this card's precision", 2, _learn_fp16, ("env",)),
+    Stage("convert_base", "real Apache V1 weights convert into a Base trunk", 2, _convert("base")),
+    Stage("convert_small", "the same for the student sizes", 2, _convert("nano", "atto")),
+    Stage("synth_packs", "generate the packs the next stages train from", 2, _synth_packs),
+    Stage("teacher", "train a Base teacher from a pack, Apache start", 5, _teacher, ("env", "synth_packs")),
+    Stage("pause_resume", "pause a Base run with its PAUSE file, then resume it", 6, _pause_resume, ("env", "synth_packs")),
+    Stage("tail", "switch to the 384px tail part-way through a run", 3, _tail, ("env", "synth_packs")),
+    Stage("distill", "distil the Base teacher into a nano", 4, _distill, ("teacher",)),
+    Stage("distill_pause_resume", "pause and resume a distillation", 5, _distill_pause_resume, ("teacher",)),
+    Stage("distill_channels_last", "distil with channels-last memory", 2, _distill_channels_last, ("teacher",)),
+    Stage("soft_negatives", "train with unlabelled images as a soft no", 2, _soft_negatives, ("env", "synth_packs")),
+    Stage("auto_batch", "automatic batch size, alone and with a teacher loaded", 5, _auto_batch, ("teacher",)),
+    Stage("many_heads", "Base with 900 sparse heads: what the head count costs", 5, _many_heads, ("teacher",)),
+    # Speed comparisons and extras: dropped first when the budget runs short.
+    Stage("other_tests", "the older backbone tests on this machine", 7, _other_tests, optional=True),
+    Stage("speed_atto", "speed: atto at 224px", 2, _speed("speed_atto", "--size", "atto", *_AT_224), ("env",), True),
+    Stage("speed_nano", "speed: nano at 224px", 2, _speed("speed_nano", "--size", "nano", *_AT_224), ("env",), True),
+    Stage("speed_tiny", "speed: tiny at 224px", 3, _speed("speed_tiny", "--size", "tiny", *_AT_224), ("env",), True),
+    Stage("speed_base", "speed: base at 224px", 4, _speed("speed_base", "--size", "base", *_AT_224), ("env",), True),
+    Stage("speed_base_384", "speed: base at 384px", 5, _speed("speed_base_384", "--size", "base", "--image-size", "384", "--batch-size", "32"), ("env",), True),
+    Stage("speed_base_channels_last", "speed: base, channels-last", 4, _speed("speed_base_channels_last", "--size", "base", *_AT_224, "--channels-last"), ("env",), True),
+    Stage("speed_base_batch128", "speed: base, batch 128", 4, _speed("speed_base_batch128", "--size", "base", "--image-size", "224", "--batch-size", "128"), ("env",), True),
+    Stage("speed_base_one_loader", "speed: base, images loaded on the training thread", 6, _speed("speed_base_one_loader", "--size", "base", *_AT_224, "--workers", "0"), ("env",), True),
+    Stage("real_pack", "a short run on part of a real pack (needs --pack)", 6, _real_pack, ("env",), True),
+]  # fmt: skip
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        prog="python -m bittrainer.tools.vm_check",
+        description="Check this round's work on the rented GPU, inside a time budget.",
+    )
+    parser.add_argument("--work", required=True, help="folder for everything it writes")
+    parser.add_argument("--budget-minutes", type=float, default=120)
+    parser.add_argument(
+        "--pack", default=None, help="a real pack, for the real_pack stage"
+    )
+    parser.add_argument("--only", default="", help="comma-separated stage names to run")
+    parser.add_argument(
+        "--skip", default="", help="comma-separated stage names to leave out"
+    )
+    parser.add_argument(
+        "--redo", action="store_true", help="repeat stages that already passed"
+    )
+    parser.add_argument("--list", action="store_true", help="print the plan and exit")
+    args = parser.parse_args(argv)
+
+    if args.list:
+        for stage in STAGES:
+            kind = "extra" if stage.optional else "must "
+            print(f"{kind} {stage.minutes:>4g} min  {stage.name}: {stage.title}")
+        must = sum(stage.minutes for stage in STAGES if not stage.optional)
+        print(
+            f"must: about {must:g} min; everything: about {sum(s.minutes for s in STAGES):g} min"
+        )
+        return 0
+
+    context = Context(Path(args.work), pack=Path(args.pack) if args.pack else None)
+    report = run_plan(
+        STAGES,
+        context,
+        budget_minutes=args.budget_minutes,
+        only={name for name in args.only.split(",") if name} or None,
+        skip={name for name in args.skip.split(",") if name} or None,
+        redo=args.redo,
+    )
+    lines = summary_lines(STAGES, report)
+    (context.work / "summary.txt").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    print("\n".join(lines))
+    failed = [
+        name
+        for name, result in report["stages"].items()
+        if result["status"] == "failed"
+    ]
+    return 1 if failed else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
