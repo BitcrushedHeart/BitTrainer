@@ -212,19 +212,21 @@ def report_lines(summary: dict) -> list[str]:
         if summary["image_size"]:
             where += f" ({summary['image_size']}px, batch {summary['batch_size']})"
     since = summary["seconds_since_progress"]
+    # A run stopped before its first report has no position to name.
+    at = where or "before its first report"
     head = {
         "running": f"running: {where or 'starting, nothing reported yet'}",
         "silent": (
-            f"running, but no progress for {_duration(since or 0)}: {where}. "
+            f"running, but no progress for {_duration(since or 0)}: {at}. "
             "Look at the machine."
         ),
         "stopped": (
-            f"no longer running and it did not say why (its process is gone): {where}. "
+            f"no longer running and it did not say why (its process is gone): {at}. "
             "The same command resumes it from its last backup."
         ),
-        "paused": f"paused: {where}. The same command resumes it.",
-        "finished": f"finished: {where}",
-        "failed": f"failed: {summary['reason'] or 'see error.txt'} ({where})",
+        "paused": f"paused: {at}. The same command resumes it.",
+        "finished": f"finished: {at}",
+        "failed": f"failed: {summary['reason'] or 'see error.txt'} ({at})",
         "refused": f"refused before training: {summary['reason'] or 'no reason recorded'}",
     }.get(state, "no status file here: not a run folder, or a run from an older runner")
     lines = [head]
