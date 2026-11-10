@@ -49,10 +49,17 @@ def read_manifest(pack: Path) -> dict:
     return manifest
 
 
-def pack_geometry_sensitive(pack: Path) -> list[str]:
-    """The manifest's ``geometry_sensitive`` ids, for the training request;
-    empty if the pack names none."""
-    names = read_manifest(pack).get("geometry_sensitive") or []
+def pack_geometry_sensitive(pack: Path) -> list[str] | None:
+    """The manifest's ``geometry_sensitive`` ids, for the training request.
+
+    ``None`` when the manifest has no such key (a pack written before the export
+    knew about it). That is not the same as an empty list: an empty list says
+    the export looked and found none, and only then may a run say its
+    augmentation was geometry-safe."""
+    manifest = read_manifest(pack)
+    if "geometry_sensitive" not in manifest:
+        return None
+    names = manifest["geometry_sensitive"] or []
     if not isinstance(names, list):
         raise PackError(f"geometry_sensitive in the manifest of {pack} is not a list")
     return [str(name) for name in names]

@@ -233,8 +233,11 @@ def test_a_resumed_run_still_writes_the_winning_epochs_scores(tmp_path, monkeypa
     selections = [0.9, 0.1]
     real_metrics = bb._backbone_metrics
 
-    def _metrics(binary, groups):
-        return {**real_metrics(binary, groups), "selection": selections.pop(0)}
+    def _metrics(binary, groups, **kwargs):
+        return {
+            **real_metrics(binary, groups, **kwargs),
+            "selection": selections.pop(0),
+        }
 
     monkeypatch.setattr(bb, "_backbone_metrics", _metrics)
     request = _request(tmp_path, config={"backup_dir": str(tmp_path / "backups")})
@@ -313,3 +316,61 @@ def test_head_only_retraining_keeps_its_metadata_as_it_was(tmp_path):
     (epoch,) = frames
     assert epoch["skipped_steps"] == 0 and epoch["grad_scale"] is None
     assert epoch["batch_size"] == 256 and epoch["image_size"] == 48
+
+
+# -- what a reader needs to judge each head ------------------------------------
+
+
+def _run_metadata(request):
+    result = asyncio.run(run_backbone_training(request))
+    return _metadata(Path(result["candidate_checkpoint_path"]))
+
+
+def test_the_candidate_reports_every_head_from_the_winning_epoch(tmp_path):
+    metadata = _run_metadata(_request(tmp_path, config={"validation_split": 0.5}))
+    val_images = json.loads(metadata["training_actual_json"])["val_images"]
+
+    report = json.loads(metadata["binary_reports_json"])["watermark"]
+    assert report["yes"] + report["no"] == val_images
+    assert report["threshold"] == 0.5
+    # A handful of validation labels is too few to tune a threshold on: the head
+    # keeps 0.5 and the candidate says it was not tuned.
+    assert json.loads(metadata["binary_thresholds_tuned_json"]) == {"watermark": False}
+    assert json.loads(metadata["binary_thresholds_json"]) == {"watermark": 0.5}
+
+    group = json.loads(metadata["group_reports_json"])["shot_type"]
+    assert sorted(group["classes"]) == ["closeup", "wide"]
+    assert np.asarray(group["confusion"]).shape == (2, 2)
+    assert (
+        int(np.asarray(group["confusion"]).sum()) == sum(group["support"]) == val_images
+    )
+    assert set(json.loads(metadata["group_temperatures_json"])) == {"shot_type"}
+
+
+def test_how_many_validation_labels_a_threshold_needs_is_a_setting(tmp_path):
+    metadata = _run_metadata(
+        _request(
+            tmp_path, config={"validation_split": 0.5, "calibration_min_labels": 1}
+        )
+    )
+
+    assert json.loads(metadata["binary_thresholds_tuned_json"]) == {"watermark": True}
+
+
+@pytest.mark.parametrize(
+    ("listed", "hflip", "expected"),
+    [
+        (None, False, "false"),  # nobody said which heads are geometry-sensitive
+        ([], False, "true"),  # looked, none
+        (["shot_type"], False, "true"),
+        ([], True, "false"),  # mirroring turned back on
+    ],
+)
+def test_the_candidate_says_whether_geometry_was_protected(
+    tmp_path, listed, hflip, expected
+):
+    request = _request(tmp_path, config={"epochs": 1, "hflip": hflip})
+    if listed is not None:
+        request["geometry_sensitive"] = listed
+
+    assert _run_metadata(request)["geometry_safe_augmentation"] == expected

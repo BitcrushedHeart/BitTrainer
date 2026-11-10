@@ -212,7 +212,7 @@ def build_request(
         "license_provenance": "locally_trained",
     }
     geometry_sensitive = pack_geometry_sensitive(pack)
-    if geometry_sensitive:
+    if geometry_sensitive is not None:  # an empty list still says "looked, none"
         request["geometry_sensitive"] = geometry_sensitive
     if init_checkpoint:
         request["backbone_init"] = {

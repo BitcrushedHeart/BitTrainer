@@ -322,6 +322,10 @@ class BackboneTask(TrainingTask):
         # opt-in (a second-order win that adds a consumer-side contract).
         self.calibrate_thresholds = bool(c.get("calibrate_thresholds", True))
         self.calibrate_temperature = bool(c.get("calibrate_temperature", False))
+        # A head's threshold is tuned only when validation has at least this many
+        # yes AND this many no answers for it; below that it keeps 0.5 and the
+        # candidate says so. One validation yes used to be enough.
+        self.calibration_min_labels = int(c.get("calibration_min_labels", 10))
         # Raw val logits of the winning epoch (populated by validate/save_candidate)
         # so calibration fits on the exported epoch, not the last one.
         self._val_score_sink: dict = {}
@@ -330,6 +334,9 @@ class BackboneTask(TrainingTask):
         # Sampling layer (Bitcrush ISSUE-0545/0546) — see bb._plan_epoch_samples.
         self.neg_pos_ratio = float(c.get("neg_pos_ratio", 5.0))
         self.label_policy = dict(c.get("label_policy") or {})
+        # The epoch the current plan was drawn for; _plan_epoch keeps it up to
+        # date. Set here because the preflight runs a step before any plan.
+        self._planned_epoch = 0
         self.use_pos_weight = bool(c.get("use_pos_weight", True))
         raw_positive_cap = c.get("max_positives_per_class")
         self.positive_cap = 1000 if raw_positive_cap is None else int(raw_positive_cap)
@@ -1422,20 +1429,46 @@ class BackboneTask(TrainingTask):
             metadata["training_actual_json"] = self._training_actual()
             if self._val_scores_file:
                 metadata["val_scores_file"] = self._val_scores_file
+            # True only for a run that mirrored nothing AND was told which heads
+            # are geometry-sensitive (an empty list counts: someone looked).
+            # Engine does not use a direction, roll or position head without it.
+            metadata["geometry_safe_augmentation"] = (
+                not self._aug.get("hflip")
+                and self.request.get("geometry_sensitive") is not None
+            )
         # Per-head calibration fitted on the WINNING epoch's val logits (A2). Keys
         # are absent (additive) unless enabled and val scores were captured, so a
         # consumer decoding ``sigmoid(logit / T) >= threshold`` keeps working with
         # T=1 / threshold=0.5 defaults. Head-only retraining opts out this round.
         scores = self._best_val_scores if self._calibration_enabled else None
         binary_scores = (scores or {}).get("binary") or {}
+        group_scores = (scores or {}).get("groups") or {}
         if binary_scores:
+            thresholds = None
             if self.calibrate_thresholds:
-                metadata["binary_thresholds_json"] = bb._tune_binary_thresholds(
-                    binary_scores
+                thresholds, tuned = bb._binary_threshold_tuning(
+                    binary_scores,
+                    min_positive=self.calibration_min_labels,
+                    min_negative=self.calibration_min_labels,
                 )
+                metadata["binary_thresholds_json"] = thresholds
+                metadata["binary_thresholds_tuned_json"] = tuned
             if self.calibrate_temperature:
                 metadata["binary_temperatures_json"] = {
                     concept: bb._fit_binary_temperature(logits, targets)
                     for concept, (logits, targets) in binary_scores.items()
                 }
+            # What a reader needs to judge each head: its validation counts, and
+            # precision and recall at the threshold it would be used with.
+            metadata["binary_reports_json"] = bb._binary_validation_report(
+                binary_scores, thresholds
+            )
+        if group_scores:
+            metadata["group_reports_json"] = bb._group_validation_report(
+                group_scores, self.vocab.groups
+            )
+            metadata["group_temperatures_json"] = {
+                group: bb._fit_group_temperature(logits, targets)
+                for group, (logits, targets) in group_scores.items()
+            }
         return metadata

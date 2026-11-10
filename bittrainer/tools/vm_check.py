@@ -55,6 +55,9 @@ _ROUND_TESTS = (
     "test_backbone_skipped_steps.py",
     "test_backbone_auto_batch.py",
     "test_backbone_run_record.py",
+    "test_backbone_label_policy.py",
+    "test_backbone_geometry.py",
+    "test_backbone_validation_report.py",
 )
 # The files with tests that only run on a GPU (named ..._real_gpu, or the one
 # that checks the precision matches the card).
@@ -287,8 +290,12 @@ def write_synthetic_pack(
     extra_heads: int = 0,
     labels_per_image: int = 30,
     seed: int = 0,
+    geometry_sensitive: bool = False,
 ) -> Path:
     """A format-1 pack drawn by the proof tool: two concepts and one group.
+
+    ``geometry_sensitive`` lists the group in the manifest, so every image with
+    a group label trains with colour-only augmentation.
 
     ``extra_heads`` adds that many more yes/no heads, each labelled on a sparse
     random share of the images (about ``labels_per_image`` answers per image in
@@ -332,7 +339,14 @@ def write_synthetic_pack(
     shutil.rmtree(drawn, ignore_errors=True)
     lines.sort()
     (root / "labels.jsonl").write_text("\n".join(lines) + "\n", encoding="utf-8")
-    manifest = {"format": 1, "images": len(lines), "short_side": image_size}
+    # The group here is a layout (side by side, stacked, centre blob): position
+    # is its answer, so it is the kind of head the export marks.
+    manifest = {
+        "format": 1,
+        "images": len(lines),
+        "short_side": image_size,
+        "geometry_sensitive": ["g1"] if geometry_sensitive else [],
+    }
     (root / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
     return root
 
@@ -595,7 +609,54 @@ def _synth_packs(context: Context) -> Result:
         if not (pack / "manifest.json").is_file():
             shutil.rmtree(pack, ignore_errors=True)
             write_synthetic_pack(pack, images=4000, image_size=256, extra_heads=extra)
-    return Result("passed", {"images": 4000, "many_heads": 902})
+    geometry = context.work / "packs" / "geometry"
+    if not (geometry / "manifest.json").is_file():
+        shutil.rmtree(geometry, ignore_errors=True)
+        write_synthetic_pack(
+            geometry, images=1500, image_size=256, geometry_sensitive=True
+        )
+    return Result("passed", {"images": 4000, "many_heads": 902, "geometry": 1500})
+
+
+def _candidate_flag(out: Path, key: str) -> str | None:
+    from safetensors import safe_open
+
+    with safe_open(
+        str(out / "backbone_candidate.safetensors"), framework="pt"
+    ) as handle:
+        return (handle.metadata() or {}).get(key)
+
+
+def _geometry(context: Context) -> Result:
+    # Every image here carries a label for a listed head, so every image takes
+    # the colour-only path; the candidate must say geometry was protected.
+    result, out = _train(
+        context, "geometry", context.work / "packs" / "geometry",
+        [*_NANO, "--epochs", "2", "--max-steps", "60"], 2,
+    )  # fmt: skip
+    if result.status == "passed":
+        flag = _candidate_flag(out, "geometry_safe_augmentation")
+        result.numbers["geometry_safe_augmentation"] = flag
+        if flag != "true":
+            return Result(
+                "failed",
+                result.numbers,
+                "the candidate does not say geometry was protected",
+            )
+    return result
+
+
+def _unlabelled_option(name: str, *flags: str) -> Callable[[Context], Result]:
+    """One of the research's options for unlabelled images, on the small pack."""
+
+    def _run(context: Context) -> Result:
+        result, _out = _train(
+            context, name, _small_pack(context),
+            [*_NANO, *flags, "--epochs", "3", "--max-steps", "150"], 2.5,
+        )  # fmt: skip
+        return result
+
+    return _run
 
 
 def _teacher(context: Context) -> Result:
@@ -794,33 +855,37 @@ def _real_pack(context: Context) -> Result:
 _AT_224 = ("--image-size", "224", "--batch-size", "64")
 
 STAGES: list[Stage] = [
-    Stage("env", "the GPU, its driver and the precision it trains in", 0.2, _env),
-    Stage("gpu_tests", "the GPU-only tests: fp16 scaler, precision by card, preflight, skipped steps", 2, _gpu_tests, ("env",)),
-    Stage("round_tests", "this round's test files on this machine", 11, _round_tests),
-    Stage("learn_fp16", "a model learns in this card's precision", 2, _learn_fp16, ("env",)),
-    Stage("convert_base", "real Apache V1 weights convert into a Base trunk", 2, _convert("base")),
-    Stage("convert_small", "the same for the student sizes", 2, _convert("nano", "atto")),
-    Stage("synth_packs", "generate the packs the next stages train from", 2, _synth_packs),
-    Stage("teacher", "train a Base teacher from a pack, Apache start", 5, _teacher, ("env", "synth_packs")),
-    Stage("pause_resume", "pause a Base run with its PAUSE file, then resume it", 6, _pause_resume, ("env", "synth_packs")),
-    Stage("tail", "Base at 224px and batch 64, then the 384px tail at batch 16", 3, _tail, ("env", "synth_packs")),
-    Stage("preflight_refuses", "a 384px tail at batch 64 is refused before anything trains", 1.5, _preflight_refuses, ("env", "synth_packs")),
-    Stage("distill", "distil the Base teacher into a nano", 4, _distill, ("teacher",)),
-    Stage("distill_pause_resume", "pause and resume a distillation", 5, _distill_pause_resume, ("teacher",)),
-    Stage("distill_channels_last", "distil with channels-last memory", 2, _distill_channels_last, ("teacher",)),
-    Stage("soft_negatives", "train with unlabelled images as a soft no", 2, _soft_negatives, ("env", "synth_packs")),
-    Stage("auto_batch", "automatic batch size: Base with its tail, then with a teacher loaded", 5, _auto_batch, ("teacher",)),
-    Stage("many_heads", "Base with 900 sparse heads: what the head count costs", 5, _many_heads, ("teacher",)),
+    Stage("env", "the GPU, its driver and the precision it trains in", 0.1, _env),
+    Stage("gpu_tests", "the GPU-only tests: fp16 scaler, precision by card, preflight, skipped steps", 0.5, _gpu_tests, ("env",)),
+    Stage("round_tests", "this round's test files on this machine", 3, _round_tests),
+    Stage("learn_fp16", "a model learns in this card's precision", 1, _learn_fp16, ("env",)),
+    Stage("convert_base", "real Apache V1 weights convert into a Base trunk", 0.5, _convert("base")),
+    Stage("convert_small", "the same for the student sizes", 0.5, _convert("nano", "atto")),
+    Stage("synth_packs", "generate the packs the next stages train from", 0.5, _synth_packs),
+    Stage("teacher", "train a Base teacher from a pack, Apache start", 3, _teacher, ("env", "synth_packs")),
+    Stage("pause_resume", "pause a Base run with its PAUSE file, then resume it", 5, _pause_resume, ("env", "synth_packs")),
+    Stage("tail", "Base at 224px and batch 64, then the 384px tail at batch 16", 5, _tail, ("env", "synth_packs")),
+    Stage("preflight_refuses", "a 384px tail at batch 64 is refused before anything trains", 1, _preflight_refuses, ("env", "synth_packs")),
+    Stage("distill", "distil the Base teacher into a nano", 2, _distill, ("teacher",)),
+    Stage("distill_pause_resume", "pause and resume a distillation", 3.5, _distill_pause_resume, ("teacher",)),
+    Stage("distill_channels_last", "distil with channels-last memory", 1.5, _distill_channels_last, ("teacher",)),
+    Stage("soft_negatives", "train with unlabelled images as a soft no", 1.5, _soft_negatives, ("env", "synth_packs")),
+    Stage("reject_negatives", "soft negatives, skipping the unlabelled pairs the model scores highest", 2, _unlabelled_option("reject_negatives", "--soft-negatives", "--reject-rate", "0.02"), ("env", "synth_packs")),
+    Stage("hill_negatives", "the Hill term for unlabelled images", 2, _unlabelled_option("hill_negatives", "--hill-negatives"), ("env", "synth_packs")),
+    Stage("mask_common", "soft negatives, but none for common concepts", 2, _unlabelled_option("mask_common", "--soft-negatives", "--mask-common", "0.05"), ("env", "synth_packs")),
+    Stage("geometry", "colour-only augmentation for images with a geometry-sensitive label", 1.5, _geometry, ("env", "synth_packs")),
+    Stage("auto_batch", "automatic batch size: Base with its tail, then with a teacher loaded", 4, _auto_batch, ("teacher",)),
+    Stage("many_heads", "Base with 900 sparse heads: what the head count costs", 4, _many_heads, ("teacher",)),
     # Speed comparisons and extras: dropped first when the budget runs short.
-    Stage("other_tests", "the older backbone tests on this machine", 7, _other_tests, optional=True),
-    Stage("speed_atto", "speed: atto at 224px", 2, _speed("speed_atto", "--size", "atto", *_AT_224), ("env",), True),
-    Stage("speed_nano", "speed: nano at 224px", 2, _speed("speed_nano", "--size", "nano", *_AT_224), ("env",), True),
-    Stage("speed_tiny", "speed: tiny at 224px", 3, _speed("speed_tiny", "--size", "tiny", *_AT_224), ("env",), True),
-    Stage("speed_base", "speed: base at 224px", 4, _speed("speed_base", "--size", "base", *_AT_224), ("env",), True),
-    Stage("speed_base_384", "speed: base at 384px", 5, _speed("speed_base_384", "--size", "base", "--image-size", "384", "--batch-size", "16"), ("env",), True),
-    Stage("speed_base_channels_last", "speed: base, channels-last", 4, _speed("speed_base_channels_last", "--size", "base", *_AT_224, "--channels-last"), ("env",), True),
-    Stage("speed_base_stock_grn", "speed: base with timm's own GRN layer, batch 32", 4, _speed("speed_base_stock_grn", "--size", "base", "--image-size", "224", "--batch-size", "32", "--stock-grn"), ("env",), True),
-    Stage("speed_base_one_loader", "speed: base, images loaded on the training thread", 6, _speed("speed_base_one_loader", "--size", "base", *_AT_224, "--workers", "0"), ("env",), True),
+    Stage("other_tests", "the older backbone tests on this machine", 2.5, _other_tests, optional=True),
+    Stage("speed_atto", "speed: atto at 224px", 1, _speed("speed_atto", "--size", "atto", *_AT_224), ("env",), True),
+    Stage("speed_nano", "speed: nano at 224px", 1.5, _speed("speed_nano", "--size", "nano", *_AT_224), ("env",), True),
+    Stage("speed_tiny", "speed: tiny at 224px", 2, _speed("speed_tiny", "--size", "tiny", *_AT_224), ("env",), True),
+    Stage("speed_base", "speed: base at 224px", 3, _speed("speed_base", "--size", "base", *_AT_224), ("env",), True),
+    Stage("speed_base_384", "speed: base at 384px", 9, _speed("speed_base_384", "--size", "base", "--image-size", "384", "--batch-size", "16"), ("env",), True),
+    Stage("speed_base_channels_last", "speed: base, channels-last", 3, _speed("speed_base_channels_last", "--size", "base", *_AT_224, "--channels-last"), ("env",), True),
+    Stage("speed_base_stock_grn", "speed: base with timm's own GRN layer, batch 32", 4.5, _speed("speed_base_stock_grn", "--size", "base", "--image-size", "224", "--batch-size", "32", "--stock-grn"), ("env",), True),
+    Stage("speed_base_one_loader", "speed: base, images loaded on the training thread", 4, _speed("speed_base_one_loader", "--size", "base", *_AT_224, "--workers", "0"), ("env",), True),
     Stage("real_pack", "a short run on part of a real pack (needs --pack)", 6, _real_pack, ("env",), True),
 ]  # fmt: skip
 

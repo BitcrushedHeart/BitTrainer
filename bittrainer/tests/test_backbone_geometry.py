@@ -291,7 +291,13 @@ def test_a_pack_carries_the_list_in_its_manifest(tmp_path):
     from bittrainer.backbone_pack import PackError, pack_geometry_sensitive
 
     manifest = tmp_path / "manifest.json"
+    # No key at all (a pack from before the export marked them) is not the same
+    # as an empty list (the export looked and found none).
     manifest.write_text(json.dumps({"format": 1}), encoding="utf-8")
+    assert pack_geometry_sensitive(tmp_path) is None
+    manifest.write_text(
+        json.dumps({"format": 1, "geometry_sensitive": []}), encoding="utf-8"
+    )
     assert pack_geometry_sensitive(tmp_path) == []
 
     listed = {"format": 1, "geometry_sensitive": ["g3", "c12", "m57"]}
@@ -318,3 +324,9 @@ def test_the_runner_copies_a_packs_list_into_the_request(tmp_path):
     (pack / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
     request, _counts = runner.build_request(pack, tmp_path / "run", **_options())
     assert request["geometry_sensitive"] == ["g5", "c12"]
+
+    # An empty list still travels: it is what lets the run say geometry was looked at.
+    manifest["geometry_sensitive"] = []
+    (pack / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+    looked, _counts = runner.build_request(pack, tmp_path / "run", **_options())
+    assert looked["geometry_sensitive"] == []
