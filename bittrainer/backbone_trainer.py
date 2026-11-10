@@ -577,39 +577,77 @@ def _batch_loss(
     legacy default, so direct callers are unchanged) or ``"mean"`` — averaging over
     the number of contributing head losses so the gradient scale no longer grows
     with per-batch label density.
+
+    The concept heads run as ONE matrix product over the heads this batch has a
+    label for (Bitcrush ISSUE-1655), instead of a row scan, an index, a Linear
+    and a loss per head: with several hundred concepts that was thousands of
+    tiny calls per batch. Each head's loss is still the mean over its own
+    labelled rows, and a head with no label in the batch stays out of the graph
+    (no gradient, so the optimizer leaves it alone), exactly as before.
     """
     losses: list[torch.Tensor] = []
     bce = nn.functional.binary_cross_entropy_with_logits
     ce = nn.functional.cross_entropy
-    for concept, head in heads.binary.items():
-        rows = [i for i, labels in enumerate(binary_labels) if concept in labels]
-        if not rows:
-            continue
-        logits = head(features[rows]).squeeze(-1)
-        targets = torch.tensor(
-            [binary_labels[i][concept] for i in rows], device=device, dtype=logits.dtype
+
+    # One pass over the labels: a column per concept head present in the batch,
+    # and the (row, column, target) of every label.
+    binary_heads = heads.binary
+    columns: dict[str, int] = {}
+    label_rows: list[int] = []
+    label_cols: list[int] = []
+    label_values: list[float] = []
+    for row, labels in enumerate(binary_labels):
+        for concept, value in labels.items():
+            column = columns.get(concept)
+            if column is None:
+                if concept not in binary_heads:
+                    continue
+                column = columns[concept] = len(columns)
+            label_rows.append(row)
+            label_cols.append(column)
+            label_values.append(value)
+    if label_rows:
+        weight = torch.cat([binary_heads[concept].weight for concept in columns])
+        bias = torch.cat([binary_heads[concept].bias for concept in columns])
+        logits = nn.functional.linear(features, weight, bias).float()
+        index = (
+            torch.tensor(label_rows, device=device),
+            torch.tensor(label_cols, device=device),
         )
-        weight = (pos_weight or {}).get(concept)
-        if weight is not None and weight != 1.0:
-            losses.append(
-                bce(
-                    logits,
-                    targets,
-                    pos_weight=torch.tensor(weight, device=device, dtype=logits.dtype),
-                )
-            )
-        else:
-            losses.append(bce(logits, targets))
-    for group, head in heads.groups.items():
-        rows = [i for i, labels in enumerate(group_labels) if group in labels]
-        if not rows:
-            continue
-        logits = head(features[rows])
-        targets = torch.tensor([group_labels[i][group] for i in rows], device=device)
-        losses.append(ce(logits, targets, label_smoothing=group_label_smoothing))
+        targets = torch.zeros(logits.shape, device=device, dtype=torch.float32)
+        targets[index] = torch.tensor(label_values, device=device, dtype=torch.float32)
+        labelled = torch.zeros_like(targets)
+        labelled[index] = 1.0
+        head_weight = None
+        if pos_weight:
+            weights = [
+                1.0 if (value := pos_weight.get(concept)) is None else float(value)
+                for concept in columns
+            ]
+            if any(value != 1.0 for value in weights):
+                head_weight = torch.tensor(weights, device=device, dtype=torch.float32)
+        per_label = bce(logits, targets, pos_weight=head_weight, reduction="none")
+        # Mean over each head's own labelled rows (every column has at least one).
+        losses.append((per_label * labelled).sum(0) / labelled.sum(0))
+
+    group_heads = heads.groups
+    group_rows: dict[str, tuple[list[int], list[int]]] = {}
+    for row, labels in enumerate(group_labels):
+        for group, target in labels.items():
+            if group not in group_heads:
+                continue
+            rows, targets_list = group_rows.setdefault(group, ([], []))
+            rows.append(row)
+            targets_list.append(target)
+    for group, (rows, targets_list) in group_rows.items():
+        logits = group_heads[group](features[rows])
+        group_targets = torch.tensor(targets_list, device=device)
+        losses.append(
+            ce(logits, group_targets, label_smoothing=group_label_smoothing).reshape(1)
+        )
     if not losses:
         return None
-    stacked = torch.stack(losses)
+    stacked = torch.cat(losses)
     return stacked.mean() if reduction == "mean" else stacked.sum()
 
 
@@ -632,49 +670,91 @@ def _collect_val_scores(
     ``group_scores[group] = (logits[N, C] float64, targets[N] int64)``. Heads run
     in fp32 exactly like the legacy ``_evaluate`` (avoids the autocast dtype
     mismatch); the raw logits feed both the metric panel and calibration.
+
+    Every head's logits come from ONE matrix product and ONE device-to-CPU copy
+    per batch (Bitcrush ISSUE-1655); the per-head split happens in numpy. The
+    old loop made a call and a copy per head per batch. Output is unchanged:
+    heads in their own order, rows in loader order, unlabelled heads left out.
     """
     backbone.eval()
     heads.eval()
-    bin_logits: dict[str, list[np.ndarray]] = {c: [] for c in heads.binary}
-    bin_targets: dict[str, list[np.ndarray]] = {c: [] for c in heads.binary}
-    grp_logits: dict[str, list[np.ndarray]] = {g: [] for g in heads.groups}
-    grp_targets: dict[str, list[np.ndarray]] = {g: [] for g in heads.groups}
+    concepts = list(heads.binary.keys())
+    groups = list(heads.groups.keys())
+    concept_column = {concept: column for column, concept in enumerate(concepts)}
+    # Columns: one per concept, then each group's classes side by side.
+    group_span: dict[str, tuple[int, int]] = {}
+    offset = len(concepts)
+    for group in groups:
+        width = heads.groups[group].out_features
+        group_span[group] = (offset, offset + width)
+        offset += width
+    modules = [heads.binary[c] for c in concepts] + [heads.groups[g] for g in groups]
+    weight = torch.cat([m.weight for m in modules]) if modules else None
+    bias = torch.cat([m.bias for m in modules]) if modules else None
+
+    bin_columns: list[np.ndarray] = []
+    bin_logits: list[np.ndarray] = []
+    bin_targets: list[np.ndarray] = []
+    grp_logits: dict[str, list[np.ndarray]] = {g: [] for g in groups}
+    grp_targets: dict[str, list[np.ndarray]] = {g: [] for g in groups}
     for images, binary_labels, group_labels in loader:
         with torch.amp.autocast(
             device_type=device.type, dtype=amp_dtype, enabled=amp_enabled
         ):
             features = backbone(images.to(device))
-        features = features.float()  # heads run in fp32; avoids autocast dtype mismatch
-        for concept, head in heads.binary.items():
-            rows = [i for i, labels in enumerate(binary_labels) if concept in labels]
-            if not rows:
-                continue
-            logits = head(features[rows]).squeeze(-1)
-            bin_logits[concept].append(
-                logits.detach().cpu().numpy().astype(np.float64).reshape(-1)
-            )
-            bin_targets[concept].append(
-                np.asarray([binary_labels[i][concept] for i in rows], dtype=np.float64)
-            )
-        for group, head in heads.groups.items():
-            rows = [i for i, labels in enumerate(group_labels) if group in labels]
-            if not rows:
-                continue
-            logits = head(features[rows])
-            grp_logits[group].append(logits.detach().cpu().numpy().astype(np.float64))
-            grp_targets[group].append(
-                np.asarray([group_labels[i][group] for i in rows], dtype=np.int64)
-            )
+        if weight is None:
+            continue
+        # Heads run in fp32; avoids the autocast dtype mismatch.
+        logits = nn.functional.linear(features.float(), weight, bias).cpu().numpy()
+
+        rows: list[int] = []
+        columns: list[int] = []
+        values: list[float] = []
+        for row, labels in enumerate(binary_labels):
+            for concept, value in labels.items():
+                column = concept_column.get(concept)
+                if column is not None:
+                    rows.append(row)
+                    columns.append(column)
+                    values.append(value)
+        if rows:
+            bin_columns.append(np.asarray(columns, dtype=np.int64))
+            bin_logits.append(logits[rows, columns].astype(np.float64))
+            bin_targets.append(np.asarray(values, dtype=np.float64))
+
+        by_group: dict[str, tuple[list[int], list[int]]] = {}
+        for row, labels in enumerate(group_labels):
+            for group, target in labels.items():
+                if group in group_span:
+                    group_rows, group_targets = by_group.setdefault(group, ([], []))
+                    group_rows.append(row)
+                    group_targets.append(target)
+        for group, (group_rows, group_targets) in by_group.items():
+            start, stop = group_span[group]
+            grp_logits[group].append(logits[group_rows, start:stop].astype(np.float64))
+            grp_targets[group].append(np.asarray(group_targets, dtype=np.int64))
     backbone.train()
     heads.train()
-    binary_scores = {
-        c: (np.concatenate(bin_logits[c]), np.concatenate(bin_targets[c]))
-        for c in heads.binary
-        if bin_logits[c]
-    }
+
+    # Split the concept labels back out per head. The stable sort keeps each
+    # head's rows in loader order; np.unique walks the heads in their own order.
+    binary_scores: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+    if bin_columns:
+        all_columns = np.concatenate(bin_columns)
+        order = np.argsort(all_columns, kind="stable")
+        all_columns = all_columns[order]
+        all_logits = np.concatenate(bin_logits)[order]
+        all_targets = np.concatenate(bin_targets)[order]
+        present, starts = np.unique(all_columns, return_index=True)
+        stops = [*starts[1:], len(all_columns)]
+        for column, start, stop in zip(present, starts, stops):
+            binary_scores[concepts[column]] = (
+                all_logits[start:stop],
+                all_targets[start:stop],
+            )
     group_scores = {
         g: (np.concatenate(grp_logits[g]), np.concatenate(grp_targets[g]))
-        for g in heads.groups
+        for g in groups
         if grp_logits[g]
     }
     return binary_scores, group_scores
