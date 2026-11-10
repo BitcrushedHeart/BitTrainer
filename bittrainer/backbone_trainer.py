@@ -49,6 +49,9 @@ progress_callback=...)`` with a request assembled from the suite DB:
                                                      # end a run before the tail.
                             ...},
         "backbone_init": {...},             # see bittrainer.backbone_init
+        "distillation": {...},              # optional: a teacher candidate to
+                                            # distil from; see
+                                            # generic.tasks.backbone_distill_task
         "license_provenance" / "external_pretrained_used"
             / "temporary_timm_fallback_used" / "release_blocking": provenance,
     }
@@ -917,7 +920,8 @@ def _train_backbone(
     stop_event: object | None = None,
     stop_now_event: object | None = None,
 ) -> dict:
-    """Worker-thread target: drive :class:`GenericTrainer` with a ``BackboneTask``.
+    """Worker-thread target: drive :class:`GenericTrainer` with a ``BackboneTask``,
+    or a ``BackboneDistillTask`` when ``request["distillation"]`` names a teacher.
 
     Kept as the same-signature thread body ``run_backbone_training`` dispatches to
     (Bitcrush ISSUE-0542 Step 6). ``stop`` is the cancellation event — set from the
@@ -930,7 +934,12 @@ def _train_backbone(
     from bittrainer.generic.generic_trainer import GenericTrainer
     from bittrainer.generic.tasks.backbone_task import BackboneTask
 
-    task = BackboneTask(request, cancel_event=stop, stop_event=stop_event)
+    task_class = BackboneTask
+    if (request.get("distillation") or {}).get("teacher_checkpoint_path"):
+        from bittrainer.generic.tasks.backbone_distill_task import BackboneDistillTask
+
+        task_class = BackboneDistillTask
+    task = task_class(request, cancel_event=stop, stop_event=stop_event)
     return GenericTrainer().run(
         task,
         progress_callback=emit,
