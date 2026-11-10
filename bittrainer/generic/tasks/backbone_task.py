@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -41,6 +42,7 @@ from torch.optim.lr_scheduler import CosineAnnealingLR, LambdaLR
 from torch.utils.data import DataLoader
 
 import bittrainer.backbone_trainer as bb
+from bittrainer.amp import amp_label, make_grad_scaler
 from bittrainer.backbone_init import apply_backbone_init, wants_timm_pretrained
 from bittrainer.ema import ModelEMA
 from bittrainer.generic.optimizer import (
@@ -114,6 +116,17 @@ class BackboneTask(TrainingTask):
         self.ema_decay = float(c.get("ema_decay") or 0.9999)
         self.use_cosine = bool(c.get("use_cosine", True))
         self.amp_enabled, self.amp_dtype = bb._amp_settings(c)
+        # fp16 runs step through a GradScaler (Bitcrush ISSUE-1655). It is built
+        # in make_context, once the device and so its precision are known; it
+        # stays None on bf16 and on a CPU.
+        self._scaler = None
+        # Opt-in speed knobs, both defaulting to the legacy behaviour: decode and
+        # augment on the training thread, contiguous (NCHW) memory.
+        self.dataloader_workers = int(c.get("dataloader_workers") or 0)
+        self.channels_last = bool(c.get("channels_last", False))
+        # The last epoch's wall time and image count, surfaced on its frame.
+        self._train_seconds = 0.0
+        self._train_images = 0
 
         # Optimizer layout (A4/B7): LLRD + weight-decay exclusions ON by default for
         # the backbone builder (long-horizon trunk training). The identity folds
@@ -225,6 +238,10 @@ class BackboneTask(TrainingTask):
             if requested_device
             else ("cuda" if torch.cuda.is_available() else "cpu")
         )
+        # Fit the precision to the card now that it is known: bf16 where it is
+        # native, fp16 through a GradScaler where it is not (a T4).
+        self.amp_enabled, self.amp_dtype = bb._amp_settings(self.config, device)
+        self._scaler = make_grad_scaler(device, self.amp_dtype, self.amp_enabled)
 
         # Samples are built here (not in prepare_data) because loop_spec — which the
         # core calls before prepare_data — needs to know whether a val split exists.
@@ -357,6 +374,9 @@ class BackboneTask(TrainingTask):
             concepts=len(self.vocab.concepts),
             groups=len(self.vocab.groups),
             sampling=plan_stats,
+            device=ctx.device.type,
+            amp_dtype=amp_label(self.amp_enabled, self.amp_dtype),
+            grad_scaler=self._scaler is not None,
         )
 
     def create_model(self, ctx: TaskContext, resume_state: dict | None):
@@ -374,6 +394,8 @@ class BackboneTask(TrainingTask):
         model = bb._BackboneWithHeads(backbone, heads).to(ctx.device)
         if resume_state is not None:
             model.load_state_dict(resume_state["model"])
+        if self.channels_last:
+            model = model.to(memory_format=torch.channels_last)
         self.model = model
         return model
 
@@ -432,6 +454,11 @@ class BackboneTask(TrainingTask):
         best = resume_state.get("best") or {}
         self.best_metrics = dict(best.get("best_metrics") or {})
         self.best_score = float(best.get("best_validation_score", -1.0))
+        # The scaler's running scale continues where it stopped. A backup taken
+        # under bf16 carries none, and a bf16 resume has no scaler to load into.
+        scaler_state = resume_state.get("grad_scaler")
+        if self._scaler is not None and scaler_state:
+            self._scaler.load_state_dict(scaler_state)
 
     def resumed_message(
         self, ctx: TaskContext, best: BestTracker, global_step: int, start_epoch: int
@@ -446,14 +473,28 @@ class BackboneTask(TrainingTask):
         }
 
     # -- per-epoch ---------------------------------------------------------
+    def _loader_kwargs(self, device, *, persistent: bool) -> dict:
+        """DataLoader kwargs for this run.
+
+        ``dataloader_workers`` (default 0, the legacy path) moves decode and
+        augmentation off the training thread. The train loader is rebuilt every
+        epoch, so only the long-lived val loader asks to keep its workers.
+        """
+        workers = max(0, self.dataloader_workers)
+        kwargs = {
+            "batch_size": self.batch_size,
+            "collate_fn": bb._collate,
+            "num_workers": workers,
+            "pin_memory": workers > 0 and torch.device(device).type == "cuda",
+        }
+        if workers > 0:
+            kwargs["persistent_workers"] = persistent
+            kwargs["prefetch_factor"] = 4
+        return kwargs
+
     def build_loaders(
         self, ctx: TaskContext, epoch: int, eff_bs: int, resume_info: ResumeInfo
     ):
-        loader_kwargs = {
-            "batch_size": self.batch_size,
-            "collate_fn": bb._collate,
-            "num_workers": 0,
-        }
         image_size = self._epoch_image_size(epoch)
         # The finetune tail switches the VAL resolution too — the tail's scores
         # (and the exported candidate's selection) must be measured at the
@@ -462,7 +503,7 @@ class BackboneTask(TrainingTask):
             self._val_loader = DataLoader(
                 bb._BackboneDataset(self.val_samples, bb._val_transform(image_size)),
                 shuffle=False,
-                **loader_kwargs,
+                **self._loader_kwargs(ctx.device, persistent=True),
             )
             self._val_loader_size = image_size
         # Per-epoch label plan (ISSUE-0545/0546): fresh negative draw each epoch
@@ -477,7 +518,7 @@ class BackboneTask(TrainingTask):
                 epoch_samples, bb._train_transform(image_size, self._aug)
             ),
             shuffle=True,
-            **loader_kwargs,
+            **self._loader_kwargs(ctx.device, persistent=False),
         )
         # Backbone resume is epoch-restart: no schedule replay, no partial start.
         return train_loader, None, 0
@@ -494,9 +535,12 @@ class BackboneTask(TrainingTask):
         start_batch: int,
     ):
         device = ctx.device
+        scaler = self._scaler
         model.train()
         epoch_loss = 0.0
         epoch_batches = 0
+        images_seen = 0
+        started = time.perf_counter()
         for images, binary_labels, group_labels in train_loader:
             if self.cancel_event is not None and self.cancel_event.is_set():
                 raise bb.BackboneTrainingCancelled
@@ -505,10 +549,13 @@ class BackboneTask(TrainingTask):
                 self.steps_stop_event.set()
                 break
             optimizer.zero_grad(set_to_none=True)
+            images = images.to(device, non_blocking=True)
+            if self.channels_last:
+                images = images.contiguous(memory_format=torch.channels_last)
             with torch.amp.autocast(
                 device_type=device.type, dtype=self.amp_dtype, enabled=self.amp_enabled
             ):
-                features = model.backbone(images.to(device))
+                features = model.backbone(images)
                 loss = bb._batch_loss(
                     features.float(),
                     model.heads,
@@ -521,17 +568,32 @@ class BackboneTask(TrainingTask):
                 )
             if loss is None:
                 continue
-            loss.backward()
-            if self.clip_grad_norm and self.clip_grad_norm > 0:
-                clip_gradients(model, self.clip_grad_norm)
-            optimizer.step()
+            clip = self.clip_grad_norm and self.clip_grad_norm > 0
+            if scaler is not None:
+                # fp16: backward on the scaled loss, then unscale so the clipper
+                # sees true gradient norms. The scaler skips the optimizer step
+                # (and backs its scale off) when a gradient came back inf/nan.
+                scaler.scale(loss).backward()
+                scaler.unscale_(optimizer)
+                if clip:
+                    clip_gradients(model, self.clip_grad_norm)
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                loss.backward()
+                if clip:
+                    clip_gradients(model, self.clip_grad_norm)
+                optimizer.step()
             if self.ema is not None:
                 self.ema.update(model)
             self.step += 1
             epoch_loss += float(loss.detach())
             epoch_batches += 1
+            images_seen += int(images.shape[0])
             if boundary_hook(epoch_batches) == "stop":  # pause backed up mid-epoch
                 break
+        self._train_seconds = time.perf_counter() - started
+        self._train_images = images_seen
         return epoch_loss / max(epoch_batches, 1)
 
     def validate(self, ctx: TaskContext, model, epoch: int, train_result) -> dict:
@@ -642,6 +704,16 @@ class BackboneTask(TrainingTask):
         best: BestTracker,
     ) -> None:
         have_best = best.best_validation_score >= 0
+        # Training speed for the epoch (decode + augment + step, validation not
+        # included). Absent when the epoch trained nothing or the task does not
+        # time itself (head-only retraining).
+        speed = {}
+        if self._train_seconds > 0 and self._train_images > 0:
+            speed = {
+                "train_seconds": self._train_seconds,
+                "train_images": self._train_images,
+                "images_per_second": self._train_images / self._train_seconds,
+            }
         self._emit(
             "training",
             f"Epoch {epoch + 1}/{self.epochs}",
@@ -652,6 +724,7 @@ class BackboneTask(TrainingTask):
             validation_score=self.validation_score,
             best_score=best.best_validation_score if have_best else None,
             best_epoch=best.best_epoch + 1 if have_best else None,
+            **speed,
         )
         return None
 
@@ -666,6 +739,9 @@ class BackboneTask(TrainingTask):
             "rng_epoch_start": rng_epoch_start,
             "best_backbone_state": self.best_backbone_state,
             "best_heads_state": self.best_heads_state,
+            "grad_scaler": self._scaler.state_dict()
+            if self._scaler is not None
+            else None,
         }
 
     # -- finalisation ------------------------------------------------------
@@ -698,7 +774,12 @@ class BackboneTask(TrainingTask):
 
         # BARE backbone keys (apply_backbone_init's unprefix branch requires the
         # backbone keys NOT be prefixed) plus heads.<key> for the multi-task heads.
-        state = {key: value.detach().to("cpu") for key, value in backbone_state.items()}
+        # contiguous(): a channels-last run holds its conv weights in NHWC
+        # strides, which safetensors refuses to write. A no-op otherwise.
+        state = {
+            key: value.detach().to("cpu").contiguous()
+            for key, value in backbone_state.items()
+        }
         for key, value in (heads_state or {}).items():
             state[f"heads.{key}"] = value.detach().to("cpu")
         save_file(

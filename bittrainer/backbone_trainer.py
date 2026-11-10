@@ -88,9 +88,9 @@ from bittrainer.training_state import make_fingerprint
 
 logger = logging.getLogger(__name__)
 
-# AMP autocast dtype aliases (Bitcrush ISSUE-0476). float16 is accepted but,
-# like the binary trainer, no GradScaler is wired — bfloat16 is the tested
-# default and needs none; float16 on CUDA without a scaler can underflow.
+# AMP autocast dtype aliases (Bitcrush ISSUE-0476). bfloat16 needs no GradScaler;
+# float16 on CUDA does, and the backbone task steps through one whenever the
+# resolved dtype is float16 (Bitcrush ISSUE-1655, see bittrainer.amp).
 _AMP_DTYPES = {
     "bfloat16": torch.bfloat16,
     "bf16": torch.bfloat16,
@@ -102,14 +102,26 @@ _AMP_DTYPES = {
 }
 
 
-def _amp_settings(config: dict) -> tuple[bool, torch.dtype]:
+def _amp_settings(
+    config: dict, device: torch.device | None = None
+) -> tuple[bool, torch.dtype]:
     """Resolve (enabled, autocast dtype) from the training config.
 
     AMP defaults ON with bfloat16 (matches the binary trainer). Disabled when
     ``use_amp`` is false or the resolved dtype is float32.
+
+    With a ``device`` the dtype is fitted to the card (Bitcrush ISSUE-1655): an
+    absent or ``"auto"`` ``amp_dtype`` picks bf16 where it is native and fp16
+    where it is not, and an explicit bf16 on a card without it becomes fp16.
+    Without a device the answer is the legacy one, untouched.
     """
-    name = str(config.get("amp_dtype") or "bfloat16").lower()
-    dtype = _AMP_DTYPES.get(name, torch.bfloat16)
+    name = str(config.get("amp_dtype") or "").lower()
+    if device is None:
+        dtype = _AMP_DTYPES.get(name, torch.bfloat16)
+    else:
+        from bittrainer import amp
+
+        dtype = amp.resolve_amp_dtype(_AMP_DTYPES.get(name), device)
     enabled = bool(config.get("use_amp", True)) and dtype != torch.float32
     return enabled, dtype
 
