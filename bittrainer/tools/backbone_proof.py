@@ -280,6 +280,8 @@ def run_proof(
                 "train_seconds",
                 "train_images",
                 "images_per_second",
+                "skipped_steps",
+                "grad_scale",
             )
         }
         for frame in frames
@@ -341,6 +343,8 @@ def run_proof(
         "epochs": epoch_rows,
         "best_images_per_second": max(speeds) if speeds else None,
         "peak_vram_mb": peak_vram_mb,
+        # fp16 only: optimizer steps the GradScaler skipped over the whole run.
+        "skipped_steps": (result or {}).get("skipped_steps"),
         "validation_score": score,
         "weakest_family_f1": weakest,
         "min_score": min_score,

@@ -26,13 +26,16 @@ teacher answers for all of them. For the same reason, images whose records
 carry no usable label join the training split (never validation) with empty
 labels, so a pool's unlabelled images still teach the student.
 
-Everything else is the parent's: the sampling plan, the fp16 GradScaler,
-clipping, EMA, channels-last, the heartbeat, max_steps, cancel, pause / backup /
-resume, validation on real labels and the candidate export. The candidate keeps
-the student's ordinary layout, so it can be a trunk or a teacher in its turn.
-The feature projector trains with the student and rides the backups (it is part
-of the model's state dict) but is never exported: it only means something next
-to this one teacher.
+Everything else is the parent's: the sampling plan, the fp16 GradScaler and its
+count of skipped steps, clipping, EMA, channels-last, the heartbeat, max_steps,
+cancel, pause / backup / resume, the tail and its batch size, validation on real
+labels and the candidate export. The parent's preflight and automatic batch size
+run this task's own step, so the teacher's forward pass is measured too.
+
+The candidate keeps the student's ordinary layout, so it can be a trunk or a
+teacher in its turn. The feature projector trains with the student and rides the
+backups (it is part of the model's state dict) but is never exported: it only
+means something next to this one teacher.
 """
 
 from __future__ import annotations
@@ -631,6 +634,7 @@ class BackboneDistillTask(BackboneTask):
         term_counts: dict[str, int] = {}
         total_batches = len(train_loader)
         started = time.perf_counter()
+        self._start_skip_count(scaler)
         for images, binary_labels, group_labels in train_loader:
             if self.cancel_event is not None and self.cancel_event.is_set():
                 raise bb.BackboneTrainingCancelled
@@ -667,6 +671,11 @@ class BackboneDistillTask(BackboneTask):
             if loss is None:
                 continue
             clip = self.clip_grad_norm and self.clip_grad_norm > 0
+            if self._dry_run:
+                # A step for its memory only (the parent's _dry_step): the
+                # teacher's forward is in it, and nothing is updated.
+                (scaler.scale(loss) if scaler is not None else loss).backward()
+                break
             if scaler is not None:
                 scaler.scale(loss).backward()
                 scaler.unscale_(optimizer)
@@ -674,6 +683,7 @@ class BackboneDistillTask(BackboneTask):
                     clip_gradients(model, self.clip_grad_norm)
                 scaler.step(optimizer)
                 scaler.update()
+                self._count_skip(scaler)
             else:
                 loss.backward()
                 if clip:

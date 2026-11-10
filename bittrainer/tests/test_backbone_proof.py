@@ -94,6 +94,9 @@ def test_proof_run_completes_on_cpu(tmp_path):
     assert report["device"] == "cpu"
     assert report["amp_dtype"] == "off"
     assert report["grad_scaler"] is False
+    # No scaler on a CPU, so no step it could have skipped.
+    assert report["skipped_steps"] == 0
+    assert report["epochs"][0]["grad_scale"] is None
     assert len(report["epochs"]) == 1
     assert report["epochs"][0]["images_per_second"] > 0
     assert report["best_images_per_second"] > 0

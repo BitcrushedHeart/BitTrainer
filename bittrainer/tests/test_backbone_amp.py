@@ -113,6 +113,9 @@ class _RecordingScaler:
     def update(self):
         self.events.append("update")
 
+    def get_scale(self):  # read after every update, to count skipped steps
+        return 1234.0
+
     def state_dict(self):
         return {"scale": 1234.0}
 

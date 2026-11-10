@@ -64,7 +64,16 @@ def wants_grad_scaler(device: torch.device, dtype: torch.dtype, enabled: bool) -
 
 
 def make_grad_scaler(device: torch.device, dtype: torch.dtype, enabled: bool):
-    """A ``torch.amp.GradScaler`` when the run needs one, else ``None``."""
+    """A ``torch.amp.GradScaler`` when the run needs one, else ``None``.
+
+    It keeps torch's start value of 65536. Coming down from there costs one
+    skipped optimizer step per halving, at most 16 to reach 1, once per run
+    (the scale rides the backups). A lower start would save those steps, but
+    the scaler only climbs one doubling per 2000 clean steps: a start below
+    where a run settles would round small gradients away for thousands of
+    steps, with nothing to show it. The backbone task counts and reports the
+    skipped steps instead.
+    """
     if not wants_grad_scaler(device, dtype, enabled):
         return None
     return torch.amp.GradScaler("cuda")

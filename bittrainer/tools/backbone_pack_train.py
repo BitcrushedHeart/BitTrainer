@@ -4,7 +4,8 @@ For a rented GPU with no Engine on it. Point it at a pack (see
 ``bittrainer.backbone_pack``) and an output folder::
 
     python -m bittrainer.tools.backbone_pack_train --pack /data/pack --out /data/run1 \
-        --size base --image-size 224 --finetune-image-size 384 --finetune-epochs 5
+        --size base --image-size 224 --batch-size 64 \
+        --finetune-image-size 384 --finetune-epochs 5 --finetune-batch-size 16
 
     # a short trial on part of the pack first
     python -m bittrainer.tools.backbone_pack_train --pack /data/pack --out /data/trial \
@@ -15,6 +16,9 @@ Everything the run produces goes into ``--out``:
     progress.jsonl                 every progress frame, appended
     backbone_candidate.safetensors the trained backbone and its heads
     result.json                    scores of the exported epoch
+    backbone_candidate.val_scores.npz
+                                   that epoch's raw validation scores, to work
+                                   thresholds out again later
     backups/                       training state, to resume from
 
 Stopping and resuming. The run backs itself up at every epoch end and every
@@ -27,7 +31,14 @@ Stopping and resuming. The run backs itself up at every epoch end and every
 Ctrl-C and a terminate signal pause the same way. Running the same command
 again resumes from the newest backup. If the backups belong to a different run
 (another size, epoch count, resolution or pack) the command refuses rather than
-train over them; ``--fresh`` discards them.
+train over them; ``--fresh`` discards them. The batch sizes are not part of
+that: a paused run can come back with another ``--batch-size`` or
+``--finetune-batch-size`` (the epoch it stopped in starts again).
+
+Before the first epoch, on a GPU, one real training step is run at each
+resolution and batch size the run will use. If one does not fit the card the
+run is refused there and then, naming which, instead of failing at the switch
+to the tail a day in.
 
 Exit codes: 0 finished, 1 failed, 2 refused, 3 paused.
 """
@@ -95,6 +106,7 @@ def build_request(
     image_size: int = 224,
     epochs: int = 30,
     batch_size: int = 64,
+    finetune_batch_size: int | None = None,
     device: str | None = None,
     amp: str = "auto",
     init: str = "timm",
@@ -152,6 +164,9 @@ def build_request(
         "backup_every_steps": int(backup_every_steps),
         "progress_every_steps": int(progress_every_steps),
     }
+    if finetune_batch_size is not None:
+        # The tail's own batch size (0 asks for a probe). Unset: as batch_size.
+        config["finetune_batch_size"] = int(finetune_batch_size)
     if stock_grn:
         config["lean_grn"] = False
     if device:
@@ -268,9 +283,20 @@ def _jsonable(value):
         return str(value)
 
 
+def _skips(frame: dict) -> str:
+    """What the fp16 GradScaler is doing, for a console line. Nothing to say
+    in bf16 or on a CPU, where there is no scaler."""
+    scale = frame.get("grad_scale")
+    if scale is None:
+        return ""
+    return f", {frame.get('skipped_steps', 0):,} skipped, scale {scale:g}"
+
+
 def _line(frame: dict) -> str | None:
     """One console line for a progress frame, or None for the quiet ones."""
     kind, stage = frame.get("type"), frame.get("stage")
+    if stage == "warning":
+        return f"WARNING: {frame.get('status_text')}"
     if stage == "preparing" and "train_samples" in frame:
         scaler = " with a GradScaler" if frame.get("grad_scaler") else ""
         return (
@@ -283,6 +309,7 @@ def _line(frame: dict) -> str | None:
         return (
             f"epoch {frame['epoch']}/{frame['epochs']} batch {frame['batch']:,}/"
             f"{frame['batches']:,} loss {frame['loss']:.4f} {speed:.1f} img/s"
+            f"{_skips(frame)}"
         )
     if stage == "training" and "loss" in frame:
         speed = frame.get("images_per_second") or 0.0
@@ -291,19 +318,30 @@ def _line(frame: dict) -> str | None:
         return (
             f"epoch {frame['epoch']}/{frame['epochs']} done: loss {frame['loss']:.4f}, "
             f"validation {frame['validation_score']:.4f}, best {best_text} "
-            f"(epoch {frame.get('best_epoch')}), {speed:.1f} img/s"
+            f"(epoch {frame.get('best_epoch')}), {speed:.1f} img/s{_skips(frame)}"
         )
     if kind == "backup_complete":
         return (
             f"backup saved at step {frame.get('global_step')} ({frame.get('reason')})"
         )
     if kind == "training_resumed":
-        return f"resumed at epoch {int(frame['epoch']) + 1}, step {frame.get('global_step')}"
+        sizes = ""
+        if frame.get("batch_size"):
+            sizes = f" ({frame.get('image_size')}px, batch {frame['batch_size']})"
+        return (
+            f"resumed at epoch {int(frame['epoch']) + 1}, step "
+            f"{frame.get('global_step')}{sizes}"
+        )
     if kind == "training_paused":
         return f"paused at step {frame.get('global_step')}"
     if kind in ("graceful_stop", "stop_now"):
         return "stopping early; exporting the best epoch so far"
-    if stage in ("saving", "training") and frame.get("status_text"):
+    if kind == "autobatch":
+        return (
+            f"automatic batch size {frame.get('batch_size')} at "
+            f"{frame.get('image_size')}px ({frame.get('phase')})"
+        )
+    if stage in ("saving", "training", "preflight") and frame.get("status_text"):
         return str(frame["status_text"])
     return None
 
@@ -369,6 +407,7 @@ def train_from_pack(
     import torch
 
     from bittrainer.backbone_trainer import run_backbone_training
+    from bittrainer.generic.tasks.backbone_task import BackboneRunRefused
 
     if torch.cuda.is_available():
         # Fixed input sizes: let cuDNN pick its fastest kernels.
@@ -392,6 +431,7 @@ def train_from_pack(
     _log(f"{counts['images']:,} images from the pack; output in {out}")
     result: dict | None = None
     failure: str | None = None
+    refusal: str | None = None
     with (out / "progress.jsonl").open("a", encoding="utf-8") as progress:
 
         def _frame(frame: dict) -> None:
@@ -412,6 +452,10 @@ def train_from_pack(
                     stop_event=control.stop_event,
                 )
             )
+        except BackboneRunRefused as exc:
+            # The trainer's own check before the first epoch (a training step
+            # that does not fit the card): nothing trained, nothing broke.
+            refusal = str(exc)
         except Exception as exc:
             failure = f"{type(exc).__name__}: {exc}"
             (out / "error.txt").write_text(traceback.format_exc(), encoding="utf-8")
@@ -419,6 +463,8 @@ def train_from_pack(
             watching.set()
             watcher.join(timeout=poll_seconds + 1)
 
+    if refusal is not None:
+        return {"status": "refused", "reason": refusal}
     if failure is not None:
         return {"status": "failed", "reason": failure}
     if result.get("paused"):
@@ -472,6 +518,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--epochs", type=int, default=30)
     parser.add_argument(
         "--batch-size", type=_batch_size, default=64, help="a number, or auto"
+    )
+    parser.add_argument(
+        "--finetune-batch-size",
+        type=_batch_size,
+        default=None,
+        help="the tail's own batch size: a number, or auto (default: --batch-size)",
     )
     parser.add_argument("--workers", type=int, default=4, help="image loading workers")
     parser.add_argument("--channels-last", action="store_true")
@@ -550,6 +602,7 @@ def main(argv: list[str] | None = None) -> int:
         finetune_epochs=args.finetune_epochs,
         epochs=args.epochs,
         batch_size=args.batch_size,
+        finetune_batch_size=args.finetune_batch_size,
         workers=args.workers,
         channels_last=args.channels_last,
         stock_grn=args.stock_grn,

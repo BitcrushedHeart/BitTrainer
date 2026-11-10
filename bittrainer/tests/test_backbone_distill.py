@@ -717,6 +717,109 @@ def test_plain_and_distillation_fingerprints_differ(tmp_path, teacher_path):
     assert fingerprint_matches(distilled, distilled)
 
 
+# -- the tail, the preflight and automatic sizing all include the teacher -------
+
+# These two train a teacher and a student for more than a few steps: they run
+# where a GPU is visible (the T4), not on a desk machine with its card hidden.
+trains = pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="trains a teacher and a student (T4)"
+)
+
+
+def _spy_teacher(monkeypatch):
+    """The shape of every batch the teacher's trunk is run on."""
+    shapes = []
+    real_load = bd.load_teacher
+
+    def _load(path, device):
+        teacher = real_load(path, device)
+        teacher.model.backbone.register_forward_pre_hook(
+            lambda _module, args: shapes.append(tuple(args[0].shape))
+        )
+        return teacher
+
+    monkeypatch.setattr(bd, "load_teacher", _load)
+    return shapes
+
+
+@trains
+def test_a_distillation_is_preflighted_with_its_teacher_and_runs_its_tail(
+    tmp_path, teacher_path, monkeypatch
+):
+    shapes = _spy_teacher(monkeypatch)
+    frames: list[dict] = []
+    request = _request(
+        tmp_path,
+        _records(tmp_path / "imgs", 12, _student_labels),
+        run_id="student_tail",
+        max_steps=None,
+        config={
+            "image_size": 48,
+            "epochs": 2,
+            "finetune_image_size": 64,
+            "finetune_epochs": 1,
+            "finetune_batch_size": 2,
+            "preflight": True,
+            "oversample_positives": False,
+        },
+        distillation={"teacher_checkpoint_path": teacher_path},
+    )
+
+    _run(request, frames.append)
+
+    # The preflight's two steps come first, the teacher's forward pass in each.
+    assert shapes[:2] == [(4, 3, 48, 48), (2, 3, 64, 64)]
+    checked = [f for f in frames if f.get("stage") == "preflight"]
+    assert [(f["phase"], f["batch_size"]) for f in checked] == [
+        ("main", 4),
+        ("tail", 2),
+    ]
+    # Then the run: the tail at its own size and batch, the teacher with it.
+    epochs = [f for f in frames if f.get("stage") == "training" and "loss" in f]
+    assert [(f["image_size"], f["batch_size"]) for f in epochs] == [(48, 4), (64, 2)]
+    assert epochs[-1]["steps"] == len(shapes) - 2
+    assert {shape[2] for shape in shapes[2 + epochs[0]["steps"] :]} == {64}
+    # A preflight step reports no loss terms of its own: both epochs' are real.
+    for epoch in epochs:
+        assert set(epoch["loss_terms"]) >= {"head", "feature", "supervised"}
+        assert epoch["skipped_steps"] == 0 and epoch["grad_scale"] is None
+
+
+@trains
+def test_automatic_sizing_measures_steps_with_the_teacher_in_them(
+    tmp_path, teacher_path, monkeypatch
+):
+    shapes = _spy_teacher(monkeypatch)
+    tried = []
+    real_dry_step = BackboneDistillTask._dry_step
+
+    def _dry_step(self, ctx, model, image_size, batch_size):
+        tried.append(batch_size)
+        real_dry_step(self, ctx, model, image_size, batch_size)
+        return (1 + batch_size) * 2**20  # a megabyte an image, on a pretend card
+
+    monkeypatch.setattr(bt, "_vram_room", lambda device: 64 * 2**30)
+    monkeypatch.setattr(BackboneDistillTask, "_dry_step", _dry_step)
+    request = _request(
+        tmp_path,
+        _records(tmp_path / "imgs", 16, _student_labels),
+        run_id="student_auto",
+        config={"batch_size": "auto", "image_size": 48, "preflight": False},
+        distillation={"teacher_checkpoint_path": teacher_path},
+    )
+    task = BackboneDistillTask(request)
+    ctx = task.make_context(None, None, None, None)
+    model = task.create_model(ctx, None)
+
+    task.resolve_batch_size(ctx, model, None)
+
+    # Eleven training images: batches of 1, 2, 4 and 8 were run, and the
+    # teacher saw every one of them.
+    assert tried == [1, 2, 4, 8]
+    assert shapes == [(batch, 3, 48, 48) for batch in tried]
+    assert task.batch_size == len(task.train_samples) == 11
+
+
 # -- the GRN layer -------------------------------------------------------------
 
 

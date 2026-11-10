@@ -273,6 +273,136 @@ def test_run_numbers_come_from_the_progress_file(tmp_path):
     assert numbers["loss_terms"] == {"head": 0.2}
 
 
+def test_run_numbers_show_the_sizes_the_preflight_and_the_skipped_steps(tmp_path):
+    frames = [
+        {"stage": "preflight", "phase": "main", "peak_vram_mb": 11400},
+        {"stage": "preflight", "phase": "tail", "peak_vram_mb": 9400},
+        {"type": "autobatch", "phase": "main", "batch_size": 72},
+        {"type": "autobatch", "phase": "tail", "batch_size": 21},
+        {"stage": "training", "loss": 0.7, "epoch": 1, "image_size": 224, "batch_size": 64},
+        {"stage": "warning", "warning": "skipped_steps"},
+        {"stage": "training", "loss": 0.6, "epoch": 2, "image_size": 384, "batch_size": 16},
+        {"stage": "training", "loss": 0.5, "epoch": 3, "image_size": 384, "batch_size": 16},
+    ]  # fmt: skip
+    (tmp_path / "progress.jsonl").write_text(
+        "\n".join(json.dumps(frame) for frame in frames) + "\n", encoding="utf-8"
+    )
+    (tmp_path / "result.json").write_text(
+        json.dumps({"validation_score": 0.8, "skipped_steps": 16, "grad_scale": 1.0}),
+        encoding="utf-8",
+    )
+
+    numbers = vm.run_numbers(tmp_path)
+
+    assert numbers["phases"] == ["224px x64", "384px x16"]
+    assert numbers["preflight_mb"] == {"main": 11400, "tail": 9400}
+    assert numbers["auto_batch_size"] == 72 and numbers["auto_tail_batch_size"] == 21
+    assert numbers["warnings"] == 1
+    assert numbers["skipped_steps"] == 16 and numbers["grad_scale"] == 1.0
+
+
+# -- the tail's batch size, the preflight and automatic sizing -----------------
+
+
+def test_the_plan_proves_the_tail_batch_size_and_the_refusal():
+    by_name = {stage.name: stage for stage in vm.STAGES}
+    assert not by_name["tail"].optional
+    assert not by_name["preflight_refuses"].optional
+    # This round's new test files run on the rented GPU too, where their GPU
+    # tests do not skip.
+    assert {
+        "test_backbone_tail_batch.py",
+        "test_backbone_skipped_steps.py",
+        "test_backbone_auto_batch.py",
+        "test_backbone_run_record.py",
+    } <= set(vm._ROUND_TESTS)
+    assert set(vm._GPU_TESTS) <= set(vm._ROUND_TESTS)
+    assert all((vm._TESTS / name).is_file() for name in vm._ROUND_TESTS)
+
+
+def _commands(monkeypatch, exit_code=0, output=""):
+    """The command lines the stages would run, without running them."""
+    ran: list[list[str]] = []
+
+    def _command(context, name, argv, minutes):
+        ran.append(argv)
+        return exit_code, output
+
+    monkeypatch.setattr(vm, "_command", _command)
+    return ran
+
+
+def test_the_tail_stage_runs_base_at_64_then_the_tail_at_16(tmp_path, monkeypatch):
+    ran = _commands(monkeypatch)
+
+    vm._tail(_context(tmp_path))
+
+    (argv,) = ran
+    value = lambda flag: argv[argv.index(flag) + 1]  # noqa: E731
+    assert (value("--size"), value("--init")) == ("base", "apache")
+    assert (value("--batch-size"), value("--finetune-batch-size")) == ("64", "16")
+    assert value("--finetune-image-size") == "384"
+    assert "--image-size" not in argv  # the runner's own default, 224
+
+
+def test_a_tail_run_passes_only_if_both_sizes_trained_and_were_checked_first():
+    good = {
+        "phases": ["224px x64", "384px x16"],
+        "preflight_mb": {"main": 11000, "tail": 9500},
+    }
+    assert vm.tail_problem(good) == ""
+    same_batch = {**good, "phases": ["224px x64", "384px x64"]}
+    assert "384px x64" in vm.tail_problem(same_batch)
+    assert "preflight" in vm.tail_problem({**good, "preflight_mb": {"main": 11000}})
+    assert vm.tail_problem({}) != ""
+
+
+def test_a_refused_run_must_exit_2_name_the_tail_and_train_nothing():
+    said = (
+        "[train] REFUSED: Preflight: one training step of the tail (384px, batch "
+        "size 64, precision float16) ran out of GPU memory."
+    )
+    assert vm.refusal_problem(2, said, '{"stage": "preflight"}') == ""
+    assert "exit 1" in vm.refusal_problem(1, said, "")  # failed, not refused
+    assert "exit 0" in vm.refusal_problem(0, said, "")  # it went ahead
+    assert vm.refusal_problem(2, "[train] REFUSED: the pack has no images", "") != ""
+    assert "trained" in vm.refusal_problem(2, said, '{"stage": "training_step"}')
+
+
+def test_the_refusal_stage_asks_for_a_tail_that_cannot_fit(tmp_path, monkeypatch):
+    said = "[train] REFUSED: Preflight: one training step of the tail ran out"
+    ran = _commands(monkeypatch, exit_code=2, output=said)
+
+    result = vm._preflight_refuses(_context(tmp_path))
+
+    (argv,) = ran
+    assert argv[argv.index("--finetune-batch-size") + 1] == "64"
+    assert argv[argv.index("--finetune-image-size") + 1] == "384"
+    assert result.status == "passed", result.note
+
+    _commands(monkeypatch, exit_code=0, output="[train] finished")
+    assert vm._preflight_refuses(_context(tmp_path)).status == "failed"
+
+
+def test_automatic_sizes_must_be_useful_not_just_survivable():
+    good = {"auto_batch_base": 72, "auto_batch_base_tail": 21}
+    assert vm.auto_batch_problem(good) == ""
+    # What the first version chose: it ran, and left most of the card unused.
+    assert "8" in vm.auto_batch_problem({**good, "auto_batch_base": 8})
+    assert vm.auto_batch_problem({**good, "auto_batch_base_tail": None}) != ""
+    assert vm.auto_batch_problem({**good, "auto_batch_base_tail": 72}) != ""
+
+
+def test_the_gpu_tests_stage_fails_when_a_gpu_test_is_skipped(tmp_path, monkeypatch):
+    context = _context(tmp_path)
+    _commands(monkeypatch, output="===== 7 passed, 80 deselected in 20.1s =====")
+    assert vm._gpu_tests(context).status == "passed"
+    _commands(monkeypatch, output="===== 5 passed, 2 skipped, 80 deselected =====")
+    assert vm._gpu_tests(context).status == "failed"
+    _commands(monkeypatch, output="===== 7 skipped, 80 deselected in 2.0s =====")
+    assert vm._gpu_tests(context).status == "failed"
+
+
 # -- pausing and resuming a detached run --------------------------------------
 
 

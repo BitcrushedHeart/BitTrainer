@@ -9,9 +9,11 @@ stages, on generated images, and writes down what passed and how fast it went::
 
 The checks that decide whether the real run can start come first: the GPU-only
 tests, a model learning in this card's precision, the real weight conversion,
-training / pausing / resuming from a pack, and distillation with a teacher wider
-than its student. Speed comparisons come last and are the first thing dropped
-when ``--budget-minutes`` (default 120) runs short. Estimates are for a T4.
+training / pausing / resuming from a pack, the switch to the 384px tail at its
+own batch size (and a tail that cannot fit being refused before anything
+trains), and distillation with a teacher wider than its student. Speed
+comparisons come last and are the first thing dropped when ``--budget-minutes``
+(default 120) runs short. Estimates are for a T4.
 
 It is safe to stop and run again: a stage that passed is not repeated
 (``--redo`` repeats everything). Everything it writes goes under ``--work``:
@@ -49,6 +51,18 @@ _ROUND_TESTS = (
     "test_convnext_v1_init.py",
     "test_lean_grn.py",
     "test_vm_check.py",
+    "test_backbone_tail_batch.py",
+    "test_backbone_skipped_steps.py",
+    "test_backbone_auto_batch.py",
+    "test_backbone_run_record.py",
+)
+# The files with tests that only run on a GPU (named ..._real_gpu, or the one
+# that checks the precision matches the card).
+_GPU_TESTS = (
+    "test_backbone_amp.py",
+    "test_backbone_tail_batch.py",
+    "test_backbone_skipped_steps.py",
+    "test_backbone_auto_batch.py",
 )
 _OTHER_TESTS = (
     "test_backbone_generic.py",
@@ -208,13 +222,15 @@ def last_json(output: str) -> dict | None:
 
 
 def run_numbers(out: Path) -> dict:
-    """What a pack training run reported: speed, precision, epochs, resume."""
+    """What a pack training run reported: speed, precision, epochs, resume,
+    the sizes it trained at, what its preflight measured and what it skipped."""
     numbers: dict = {}
     progress = Path(out) / "progress.jsonl"
     if not progress.is_file():
         return numbers
     speeds = []
     epochs = 0
+    phases: list[str] = []
     for raw in progress.read_text(encoding="utf-8").splitlines():
         try:
             frame = json.loads(raw)
@@ -229,17 +245,30 @@ def run_numbers(out: Path) -> dict:
                 speeds.append(frame["images_per_second"])
             if frame.get("loss_terms"):
                 numbers["loss_terms"] = frame["loss_terms"]
+            if frame.get("batch_size"):
+                phase = f"{frame.get('image_size')}px x{frame['batch_size']}"
+                if phase not in phases:
+                    phases.append(phase)
+        elif frame.get("stage") == "preflight":
+            checked = numbers.setdefault("preflight_mb", {})
+            checked[frame.get("phase")] = frame.get("peak_vram_mb")
+        elif frame.get("stage") == "warning":
+            numbers["warnings"] = numbers.get("warnings", 0) + 1
         elif frame.get("type") == "autobatch":
-            numbers["auto_batch_size"] = frame.get("batch_size")
+            tail = frame.get("phase") == "tail"
+            key = "auto_tail_batch_size" if tail else "auto_batch_size"
+            numbers[key] = frame.get("batch_size")
         elif frame.get("type") == "training_resumed":
             numbers["resumed"] = True
     numbers["epochs"] = epochs
+    if phases:
+        numbers["phases"] = phases
     if speeds:
         numbers["images_per_second"] = round(max(speeds), 1)
     result = Path(out) / "result.json"
     if result.is_file():
         saved = json.loads(result.read_text(encoding="utf-8"))
-        for key in ("validation_score", "peak_vram_mb"):
+        for key in ("validation_score", "peak_vram_mb", "skipped_steps", "grad_scale"):
             if saved.get(key) is not None:
                 numbers[key] = saved[key]
     return numbers
@@ -479,12 +508,14 @@ def _pytest(context: Context, name: str, files, minutes: float, *extra: str):
 
 
 def _gpu_tests(context: Context) -> Result:
-    code, output, numbers = _pytest(
-        context, "gpu_tests", ["test_backbone_amp.py"], 1.5,
+    code, _output, numbers = _pytest(
+        context, "gpu_tests", _GPU_TESTS, 2,
         "-k", "real_gpu or matches_the_card",
     )  # fmt: skip
-    if code != 0 or "2 passed" not in output:
-        return Result("failed", numbers, "both GPU tests must run and pass (not skip)")
+    # Picked by name, so a skipped one means the GPU was not seen.
+    ran = numbers["result"]
+    if code != 0 or " passed" not in ran or " skipped" in ran:
+        return Result("failed", numbers, "every GPU test must run and pass (not skip)")
     return Result("passed", numbers)
 
 
@@ -509,6 +540,7 @@ def _proof(context: Context, name: str, minutes: float, *args: str) -> Result:
         "precision": report.get("amp_dtype"),
         "grad_scaler": report.get("grad_scaler"),
         "peak_vram_mb": report.get("peak_vram_mb"),
+        "skipped_steps": report.get("skipped_steps"),
     }
     if report.get("lean_grn") is False:
         numbers["grn"] = "stock"
@@ -584,22 +616,63 @@ def _pause_resume(context: Context) -> Result:
     return pause_then_resume(context, "pause_resume", argv, out)
 
 
-def _tail(context: Context) -> Result:
-    result, out = _train(
-        context, "tail", _small_pack(context),
-        ["--size", "tiny", "--init", "apache", "--batch-size", "32", "--workers", "4",
-         "--limit", "1000", "--epochs", "2",
-         "--finetune-image-size", "384", "--finetune-epochs", "1"], 3,
-    )  # fmt: skip
-    progress = out / "progress.jsonl"
-    switched = progress.is_file() and "finetune_image_size" in progress.read_text(
-        "utf-8"
-    )
-    if result.status == "passed" and not switched:
-        return Result(
-            "failed", result.numbers, "the run never switched to the tail size"
+# A short run shaped like the real one: an epoch at 224px, then a 384px tail.
+_TAIL = [
+    "--epochs", "2", "--limit", "400", "--progress-every", "5",
+    "--finetune-image-size", "384", "--finetune-epochs", "1",
+]  # fmt: skip
+
+
+def tail_problem(numbers: dict) -> str:
+    """What is wrong with a run that should have trained Base at 224px and
+    batch 64, then at 384px and batch 16; empty when nothing is."""
+    if numbers.get("phases") != ["224px x64", "384px x16"]:
+        return (
+            f"expected 224px at batch 64, then 384px at batch 16; the run "
+            f"trained {numbers.get('phases')}"
         )
-    return result
+    if set(numbers.get("preflight_mb") or {}) != {"main", "tail"}:
+        return "the preflight did not check both phases before training"
+    return ""
+
+
+def _tail(context: Context) -> Result:
+    result, _out = _train(
+        context, "tail", _small_pack(context),
+        [*_BASE, *_TAIL, "--finetune-batch-size", "16"], 3,
+    )  # fmt: skip
+    problem = tail_problem(result.numbers) if result.status == "passed" else ""
+    return Result("failed", result.numbers, problem) if problem else result
+
+
+def refusal_problem(code: int, output: str, progress: str) -> str:
+    """What is wrong with a run the preflight should have refused; empty when
+    it was refused as it should be: exit 2, the tail named, nothing trained."""
+    if code != 2:
+        return f"expected exit 2 (refused), got exit {code}"
+    if "REFUSED" not in output or "tail" not in output:
+        return "the refusal does not name the tail"
+    if "training_step" in progress:
+        return "the run trained before it was refused"
+    return ""
+
+
+def _preflight_refuses(context: Context) -> Result:
+    # 384px at batch 64 needs about twice this card. The run has to say so
+    # before it trains anything, not at the switch.
+    out = _fresh_run_folder(context, "preflight_refuses")
+    argv = _module(
+        context, "bittrainer.tools.backbone_pack_train",
+        "--pack", str(_small_pack(context)), "--out", str(out),
+        *_BASE, *_TAIL, "--finetune-batch-size", "64",
+    )  # fmt: skip
+    code, output = _command(context, "preflight_refuses", argv, 1.5)
+    progress = out / "progress.jsonl"
+    problem = refusal_problem(
+        code, output, progress.read_text("utf-8") if progress.is_file() else ""
+    )
+    numbers = run_numbers(out)
+    return Result("failed", numbers, problem) if problem else Result("passed", numbers)
 
 
 def _distill(context: Context) -> Result:
@@ -651,27 +724,43 @@ def _soft_negatives(context: Context) -> Result:
     return result
 
 
+def auto_batch_problem(numbers: dict) -> str:
+    """What is wrong with the sizes ``--batch-size auto`` chose for Base on a
+    16 GB card; empty when nothing is. Batch 64 is known to fit at 224px, and
+    the first version chose 8."""
+    main, tail = numbers.get("auto_batch_base"), numbers.get("auto_batch_base_tail")
+    if not main or main < 48:
+        return f"Base at 224px was sized at {main}; 64 is known to fit"
+    if not tail or tail < 8 or tail >= main:
+        return f"the 384px tail was sized at {tail}, beside {main} at 224px"
+    return ""
+
+
 def _auto_batch(context: Context) -> Result:
-    # Alone, then with a teacher loaded: the probe sizes the batch on the student
-    # only, so the second run is where running out of memory would show.
+    # Base with a tail, each phase sized on its own and then trained at that
+    # size. Then a nano with a Base teacher loaded: its forward pass is part of
+    # every step that is measured.
     numbers = {}
     runs = (
-        ("auto_batch_base", ["--size", "base", "--init", "apache", "--workers", "4"]),
+        ("auto_batch_base", ["--size", "base", "--init", "apache", *_TAIL]),
         (
             "auto_batch_distill",
-            [*_NANO[:4], "--workers", "4", "--teacher", _teacher_file(context)],
+            [*_NANO[:4], "--teacher", _teacher_file(context),
+             "--epochs", "1", "--max-steps", "30"],
         ),
-    )
+    )  # fmt: skip
     for name, args in runs:
         result, _out = _train(
             context, name, _small_pack(context),
-            [*args, "--batch-size", "auto", "--epochs", "1", "--max-steps", "30"], 2.5,
+            [*args, "--workers", "4", "--batch-size", "auto"], 2.5,
         )  # fmt: skip
         numbers[name] = result.numbers.get("auto_batch_size")
+        numbers[f"{name}_tail"] = result.numbers.get("auto_tail_batch_size")
         numbers[f"{name}_vram_mb"] = result.numbers.get("peak_vram_mb")
         if result.status != "passed":
             return Result("failed", numbers, f"{name}: {result.note}")
-    return Result("passed", numbers)
+    problem = auto_batch_problem(numbers)
+    return Result("failed" if problem else "passed", numbers, problem)
 
 
 def _many_heads(context: Context) -> Result:
@@ -706,20 +795,21 @@ _AT_224 = ("--image-size", "224", "--batch-size", "64")
 
 STAGES: list[Stage] = [
     Stage("env", "the GPU, its driver and the precision it trains in", 0.2, _env),
-    Stage("gpu_tests", "the two GPU-only tests: fp16 scaler, precision by card", 1.5, _gpu_tests, ("env",)),
-    Stage("round_tests", "this round's test files on this machine", 9, _round_tests),
+    Stage("gpu_tests", "the GPU-only tests: fp16 scaler, precision by card, preflight, skipped steps", 2, _gpu_tests, ("env",)),
+    Stage("round_tests", "this round's test files on this machine", 11, _round_tests),
     Stage("learn_fp16", "a model learns in this card's precision", 2, _learn_fp16, ("env",)),
     Stage("convert_base", "real Apache V1 weights convert into a Base trunk", 2, _convert("base")),
     Stage("convert_small", "the same for the student sizes", 2, _convert("nano", "atto")),
     Stage("synth_packs", "generate the packs the next stages train from", 2, _synth_packs),
     Stage("teacher", "train a Base teacher from a pack, Apache start", 5, _teacher, ("env", "synth_packs")),
     Stage("pause_resume", "pause a Base run with its PAUSE file, then resume it", 6, _pause_resume, ("env", "synth_packs")),
-    Stage("tail", "switch to the 384px tail part-way through a run", 3, _tail, ("env", "synth_packs")),
+    Stage("tail", "Base at 224px and batch 64, then the 384px tail at batch 16", 3, _tail, ("env", "synth_packs")),
+    Stage("preflight_refuses", "a 384px tail at batch 64 is refused before anything trains", 1.5, _preflight_refuses, ("env", "synth_packs")),
     Stage("distill", "distil the Base teacher into a nano", 4, _distill, ("teacher",)),
     Stage("distill_pause_resume", "pause and resume a distillation", 5, _distill_pause_resume, ("teacher",)),
     Stage("distill_channels_last", "distil with channels-last memory", 2, _distill_channels_last, ("teacher",)),
     Stage("soft_negatives", "train with unlabelled images as a soft no", 2, _soft_negatives, ("env", "synth_packs")),
-    Stage("auto_batch", "automatic batch size, alone and with a teacher loaded", 5, _auto_batch, ("teacher",)),
+    Stage("auto_batch", "automatic batch size: Base with its tail, then with a teacher loaded", 5, _auto_batch, ("teacher",)),
     Stage("many_heads", "Base with 900 sparse heads: what the head count costs", 5, _many_heads, ("teacher",)),
     # Speed comparisons and extras: dropped first when the budget runs short.
     Stage("other_tests", "the older backbone tests on this machine", 7, _other_tests, optional=True),

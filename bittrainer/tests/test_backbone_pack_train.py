@@ -25,6 +25,7 @@ import bittrainer.tools.backbone_pack_train as runner
 from bittrainer.backbone_pack import PackError, pack_records, read_manifest
 from bittrainer.generic.tasks.backbone_distill_task import BackboneDistillTask
 from bittrainer.generic.tasks.backbone_task import BackboneTask
+from bittrainer.tests.backbone_stub import use_stub_trunk
 from bittrainer.tools.backbone_proof import make_fixture_dataset
 
 _CONCEPT_IDS = {"striped": "c11", "ringed": "c12"}
@@ -213,10 +214,16 @@ def test_a_run_trains_reports_and_exports(tmp_path):
     assert summary["status"] == "finished"
     result = json.loads((out / "result.json").read_text(encoding="utf-8"))
     assert result["epochs_completed"] == 1
+    # No GradScaler on a CPU: nothing skipped, and no scale to report.
+    assert result["skipped_steps"] == 0 and result["grad_scale"] is None
+    # The exported epoch's raw validation scores sit beside the candidate.
+    assert result["val_scores_file"] == "backbone_candidate.val_scores.npz"
+    assert (out / result["val_scores_file"]).is_file()
     with safe_open(out / "backbone_candidate.safetensors", framework="pt") as candidate:
         metadata = candidate.metadata()
     assert json.loads(metadata["heads_concepts_json"]) == ["c11", "c12"]
     assert list(json.loads(metadata["heads_groups_json"])) == ["g5"]
+    assert metadata["val_scores_file"] == result["val_scores_file"]
 
     frames = _frames(out)
     steps = [frame for frame in frames if frame.get("stage") == "training_step"]
@@ -577,6 +584,114 @@ def test_command_line_options_reach_the_run(monkeypatch, tmp_path):
         and seen["fresh"] is True
     )
     assert seen["extra"] == {"neg_pos_ratio": 3, "positive_cap_mode": "random"}
+
+
+# -- the tail's own batch size and the preflight ---------------------------------
+
+
+def test_the_tail_batch_size_reaches_the_request_only_when_given(tmp_path):
+    pack = _make_pack(tmp_path)
+
+    unset, _ = runner.build_request(pack, tmp_path / "a", **_options())
+    given, _ = runner.build_request(
+        pack, tmp_path / "b", **_options(finetune_batch_size=16)
+    )
+    probed, _ = runner.build_request(
+        pack, tmp_path / "c", **_options(finetune_batch_size=0)
+    )
+
+    # Unset means the trainer's own default: the tail keeps batch_size.
+    assert "finetune_batch_size" not in unset["training_config"]
+    assert given["training_config"]["finetune_batch_size"] == 16
+    assert probed["training_config"]["finetune_batch_size"] == 0
+
+
+def test_the_tail_batch_size_comes_from_the_command_line(monkeypatch, tmp_path):
+    seen: dict = {}
+
+    def _fake(pack, out, **kw):
+        seen.update(kw)
+        return {"status": "finished"}
+
+    monkeypatch.setattr(runner, "train_from_pack", _fake)
+    base = ["--pack", str(tmp_path), "--out", str(tmp_path / "run")]
+
+    assert runner.main(base) == 0
+    assert seen["finetune_batch_size"] is None
+    assert runner.main([*base, "--finetune-batch-size", "16"]) == 0
+    assert seen["finetune_batch_size"] == 16
+    assert runner.main([*base, "--finetune-batch-size", "auto"]) == 0
+    assert seen["finetune_batch_size"] == 0
+
+
+def test_a_tail_that_does_not_fit_is_a_refused_run_not_a_failed_one(
+    tmp_path, monkeypatch
+):
+    pack = _make_pack(tmp_path)
+    out = tmp_path / "run"
+    use_stub_trunk(monkeypatch)  # nothing trains here: no need for a real trunk
+
+    def _dry_step(self, ctx, model, image_size, batch_size):
+        if image_size == 96:
+            raise RuntimeError("CUDA out of memory. Tried to allocate 2.00 GiB.")
+        return None
+
+    monkeypatch.setattr(BackboneTask, "_dry_step", _dry_step)
+
+    refused = runner.train_from_pack(
+        pack,
+        out,
+        **_options(
+            epochs=2,
+            finetune_image_size=96,
+            finetune_epochs=1,
+            finetune_batch_size=8,
+            extra={"preflight": True},
+        ),
+    )
+
+    assert refused["status"] == "refused"
+    assert runner._EXIT_CODES[refused["status"]] == 2
+    reason = refused["reason"]
+    assert "tail" in reason and "96px" in reason and "batch size 8" in reason
+    assert "--finetune-batch-size" in reason
+    # Nothing trained and nothing broke: no step, no backup, no error file.
+    frames = _frames(out)
+    assert [f["phase"] for f in frames if f.get("stage") == "preflight"] == ["main"]
+    assert not any(frame.get("stage") == "training_step" for frame in frames)
+    assert not list((out / "backups").glob("backup_*.pt"))
+    assert not (out / "error.txt").exists()
+    assert not (out / "result.json").exists()
+
+
+def test_console_lines_show_the_preflight_skipped_steps_and_warnings():
+    step = {
+        "stage": "training_step", "epoch": 1, "epochs": 2, "batch": 50,
+        "batches": 2935, "loss": 0.5, "images_per_second": 61.0,
+        "skipped_steps": 16, "grad_scale": 1.0,
+    }  # fmt: skip
+    assert runner._line(step).endswith("61.0 img/s, 16 skipped, scale 1")
+    # bf16, or a CPU: there is no scaler, so nothing is said about one.
+    quiet = {**step, "skipped_steps": 0, "grad_scale": None}
+    assert runner._line(quiet).endswith("61.0 img/s")
+    epoch = {
+        "stage": "training", "epoch": 1, "epochs": 2, "loss": 0.5,
+        "validation_score": 0.7, "best_score": 0.7, "best_epoch": 1,
+        "images_per_second": 61.0, "skipped_steps": 16, "grad_scale": 2.0,
+    }  # fmt: skip
+    assert runner._line(epoch).endswith("61.0 img/s, 16 skipped, scale 2")
+
+    warning = {"stage": "warning", "status_text": "40 of the 50 steps were skipped"}
+    assert runner._line(warning) == "WARNING: 40 of the 50 steps were skipped"
+    fits = {"stage": "preflight", "status_text": "Preflight: the tail fits"}
+    assert runner._line(fits) == "Preflight: the tail fits"
+    resumed = {
+        "type": "training_resumed", "epoch": 25, "global_step": 73000,
+        "image_size": 384, "batch_size": 16,
+    }  # fmt: skip
+    assert runner._line(resumed) == "resumed at epoch 26, step 73000 (384px, batch 16)"
+    sized = {"type": "autobatch", "phase": "tail", "image_size": 384, "batch_size": 21}
+    assert runner._line(sized) == "automatic batch size 21 at 384px (tail)"
 
 
 # -- the GRN layer -------------------------------------------------------------
