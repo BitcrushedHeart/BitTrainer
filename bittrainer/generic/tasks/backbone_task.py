@@ -621,13 +621,13 @@ class BackboneTask(TrainingTask):
         The shared probe could not do this: it calls ``model(inputs)``, the
         wrapper here has no ``forward``, and the probe read the error that
         raises as "out of memory" at a batch of one and fell back to 8. It
-        still answers off a GPU (a fixed 32) and for head-only retraining,
-        whose loop runs on cached vectors.
+        still answers off a GPU (a fixed 32). Head-only retraining never comes
+        here: its loop runs on cached vectors at its own batch size.
         """
         device = ctx.device
         train_images = len(self.train_samples)
         room = _vram_room(device)
-        if room is None or self.trainer_name != BackboneTask.trainer_name:
+        if room is None:
             from bittrainer.autobatch import determine_batch_size
 
             found = determine_batch_size(

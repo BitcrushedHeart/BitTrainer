@@ -332,6 +332,40 @@ def test_off_a_gpu_auto_is_the_shared_probes_fixed_answer(tmp_path):
     ]
 
 
+def test_head_only_retraining_keeps_its_own_batch_when_asked_for_auto(
+    tmp_path, monkeypatch
+):
+    """Head-only retraining runs on cached vectors at its own batch size, so an
+    image batch of "auto" has nothing to measure. It used to go to the shared
+    probe, which called the wrapper's missing ``forward``, read the error as
+    "out of memory" and trained the heads at 8 instead of 256."""
+    from bittrainer.generic.tasks.backbone_heads_task import BackboneHeadsTask
+
+    def _never(*args, **kwargs):
+        raise AssertionError("head-only retraining must not measure an image batch")
+
+    monkeypatch.setattr(bt, "_vram_room", lambda device: _T4_ROOM)
+    monkeypatch.setattr("bittrainer.autobatch.determine_batch_size", _never)
+    monkeypatch.setattr(BackboneTask, "_dry_step", _never)
+    ctx = SimpleNamespace(device=CUDA)
+
+    def _heads(**config):
+        request = _request(tmp_path, batch_size="auto", **config)
+        request["backbone_init"] = {
+            "source": "local_active",
+            "checkpoint_path": str(tmp_path / "source.safetensors"),
+        }
+        return BackboneHeadsTask(request)
+
+    task = _heads()
+    assert task.resolve_batch_size(ctx, None, None) == 256
+    assert task.batch_size == task.finetune_batch_size == 256
+
+    task = _heads(head_batch_size=64)
+    assert task.resolve_batch_size(ctx, None, None) == 64
+    assert task.batch_size == task.finetune_batch_size == 64
+
+
 # -- real GPU (skipped at home; run this on the T4) ----------------------------
 
 

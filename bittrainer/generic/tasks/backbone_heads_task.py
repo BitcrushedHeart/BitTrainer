@@ -105,6 +105,15 @@ class BackboneHeadsTask(BackboneTask):
                 "'local_active' or 'timm_pretrained'."
             )
 
+    def resolve_batch_size(
+        self, ctx: TaskContext, model, resume_state: dict | None
+    ) -> int:
+        # The loop runs on cached vectors at its own batch size. An image batch
+        # of 0 / "auto" has nothing to measure here: the shared probe calls the
+        # wrapper's missing ``forward``.
+        self.finetune_batch_size = self.batch_size
+        return self.batch_size
+
     # -- one-time setup ----------------------------------------------------
     def fingerprint_init(self, ctx: TaskContext) -> None:
         # Never backs up or resumes: inert coordinator, always a fresh run.

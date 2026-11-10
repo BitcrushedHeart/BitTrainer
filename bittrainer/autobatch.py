@@ -43,7 +43,8 @@ _FALLBACK_BATCH = 8
 def is_out_of_memory(exc: BaseException) -> bool:
     """Running out of GPU memory, however it is worded: torch's own error, or
     cuDNN / cuBLAS failing to get their workspace on a card that is full (the
-    T4 says ``CUDNN_STATUS_ALLOC_FAILED``).
+    T4 says ``CUDNN_STATUS_ALLOC_FAILED``), cuDNN's algorithm search finding no
+    room in benchmark mode, or cuBLAS failing to start.
 
     The one test every trainer uses (Bitcrush ISSUE-1690): the batch probe, the
     preflights, the feature warm-up's back-off and the exception backup. Any
@@ -53,7 +54,13 @@ def is_out_of_memory(exc: BaseException) -> bool:
         return True
     text = str(exc)
     lowered = text.lower()
-    return "out of memory" in lowered or "cuda oom" in lowered or "ALLOC_FAILED" in text
+    return (
+        "out of memory" in lowered
+        or "cuda oom" in lowered
+        or "ALLOC_FAILED" in text
+        or "unable to find a valid cudnn algorithm" in lowered
+        or "CUBLAS_STATUS_NOT_INITIALIZED" in text
+    )
 
 
 class RunRefused(RuntimeError):
@@ -234,11 +241,19 @@ def profile_vram_batch_size(
             model.zero_grad(set_to_none=True)
             torch.cuda.empty_cache()
             if not is_out_of_memory(exc):
-                # A broken step must stop the run, not size it (Bitcrush
-                # ISSUE-1690): read as "out of memory" at a batch of one, it
-                # used to fall back to batch 8 and fail later, somewhere else.
-                model.train(was_training)
-                raise
+                if not xs:
+                    # A step that has never run is broken, and must stop the
+                    # run, not size it (Bitcrush ISSUE-1690): read as "out of
+                    # memory" at a batch of one, it used to fall back to batch
+                    # 8 and fail later, somewhere else.
+                    model.train(was_training)
+                    raise
+                # A smaller batch has fitted, so the step works: whatever this
+                # larger one raised is the card giving out in other words.
+                logger.warning(
+                    "VRAM probe: batch %d raised %s after batch %d fitted; read as does not fit",
+                    b, exc, xs[-1],
+                )
             failed_at = b
             status = "oom"
         if progress_callback is not None:

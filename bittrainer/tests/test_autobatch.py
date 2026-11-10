@@ -252,6 +252,28 @@ class TestOnlyMemoryErrorsAreSizedAround:
         assert not is_out_of_memory(RuntimeError("shapes cannot be multiplied"))
         assert not is_out_of_memory(NotImplementedError("missing the forward function"))
 
+    def test_a_full_card_in_cudnns_and_cublas_other_words_is_out_of_memory(self):
+        # With cudnn.benchmark on, a card with no room left for the algorithm
+        # search says the first; cuBLAS failing to start on a full card says
+        # the second. Neither mentions memory.
+        assert is_out_of_memory(
+            RuntimeError("Unable to find a valid cuDNN algorithm to run convolution")
+        )
+        assert is_out_of_memory(
+            RuntimeError(
+                "CUDA error: CUBLAS_STATUS_NOT_INITIALIZED when calling `cublasCreate(handle)`"
+            )
+        )
+
+    def test_an_unknown_error_after_a_batch_has_fitted_ends_the_ladder(self, _fake_card):
+        """Home training must not start failing where it used to carry on. Once
+        a smaller batch has run the step works, so whatever a larger batch
+        raises is the card giving out, in words the shared test does not know."""
+        model = _FailsFrom(8, "cuDNN error: CUDNN_STATUS_INTERNAL_ERROR")
+        result = _probe(model, _fake_card)
+        assert model.seen == [1, 2, 4, 8]
+        assert result["max_fitted_rung"] == 4
+
     def test_every_trainer_asks_the_same_test(self):
         import bittrainer.embedding_cache as embedding_cache
         import bittrainer.generic.tasks.backbone_task as backbone_task
