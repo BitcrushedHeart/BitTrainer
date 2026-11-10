@@ -14,6 +14,11 @@ can be trained away from the machine that holds the labels. It carries no names:
 train as yes/no heads), ``g`` are single-label groups with ``k`` classes. The
 ids stay ids all the way through: they become the head names in the exported
 candidate, and the machine that made the pack maps them back.
+
+The manifest may carry ``"geometry_sensitive"``: the ids of groups and yes/no
+heads whose answer depends on framing, position or tilt; their images train
+without geometric augmentation. The key is optional and the format number does
+not change for it.
 """
 
 from __future__ import annotations
@@ -42,6 +47,15 @@ def read_manifest(pack: Path) -> dict:
             f"(this trainer reads format {PACK_FORMAT})"
         )
     return manifest
+
+
+def pack_geometry_sensitive(pack: Path) -> list[str]:
+    """The manifest's ``geometry_sensitive`` ids, for the training request;
+    empty if the pack names none."""
+    names = read_manifest(pack).get("geometry_sensitive") or []
+    if not isinstance(names, list):
+        raise PackError(f"geometry_sensitive in the manifest of {pack} is not a list")
+    return [str(name) for name in names]
 
 
 def pack_records(pack: Path, *, limit: int | None = None) -> tuple[list[dict], dict]:
