@@ -912,6 +912,23 @@ def _stringify(value) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"), default=str)
 
 
+def backbone_task_class(request: dict):
+    """The task a backbone request runs as: ``BackboneDistillTask`` when
+    ``request["distillation"]`` names a teacher, else ``BackboneTask``.
+
+    One place decides, because the choice also decides the resume fingerprint:
+    anything that asks "do these backups belong to this run?" before training
+    (the pack runner does) must ask the same task the run will use.
+    """
+    if (request.get("distillation") or {}).get("teacher_checkpoint_path"):
+        from bittrainer.generic.tasks.backbone_distill_task import BackboneDistillTask
+
+        return BackboneDistillTask
+    from bittrainer.generic.tasks.backbone_task import BackboneTask
+
+    return BackboneTask
+
+
 def _train_backbone(
     request: dict,
     emit: Callable[[dict], None],
@@ -932,14 +949,10 @@ def _train_backbone(
     runs through the shared core.
     """
     from bittrainer.generic.generic_trainer import GenericTrainer
-    from bittrainer.generic.tasks.backbone_task import BackboneTask
 
-    task_class = BackboneTask
-    if (request.get("distillation") or {}).get("teacher_checkpoint_path"):
-        from bittrainer.generic.tasks.backbone_distill_task import BackboneDistillTask
-
-        task_class = BackboneDistillTask
-    task = task_class(request, cancel_event=stop, stop_event=stop_event)
+    task = backbone_task_class(request)(
+        request, cancel_event=stop, stop_event=stop_event
+    )
     return GenericTrainer().run(
         task,
         progress_callback=emit,

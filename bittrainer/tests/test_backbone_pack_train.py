@@ -15,12 +15,16 @@ from __future__ import annotations
 import json
 import shutil
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from safetensors import safe_open
 
+import bittrainer.backbone_trainer as bb
 import bittrainer.tools.backbone_pack_train as runner
 from bittrainer.backbone_pack import PackError, pack_records, read_manifest
+from bittrainer.generic.tasks.backbone_distill_task import BackboneDistillTask
+from bittrainer.generic.tasks.backbone_task import BackboneTask
 from bittrainer.tools.backbone_proof import make_fixture_dataset
 
 _CONCEPT_IDS = {"striped": "c11", "ringed": "c12"}
@@ -426,6 +430,65 @@ def test_a_missing_teacher_file_is_refused(tmp_path, monkeypatch):
 
     assert refused["status"] == "refused"
     assert "teacher" in refused["reason"]
+
+
+def test_a_teacher_request_runs_as_the_distillation_task():
+    teacher = {"distillation": {"teacher_checkpoint_path": "t.safetensors"}}
+    assert bb.backbone_task_class(teacher) is BackboneDistillTask
+    assert bb.backbone_task_class({}) is BackboneTask
+    assert bb.backbone_task_class({"distillation": {}}) is BackboneTask
+
+
+def test_backups_are_checked_by_the_task_the_run_will_use(monkeypatch):
+    """A distillation's backups carry their own fingerprint. Asked of the plain
+    task they would look like another run's, and a paused distillation could
+    never be resumed."""
+    asked = []
+
+    class _Task:
+        def __init__(self, request):
+            asked.append(request)
+
+        def make_context(self, *_args):
+            return SimpleNamespace(resume_state=None)
+
+        def fingerprint_init(self, context):
+            context.resume_state = {"epoch": 1}
+
+    monkeypatch.setattr(bb, "backbone_task_class", lambda request: _Task)
+    request = {"distillation": {"teacher_checkpoint_path": "t.safetensors"}}
+
+    assert runner._backups_fit(request) is True
+    assert asked == [request]
+
+
+def test_a_paused_distillation_resumes_through_the_runner(tmp_path):
+    """The whole path: train a teacher from the pack, distil it, pause, resume."""
+    pack = _make_pack(tmp_path)
+    teacher_run = tmp_path / "teacher"
+    assert (
+        runner.train_from_pack(pack, teacher_run, **_options())["status"] == "finished"
+    )
+    teacher = str(teacher_run / "backbone_candidate.safetensors")
+    out = tmp_path / "student"
+
+    def _pause_at_first_step(frame, control):
+        if frame.get("stage") == "training_step":
+            control.pause()
+
+    paused = runner.train_from_pack(
+        pack, out, on_frame=_pause_at_first_step, **_options(epochs=2, teacher=teacher)
+    )
+    assert paused["status"] == "paused"
+
+    finished = runner.train_from_pack(pack, out, **_options(epochs=2, teacher=teacher))
+
+    assert finished["status"] == "finished"
+    assert any(frame.get("type") == "training_resumed" for frame in _frames(out))
+    with safe_open(out / "backbone_candidate.safetensors", framework="pt") as candidate:
+        metadata = candidate.metadata()
+    assert "distilled_from" in metadata
+    assert json.loads(metadata["heads_concepts_json"]) == ["c11", "c12"]
 
 
 def test_weight_and_teacher_options_reach_the_run(monkeypatch, tmp_path):

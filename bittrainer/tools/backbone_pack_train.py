@@ -242,11 +242,13 @@ def _backups_fit(request: dict) -> bool:
     """Whether the newest backup in the run's folder belongs to this run.
 
     Asked of the trainer itself, before anything trains: a run that starts over
-    would rotate the old backups out within two saves.
+    would rotate the old backups out within two saves. The question goes to the
+    task the run will use: a distillation's backups carry their own
+    fingerprint, and the plain task would call them another run's.
     """
-    from bittrainer.generic.tasks.backbone_task import BackboneTask
+    from bittrainer.backbone_trainer import backbone_task_class
 
-    task = BackboneTask(request)
+    task = backbone_task_class(request)(request)
     context = task.make_context(None, None, None, None)
     task.fingerprint_init(context)
     return context.resume_state is not None
