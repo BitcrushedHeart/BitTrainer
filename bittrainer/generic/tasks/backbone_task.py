@@ -124,6 +124,10 @@ class BackboneTask(TrainingTask):
         # augment on the training thread, contiguous (NCHW) memory.
         self.dataloader_workers = int(c.get("dataloader_workers") or 0)
         self.channels_last = bool(c.get("channels_last", False))
+        # Heartbeat inside an epoch: a ``training_step`` frame every N optimizer
+        # steps (0 = none, the legacy behaviour). An epoch on a big pool runs for
+        # an hour or more; without this a detached run cannot be told from a hang.
+        self.progress_every_steps = int(c.get("progress_every_steps") or 0)
         # The last epoch's wall time and image count, surfaced on its frame.
         self._train_seconds = 0.0
         self._train_images = 0
@@ -523,6 +527,33 @@ class BackboneTask(TrainingTask):
         # Backbone resume is epoch-restart: no schedule replay, no partial start.
         return train_loader, None, 0
 
+    def make_step_callback(
+        self,
+        ctx: TaskContext,
+        epoch: int,
+        eff_bs: int,
+        best: BestTracker,
+        epoch_start_mono,
+    ):
+        """The in-epoch heartbeat, or ``None`` when ``progress_every_steps`` is 0."""
+        if self.progress_every_steps <= 0:
+            return None
+
+        def _step(batch: int, batches: int, loss: float, images: int, seconds: float):
+            self._emit(
+                "training_step",
+                f"Epoch {epoch + 1}/{self.epochs}, batch {batch}/{batches}",
+                epoch=epoch + 1,
+                epochs=self.epochs,
+                batch=batch,
+                batches=batches,
+                steps=self.step,
+                loss=loss,
+                images_per_second=images / seconds if seconds > 0 else None,
+            )
+
+        return _step
+
     def train_epoch(
         self,
         ctx: TaskContext,
@@ -540,6 +571,7 @@ class BackboneTask(TrainingTask):
         epoch_loss = 0.0
         epoch_batches = 0
         images_seen = 0
+        total_batches = len(train_loader)
         started = time.perf_counter()
         for images, binary_labels, group_labels in train_loader:
             if self.cancel_event is not None and self.cancel_event.is_set():
@@ -590,6 +622,17 @@ class BackboneTask(TrainingTask):
             epoch_loss += float(loss.detach())
             epoch_batches += 1
             images_seen += int(images.shape[0])
+            if (
+                step_callback is not None
+                and epoch_batches % self.progress_every_steps == 0
+            ):
+                step_callback(
+                    epoch_batches,
+                    total_batches,
+                    epoch_loss / epoch_batches,
+                    images_seen,
+                    time.perf_counter() - started,
+                )
             if boundary_hook(epoch_batches) == "stop":  # pause backed up mid-epoch
                 break
         self._train_seconds = time.perf_counter() - started
