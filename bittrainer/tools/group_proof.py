@@ -5,18 +5,26 @@ Draws a small group, then runs what a cloud group training runs, end to end:
 1. a head-only training on the drawn images: the model Engine holds at home;
 2. a scoped export of the group's cached tensors
    (``bittrainer.cloud_export.build_scoped_export``), verified the way the pod
-   verifies what it receives;
+   verifies what it receives. By default it carries ids, never names, as an
+   export that leaves the machine must (``--no-private-names`` for the old
+   way); the proof checks that none of its own names or paths is in it;
 3. the drawn images deleted, and a full update of the head-only model trained
-   from the export alone (``sourceless``, as on the pod).
+   from the export alone (``sourceless``, as on the pod), on the class ids and
+   from an incumbent that carries them, as the VM gets it.
 
 It reports how fast the update trained and how much memory it took, the
 precision it chose, whether the GradScaler and the lean GRN layer were on,
-whether the fused back pass ran, and the optimizer steps the scaler skipped.
+whether the fused back pass ran, and the optimizer steps the scaler skipped. A
+run whose fp16 scaler collapsed fails (``scaler_held``): it barely trained.
 No real image is read, so the same command proves the trainers at home and on
 the rented T4::
 
     python -m bittrainer.tools.group_proof
-    python -m bittrainer.tools.group_proof --size base --bucket-size 512 --device cuda
+    python -m bittrainer.tools.group_proof --size base --bucket-size 512 --device cuda \\
+        --trunk runs/teacher/backbone_candidate.safetensors
+
+A real run always starts from a trained model; ``--trunk`` gives the proof one
+(random weights, the default at home, can collapse the fp16 scaler).
 
 The classes are arrangements a ConvNeXt learns quickly (two halves side by
 side, two halves stacked, a blob in the centre) and ``__none__`` (a plain
@@ -47,6 +55,8 @@ from pathlib import Path
 
 CLASSES = ("side_by_side", "stacked", "centre_blob", "__none__")
 GROUP = "proof_group"
+# The id the group goes by in a private export (contract C1: "g" + five digits).
+ALIAS = "g00000"
 
 # What ``--amp`` asks the trainer for. "auto" is the trainer's own default,
 # bf16, which a card without native bf16 (the T4) turns into fp16.
@@ -133,6 +143,9 @@ def build_config(
     preflight: bool | None = None,
     backup_dir: Path | None = None,
     resume_from: Path | None = None,
+    class_names: list[str] | None = None,
+    group_name: str = GROUP,
+    best_model_name: str = "best.pt",
 ):
     """The ``GroupTrainConfig`` for one phase of a proof run. Every training
     default the group trainer ships with is left alone; only the settings
@@ -142,9 +155,10 @@ def build_config(
     return GroupTrainConfig(
         group_folder=str(group_folder),
         num_classes=len(CLASSES),
-        class_names=list(CLASSES),
+        class_names=list(class_names or CLASSES),
         checkpoint_dir=str(checkpoint_dir),
-        group_name=GROUP,
+        group_name=group_name,
+        best_model_name=best_model_name,
         max_epochs=int(epochs),
         patience=max(3, int(epochs)),
         backbone_variant=size,
@@ -188,7 +202,9 @@ def update_numbers(frames: list[dict]) -> dict:
                 "train_loss",
                 "val_macro_f1",
                 "elapsed_seconds",
+                "steps",
                 "skipped_steps",
+                "late_skipped_steps",
                 "grad_scale",
             )
         }
@@ -242,6 +258,25 @@ def _no_backup(folder: Path) -> bool:
     return not list(Path(folder).glob("backup_*.pt*"))
 
 
+def _own_names(group: Path, refs) -> set[str]:
+    """Every name and path the proof made at home: what its export must not hold."""
+    names = {GROUP, str(group), str(group.parent)}
+    names |= {name for name in CLASSES if name != "__none__"}
+    for ref in refs:
+        names |= {ref.path, os.path.basename(ref.path)}
+    return names
+
+
+def _incumbent_with_ids(source: str, target: Path, class_ids: dict[str, str]) -> None:
+    """The head-only model as the VM gets it: its class names replaced by ids."""
+    import torch
+
+    model = torch.load(source, map_location="cpu", weights_only=False)
+    model["class_names"] = [class_ids[name] for name in model["class_names"]]
+    target.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(model, target)
+
+
 # --------------------------------------------------------------------------- #
 # The run                                                                     #
 # --------------------------------------------------------------------------- #
@@ -267,6 +302,7 @@ def run_proof(
     expect_refusal: bool = False,
     min_score: float | None = None,
     seed: int = 0,
+    private_names: bool = True,
 ) -> dict:
     """Draw the group under ``root``, run the three phases and return the
     report. A failing run is reported, not raised: ``checks`` says which part
@@ -276,12 +312,14 @@ def run_proof(
     from bittrainer.amp import amp_label, resolve_amp_dtype
     from bittrainer.autobatch import RunRefused
     from bittrainer.cloud_export import (
+        PrivateNames,
         SampleRef,
         build_scoped_export,
+        scoped_export_strings,
         verify_scoped_cache,
     )
     from bittrainer.generic.generic_trainer import GenericTrainer
-    from bittrainer.generic.tasks.group_task import GroupTask
+    from bittrainer.generic.tasks.group_task import GroupTask, scaler_collapse_in
     from bittrainer.generic.tasks.head_only_task import HeadOnlyTask
     from bittrainer.group_trainer import _get_dtype
 
@@ -345,28 +383,48 @@ def run_proof(
             for split, dataset in (("train", head_task.train_ds), ("val", head_task.val_ds))
             for sample in dataset.samples
         ]
+        private = PrivateNames(group_alias=ALIAS) if private_names else None
         manifest = build_scoped_export(
             global_cache_dir=home / "cache", export_dir=pod / "export", samples=refs,
             modeltype=head_task.config.modeltype, num_classes=len(CLASSES),
             class_names=list(CLASSES), group_name=GROUP, safe_name=GROUP,
+            private_names=private,
         )  # fmt: skip
         verified, _key, message = verify_scoped_cache(pod / "export" / "cache", manifest)
         checks["export_verified"] = verified
         if not verified:
             raise RuntimeError(f"the export did not verify: {message}")
+        checks["export_has_no_names"] = None
+        if private is not None:
+            strings = scoped_export_strings(pod / "export")
+            leaked = [n for n in _own_names(group, refs) if any(n in s for s in strings)]
+            checks["export_has_no_names"] = not leaked
+            if leaked:  # counted, not named: the report names no file
+                raise RuntimeError(f"the export holds {len(leaked)} of the proof's own names")
         # The pod never has the images: delete them before the update.
         shutil.rmtree(group)
         checks["sources_removed"] = not group.exists()
-        (pod / "checkpoints").mkdir(parents=True, exist_ok=True)
-        shutil.copy2(incumbent, pod / "checkpoints" / "best.pt")
-        (pod / GROUP).mkdir(parents=True, exist_ok=True)
+        # What the update is told, as the VM is told it: ids, and an incumbent
+        # that carries them; or, without private names, the names.
+        names = dict(class_names=list(CLASSES), group_name=GROUP, best_model_name="best.pt")
+        if private is None:
+            (pod / "checkpoints").mkdir(parents=True, exist_ok=True)
+            shutil.copy2(incumbent, pod / "checkpoints" / "best.pt")
+        else:
+            names = dict(
+                class_names=[private.class_ids[name] for name in CLASSES],
+                group_name=ALIAS, best_model_name=f"{ALIAS}.pt",
+            )  # fmt: skip
+            _incumbent_with_ids(incumbent, pod / "checkpoints" / f"{ALIAS}.pt", private.class_ids)
+        (pod / names["group_name"]).mkdir(parents=True, exist_ok=True)
 
         # 3. The sourceless full update of the head-only model.
         def _update_config(**extra):
             config = build_config(
-                pod / GROUP, pod / "checkpoints", cache_dir=pod / "export" / "cache",
-                embedding_dir=pod / "embeddings", sourceless=True, preflight=preflight,
-                backup_dir=pod / "backups", **settings, **extra,
+                pod / names["group_name"], pod / "checkpoints",
+                cache_dir=pod / "export" / "cache", embedding_dir=pod / "embeddings",
+                sourceless=True, preflight=preflight, backup_dir=pod / "backups",
+                **names, **settings, **extra,
             )  # fmt: skip
             # On the config, not the run: the loop announces its back-pass mode
             # through the config's callback.
@@ -404,7 +462,14 @@ def run_proof(
         checks["no_backup_left"] = _no_backup(pod / "backups")
     elif refused is not None:
         error = f"RunRefused: {refused}"
+    grad_scaler = task.scaler is not None if task is not None else None
+    # What the fp16 scaler did, by the trainer's own rule: a run whose scaler
+    # collapsed barely trained, so it does not pass.
+    collapse = scaler_collapse_in(numbers["epochs"]) if grad_scaler else ""
     if not expect_refusal and "sources_removed" in checks:
+        checks["scaler_held"] = (
+            None if not grad_scaler or not numbers["epochs"] else not collapse
+        )
         completed = result is not None and not result.get("paused")
         losses = [row["train_loss"] for row in numbers["epochs"]]
         checks["update_completed"] = completed
@@ -431,8 +496,10 @@ def run_proof(
         props = torch.cuda.get_device_properties(torch.device(device))
         gpu_name, capability = props.name, f"{props.major}.{props.minor}"
         peak_vram_mb = round(torch.cuda.max_memory_allocated() / 2**20)
-    grad_scaler = task.scaler is not None if task is not None else None
     lean_grn = task.lean_grn if task is not None else None
+    grad_scale = (result or {}).get("grad_scale")
+    if grad_scale is None and numbers["epochs"]:
+        grad_scale = numbers["epochs"][-1].get("grad_scale")
     return {
         "torch": torch.__version__,
         "device": device,
@@ -453,6 +520,9 @@ def run_proof(
         "lean_grn": lean_grn,
         "fused_back_pass": numbers["fused_back_pass"],
         "skipped_steps": getattr(task, "skipped_steps", None) if grad_scaler else None,
+        "grad_scale": grad_scale if grad_scaler else None,
+        "scaler_collapse": collapse or None,
+        "private_names": bool(private_names),
         "epochs": numbers["epochs"],
         "best_images_per_second": numbers["best_images_per_second"],
         "peak_vram_mb": peak_vram_mb,
@@ -554,6 +624,11 @@ def main(argv: list[str] | None = None) -> int:
     )  # fmt: skip
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument(
+        "--private-names", action=argparse.BooleanOptionalAction, default=True,
+        help="export ids, never names, as an export leaving the machine must "
+        "(--no-private-names: the old export, names and all)",
+    )  # fmt: skip
+    parser.add_argument(
         "--workdir", default=None,
         help="keep the images, export and models here (default: temp, deleted)",
     )  # fmt: skip
@@ -577,6 +652,7 @@ def main(argv: list[str] | None = None) -> int:
         "expect_refusal": args.expect_refusal,
         "min_score": None if args.min_score < 0 else args.min_score,
         "seed": args.seed,
+        "private_names": args.private_names,
     }
     if args.workdir:
         report = run_proof(Path(args.workdir), **options)

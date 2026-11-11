@@ -574,6 +574,146 @@ def test_a_group_stage_reports_its_speed_and_passes_on_a_passing_proof(
     assert _by_name()["group_tiny"].run(context).status == "failed"
 
 
+# -- a group stage starts like a real run and notices a collapsed scaler --------
+# (Bitcrush ISSUE-1690). On the T4 on 2026-11-10 the group stages started from
+# random weights: the fp16 scaler fell to 0.0625 with most of the first epoch's
+# steps skipped, and every stage passed. From the series' Base teacher: 2
+# skipped steps, scale 16384, loss falling.
+
+_TEACHER = "runs/teacher/backbone_candidate.safetensors"
+_TRUNK_OF = {
+    "group_base": ("teacher", _TEACHER),
+    "group_nano": ("distill", "runs/distill/backbone_candidate.safetensors"),
+    "group_tiny": ("convert_tiny", "trunks/tiny.safetensors"),
+    "group_refuses": ("convert_base", "trunks/base.safetensors"),
+    "group_pause_resume": ("convert_small", "trunks/nano.safetensors"),
+    "group_base_eager": ("teacher", _TEACHER),
+    "group_base_stock_grn": ("teacher", _TEACHER),
+}
+
+
+def test_every_group_stage_starts_from_a_trunk_the_series_made(tmp_path, monkeypatch):
+    ran = _commands(monkeypatch)
+    context = _context(tmp_path)
+    stages = _by_name()
+    names = [name for name in stages if name.startswith("group_")]
+    assert set(names) == set(_TRUNK_OF)
+    for name in names:
+        stages[name].run(context)
+
+    made_by = {
+        "teacher": _value(list(vm._BASE), "--size"),
+        "distill": _value(list(vm._NANO), "--size"),
+    }
+    for name, argv in zip(names, ran, strict=True):
+        maker, trunk = _TRUNK_OF[name]
+        assert _value(argv, "--trunk") == str(tmp_path / trunk), name
+        assert maker in stages[name].needs, name
+        # The trunk is the size the stage trains, and never timm's own weights
+        # (their licence is non-commercial).
+        trunk_size = made_by.get(maker) or trunk.split("/")[-1].split(".")[0]
+        assert trunk_size == _value(argv, "--size"), name
+        assert "timm" not in argv, name
+
+
+def test_the_tiny_trunk_is_converted_like_the_others(tmp_path, monkeypatch):
+    ran = _commands(monkeypatch)
+    stage = _by_name()["convert_tiny"]
+
+    assert stage.run(_context(tmp_path)).status == "passed"
+
+    (argv,) = ran
+    assert argv[1:3] == ["-m", "bittrainer.tools.convnext_v1_trunk"]
+    assert _value(argv, "--size") == "tiny"
+    assert _value(argv, "--out") == str(tmp_path / "trunks" / "tiny.safetensors")
+    assert not stage.optional
+
+
+_T4 = {"amp_dtype": "float16", "grad_scaler": True, "lean_grn": True, "compiled": True}
+
+
+def _epochs(*rows):
+    keys = ("epoch", "steps", "skipped_steps", "late_skipped_steps", "grad_scale")
+    return [dict(zip(keys, row, strict=True)) for row in rows]
+
+
+def test_a_group_stage_whose_scaler_collapsed_fails_and_says_why():
+    # From the teacher on 2026-11-10: two skips in the opening descent.
+    healthy = {**_T4, "grad_scale": 16384.0, "epochs": _epochs(
+        (1, 11, 2, 0, 16384.0), (2, 11, 0, 0, 16384.0), (3, 11, 0, 0, 16384.0))}  # fmt: skip
+    assert vm.group_problem(healthy, (), native_bf16=False) == ""
+
+    # From random weights: the first epoch all skipped, the scale under 1.
+    random_start = {**_T4, "grad_scale": 0.0625, "epochs": _epochs(
+        (1, 11, 11, 0, 32.0), (2, 11, 9, 9, 0.0625))}  # fmt: skip
+    problem = vm.group_problem(random_start, (), native_bf16=False)
+    assert "GradScaler collapsed" in problem and "below 1" in problem
+
+    # Still above 1, but most of an epoch skipped after the scaler settled.
+    stalled = {**_T4, "grad_scale": 64.0, "epochs": _epochs(
+        (1, 11, 4, 0, 4096.0), (2, 10, 6, 6, 64.0))}  # fmt: skip
+    problem = vm.group_problem(stalled, (), native_bf16=False)
+    assert "GradScaler collapsed" in problem and "6 of its 10 steps" in problem
+
+    # An opening descent that fills a short first epoch is the scaler finding
+    # its level, not a collapse.
+    opening = {**_T4, "grad_scale": 4096.0, "epochs": _epochs(
+        (1, 4, 4, 0, 4096.0), (2, 4, 0, 0, 4096.0))}  # fmt: skip
+    assert vm.group_problem(opening, (), native_bf16=False) == ""
+
+    # A bf16 card has no scaler; a refusal trained nothing.
+    ampere = {**random_start, "amp_dtype": "bfloat16", "grad_scaler": False, "lean_grn": False}
+    assert vm.group_problem(ampere, (), native_bf16=True) == ""
+    assert vm.group_problem(random_start, ("--expect-refusal",), native_bf16=False) == ""
+
+
+def test_a_group_stage_reports_the_collapse_even_when_the_proof_failed_on_it(
+    tmp_path, monkeypatch
+):
+    import bittrainer.amp as amp
+
+    monkeypatch.setattr(amp, "native_bf16", lambda device: False)  # a T4
+    collapsed = {
+        **_T4, "passed": True, "grad_scale": 0.0625,
+        "epochs": _epochs((1, 11, 11, 0, 32.0), (2, 11, 9, 9, 0.0625)),
+    }  # fmt: skip
+    _commands(monkeypatch, output=json.dumps(collapsed, indent=2))
+    result = _by_name()["group_base"].run(_context(tmp_path))
+    assert result.status == "failed" and "GradScaler collapsed" in result.note
+    assert result.numbers["grad_scale"] == 0.0625
+
+    failed = {**collapsed, "passed": False, "checks": {"scaler_held": False}}
+    _commands(monkeypatch, exit_code=1, output=json.dumps(failed, indent=2))
+    result = _by_name()["group_nano"].run(_context(tmp_path))
+    assert result.status == "failed"
+    assert "GradScaler collapsed" in result.note and "scaler_held" in result.note
+
+
+# What each stage took on the T4 in rehearsal R1 (2026-11-10), in seconds. The
+# group stages then started from random weights; from a trunk they train the
+# same steps on the same images.
+_R1_SECONDS = {
+    "gpu_tests": 71.7, "round_tests": 154.4, "learn_fp16": 31.3, "convert_base": 10.5,
+    "convert_small": 11.1, "synth_packs": 6.7, "teacher": 154.9, "pause_resume": 260.8,
+    "tail": 98.0, "preflight_refuses": 40.6, "distill": 106.8,
+    "distill_pause_resume": 181.2, "distill_channels_last": 74.2, "soft_negatives": 68.9,
+    "reject_negatives": 98.1, "hill_negatives": 97.7, "mask_common": 89.0, "geometry": 45.0,
+    "auto_batch": 407.0, "many_heads": 202.2, "group_base": 449.5, "group_nano": 232.6,
+    "group_tiny": 263.7, "group_refuses": 61.6, "group_pause_resume": 147.1,
+    "other_tests": 146.2, "group_base_eager": 349.8, "group_base_stock_grn": 283.3,
+}  # fmt: skip
+
+
+def test_no_estimate_is_below_what_the_t4_measured():
+    stages = _by_name()
+    for name, seconds in _R1_SECONDS.items():
+        assert stages[name].minutes * 60 >= seconds, name
+
+
+def test_the_private_export_tests_run_on_the_rented_gpu_too():
+    assert "test_cloud_export_private_names.py" in vm._ROUND_TESTS
+
+
 def test_base_stages_ask_for_what_a_16gb_card_holds():
     """First run on the T4: Base ran out of memory at batch 128, and at 384px
     with batch 32. The comparison that replaced them measures what the lean GRN

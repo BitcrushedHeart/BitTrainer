@@ -371,6 +371,9 @@ def test_scaler_state_and_skipped_steps_ride_the_backup(tmp_path):
     task.scaler.value = 1024.0
     task.skipped_steps = 16
     task._scaler_settled = True
+    rows = [{"epoch": 1, "steps": 9, "skipped_steps": 16, "late_skipped_steps": 0, "grad_scale": 1024.0}]
+    task.scaler_epochs = list(rows)
+    task.scaler_warning = "collapsed"
 
     state = task.collect_extra_state(
         ctx, rng_epoch_start=None, schedule=None, batch_in_epoch=0
@@ -383,6 +386,7 @@ def test_scaler_state_and_skipped_steps_ride_the_backup(tmp_path):
     resumed.restore_resume_extra(ctx, state)
     assert resumed.scaler.loaded == {"scale": 1024.0}
     assert resumed.skipped_steps == 16 and resumed._scaler_settled is True
+    assert resumed.scaler_epochs == rows and resumed.scaler_warning == "collapsed"
 
 
 def test_a_bf16_backup_is_unchanged_and_resumes_in_either_precision(tmp_path):
@@ -391,7 +395,9 @@ def test_a_bf16_backup_is_unchanged_and_resumes_in_either_precision(tmp_path):
     state = plain.collect_extra_state(
         ctx, rng_epoch_start=None, schedule=None, batch_in_epoch=0
     )
-    assert not {"grad_scaler", "skipped_steps", "scaler_settled"} & set(state)
+    assert not {
+        "grad_scaler", "skipped_steps", "scaler_settled", "scaler_epochs", "scaler_warning"
+    } & set(state)  # fmt: skip
 
     # Resumed in fp16: a fresh scaler, its opening descent still to come.
     fp16 = GroupTask(group_config(tmp_path, tmp_path / "ck"))
@@ -428,6 +434,115 @@ def test_skipped_steps_are_counted_and_reported(tmp_path, monkeypatch):
     assert scaler.steps == 12 and scaler.applied == 9
     assert result["grad_scaler"] is True and result["skipped_steps"] == 3
     assert result["grad_scale"] == 65536.0 / 8
+    # Per epoch: its steps, its skips, the ones after the scaler settled (the
+    # fourth step; the first two were its opening descent) and the scale.
+    assert [(f["steps"], f["late_skipped_steps"]) for f in epochs] == [(6, 1), (6, 0)]
+    assert result["scaler_epochs"] == [
+        {"epoch": 1, "steps": 6, "skipped_steps": 3, "late_skipped_steps": 1, "grad_scale": 8192.0},
+        {"epoch": 2, "steps": 6, "skipped_steps": 0, "late_skipped_steps": 0, "grad_scale": 8192.0},
+    ]
+    assert result["scaler_collapsed"] is False and result["scaler_warning"] is None
+    assert not _warnings(frames)
+
+
+# --------------------------------------------------------------------------- #
+# A collapsing scaler is said out loud                                         #
+# --------------------------------------------------------------------------- #
+
+
+def _warnings(frames):
+    return [f for f in frames if f.get("stage") == "warning"]
+
+
+def _fp16_run(tmp_path, monkeypatch, scaler, *, epochs=1):
+    use_micro_trunk(monkeypatch)
+    make_group(tmp_path / "grp", per_class=4)
+    monkeypatch.setattr(group_task, "make_grad_scaler", lambda *_a: scaler)
+    frames: list[dict] = []
+    result = GenericTrainer().run(
+        GroupTask(
+            group_config(tmp_path / "grp", tmp_path / "ck", batch_size=2, max_epochs=epochs)
+        ),
+        progress_callback=frames.append,
+    )
+    return result, frames
+
+
+def test_the_collapse_rule_separates_the_t4_runs():
+    """On the T4 (2026-11-10): from random weights the scale fell to 0.0625;
+    from a trained trunk, 2 skipped steps and a scale of 16384."""
+    rule = group_task.scaler_collapse
+    assert rule(epoch=1, steps=11, late_skipped=9, grad_scale=0.0625)
+    assert "below 1" in rule(epoch=2, steps=11, late_skipped=0, grad_scale=0.5)
+    assert rule(epoch=1, steps=11, late_skipped=0, grad_scale=16384.0) == ""
+    # Most of an epoch skipped after the scaler settled, at any scale.
+    assert "4 of its 6 steps" in rule(epoch=1, steps=6, late_skipped=4, grad_scale=4096.0)
+    # Two late skips are jitter, not a collapse; and half is not most.
+    assert rule(epoch=1, steps=3, late_skipped=2, grad_scale=4096.0) == ""
+    assert rule(epoch=1, steps=8, late_skipped=4, grad_scale=4096.0) == ""
+    assert rule(epoch=1, steps=6, late_skipped=0, grad_scale=None) == ""
+
+
+def test_a_scale_below_one_raises_a_warning_frame_and_marks_the_result(tmp_path, monkeypatch):
+    """The first step lands, then every step is skipped: 4 -> 0.125 within the
+    first epoch, and it stays there. The run trains on, and says so each epoch."""
+    scaler = _RecordingScaler(skips=set(range(2, 100)))
+    scaler.value = 4.0
+
+    result, frames = _fp16_run(tmp_path, monkeypatch, scaler, epochs=2)
+
+    warnings = _warnings(frames)
+    assert [w["epoch"] for w in warnings] == [1, 2]  # once an epoch
+    first = warnings[0]
+    assert first["warning"] == "grad_scaler_collapsed" and first["type"] == "training_progress"
+    assert first["grad_scale"] < 1 and "below 1" in first["status_text"]
+    epochs = [f for f in frames if f.get("type") == "epoch_complete"]
+    assert frames.index(first) < frames.index(epochs[0])
+    assert epochs[0]["stage"] == "training"  # the stream goes back to training
+    assert result["scaler_collapsed"] is True
+    assert "below 1" in result["scaler_warning"]
+    assert [row["grad_scale"] < 1 for row in result["scaler_epochs"]] == [True, True]
+    assert "checkpoint_path" in result  # it finished; Engine decides what to do
+
+
+def test_most_of_an_epoch_skipped_after_settling_is_a_collapse(tmp_path, monkeypatch):
+    scaler = _RecordingScaler(skips={2, 3, 4, 5})  # 65536 -> 4096: above 1
+
+    result, frames = _fp16_run(tmp_path, monkeypatch, scaler)
+
+    (warning,) = _warnings(frames)
+    assert warning["late_skipped_steps"] == 4 and warning["steps"] == 6
+    assert "4 of its 6 steps" in warning["status_text"]
+    assert result["scaler_collapsed"] is True
+
+
+def test_an_opening_descent_is_not_a_collapse(tmp_path, monkeypatch):
+    """Five of the first epoch's six steps skipped while the scale comes down
+    from 65536, then a clean epoch: nothing to warn about."""
+    scaler = _RecordingScaler(skips={1, 2, 3, 4, 5})
+
+    result, frames = _fp16_run(tmp_path, monkeypatch, scaler, epochs=2)
+
+    assert not _warnings(frames)
+    assert result["scaler_collapsed"] is False
+    assert [row["skipped_steps"] for row in result["scaler_epochs"]] == [5, 0]
+
+
+def test_a_bf16_or_cpu_run_reports_nothing_new(tmp_path, monkeypatch):
+    use_micro_trunk(monkeypatch)
+    make_group(tmp_path / "grp", per_class=4)
+    frames: list[dict] = []
+
+    result = GenericTrainer().run(
+        GroupTask(group_config(tmp_path / "grp", tmp_path / "ck", batch_size=2)),
+        progress_callback=frames.append,
+    )
+
+    new = {"steps", "late_skipped_steps", "skipped_steps", "grad_scale", "warning"}
+    for frame in frames:
+        if frame.get("stage") in ("training", "warning"):
+            assert not new & set(frame), frame
+    assert not {"scaler_epochs", "scaler_collapsed", "scaler_warning", "grad_scale"} & set(result)
 
 
 def test_a_paused_fp16_run_resumes_with_its_scale_and_count(tmp_path, monkeypatch):

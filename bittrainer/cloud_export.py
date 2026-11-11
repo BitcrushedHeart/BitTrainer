@@ -22,6 +22,16 @@ Source of truth for "this group's dataset" is ``GroupDataset.samples`` (disk +
 the caller-injected ``extra_paths`` for the never-copied ``__none__`` negatives),
 i.e. exactly what ``run_group_training`` caches. The backend additionally passes
 ``db_expected_paths`` so a disk-vs-DB drift fails loudly at export time.
+
+Private names (Bitcrush ISSUE-1690): an export that leaves the machine may not
+hold a local path, a file name, the group's name or a class name. Given a
+:class:`PrivateNames`, the export writes ids in their place and hands the maps
+back for home use; :func:`scoped_export_strings` lists what an export still
+says about its samples, classes and group, for the caller's final check. A
+sourceless run never reads a sample's path or name: it keys on the index key,
+reads label / split from the index and the bucket from the tensor file, so it
+trains on ids exactly as on paths. Only the tensor files whose bytes name a
+sample (``__source_path``) are rewritten; that is the one place torch is used.
 """
 
 from __future__ import annotations
@@ -29,6 +39,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import shutil
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
@@ -39,10 +50,30 @@ from typing import Any, Sequence
 # asserts these against the live SmartCache so a format bump fails loudly.
 _CACHE_VERSION = 2
 _CACHE_INDEX_FILENAME = "cache.json"
+# The trainer treats this class name specially; it is never renamed.
+_NONE_CLASS = "__none__"
 
 
 class ScopedExportError(Exception):
     """A scoped export failed a hard correctness assertion. Never ship anyway."""
+
+
+@dataclass
+class PrivateNames:
+    """Ids for everything an export would otherwise name (contract C1).
+
+    Pass one to :func:`build_scoped_export`. The export then says
+    ``group_alias`` for the group, ``k`` + the class's place in the group's
+    class order for a class (``__none__`` stays ``__none__``) and ``s000000``,
+    ``s000001`` ... for the samples in the order of their sorted paths. The
+    build fills in the two maps, real -> id, for the caller to keep at home;
+    they are never written into the export and are valid once the build
+    returned.
+    """
+
+    group_alias: str
+    class_ids: dict[str, str] = field(default_factory=dict)
+    sample_ids: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -138,6 +169,83 @@ def _label_for_storage(label):
     return label
 
 
+def _assign_private_ids(
+    private: PrivateNames,
+    *,
+    class_names: list[str],
+    paths: list[str],
+    group_name: str,
+    safe_name: str,
+) -> None:
+    """Fill ``private``'s maps, refusing any name an id would not hide: a
+    missing alias, a class listed twice, or a real name that reads like one
+    of the ids (the export would then hold that name after all)."""
+    alias = private.group_alias
+    if not alias or not isinstance(alias, str) or re.search(r"[\\/]", alias):
+        raise ScopedExportError(f"the group alias {alias!r} is empty or holds a path")
+    if alias in {group_name, safe_name}:
+        raise ScopedExportError("the group alias is the group's own name")
+    if len(set(class_names)) != len(class_names):
+        raise ScopedExportError("a class is listed twice; class ids would not be invertible")
+    class_ids = {
+        name: name if name == _NONE_CLASS else f"k{index}"
+        for index, name in enumerate(class_names)
+    }
+    sample_ids = {path: f"s{index:06d}" for index, path in enumerate(sorted(paths))}
+    real = {name for name in class_names if name != _NONE_CLASS}
+    real |= {name for name in (group_name, safe_name) if name}
+    real |= set(paths) | {os.path.basename(path) for path in paths}
+    ids = {alias, *class_ids.values(), *sample_ids.values()}
+    clash = sorted(real & ids)
+    if clash:
+        raise ScopedExportError(
+            f"cannot hide these names, they read like the ids that replace them: {clash[:5]}"
+        )
+    private.class_ids = class_ids
+    private.sample_ids = sample_ids
+
+
+def _private_signature(signature: Any) -> Any:
+    """A face/region model signature names the model's file: keep whether one
+    was used and which (equal stays equal), not its name."""
+    if not isinstance(signature, str) or signature == "none":
+        return signature
+    return "sig-" + hashlib.sha256(signature.encode("utf-8")).hexdigest()[:16]
+
+
+def _private_entry(
+    entry: dict, sample_id: str, private: PrivateNames, class_names: list[str]
+) -> dict:
+    """A cache index entry that names its sample by id. Everything a sourceless
+    run reads (label, split, cache file, content hash, build signature) is kept."""
+    label = entry.get("label")
+    concept = private.group_alias
+    if isinstance(label, int) and 0 <= label < len(class_names):
+        concept += "/" + private.class_ids[class_names[label]]
+    out = dict(entry, filename=sample_id, filepath=sample_id, concept_name=concept)
+    if "face_model_sig" in out:
+        out["face_model_sig"] = _private_signature(out["face_model_sig"])
+    return out
+
+
+def _write_private_tensor_file(source: Path, target: Path, sample_id: str) -> None:
+    """Copy a cached tensor file, naming its sample by id. The tensor and every
+    other field are kept as they are."""
+    import torch
+
+    payload = torch.load(source, map_location="cpu", weights_only=False)
+    if not isinstance(payload, dict):
+        raise ScopedExportError(f"cache file {source.name} is not a cache payload")
+    payload = dict(payload)
+    if "__source_path" in payload:
+        payload["__source_path"] = sample_id
+    if "__face_model_sig" in payload:
+        payload["__face_model_sig"] = _private_signature(payload["__face_model_sig"])
+    partial = target.with_name(target.name + ".partial")
+    torch.save(payload, partial)
+    os.replace(partial, target)
+
+
 def build_scoped_export(
     *,
     global_cache_dir: str | os.PathLike,
@@ -151,16 +259,31 @@ def build_scoped_export(
     config: dict | None = None,
     db_expected_paths: set[str] | None = None,
     hash_pt: bool = True,
+    private_names: PrivateNames | None = None,
 ) -> ScopedExportManifest:
     """Build a scoped cache export under ``export_dir/cache/`` and return its
     manifest. Raises ``ScopedExportError`` on any correctness violation.
 
     ``samples`` must already be cached in the global cache (run
     :func:`warm_group_cache` first); a missing entry is a hard error.
+
+    With ``private_names`` the export carries ids, never names (see
+    :class:`PrivateNames`): the index keys, each entry's ``filename`` /
+    ``filepath`` / ``concept_name``, the manifest's ``group_name`` /
+    ``safe_name`` / ``class_names`` / ``entry_paths`` and the source path
+    inside every tensor file, which is therefore written anew rather than
+    copied (its sha256 is of the file as written). ``config`` is written as
+    given: the caller cleans it. The cache folder must start empty, so no file
+    of an earlier export can ride along. Without it, nothing changes.
     """
     export_dir = Path(export_dir)
     cache_out = export_dir / "cache"
     cache_out.mkdir(parents=True, exist_ok=True)
+    if private_names is not None and any(cache_out.iterdir()):
+        raise ScopedExportError(
+            f"the export's cache folder is not empty ({cache_out}); start from an empty "
+            "folder, a file left from an earlier export could carry names"
+        )
 
     # Authoritative path -> sample (dedup by normpath, which is how cache.json keys).
     auth: dict[str, SampleRef] = {}
@@ -224,22 +347,42 @@ def build_scoped_export(
 
     pt_files = sorted({_pt_filename(e["cache_file"]) for e in scoped_entries.values()})
 
+    # What the export says: the entries as they are, or keyed and named by id.
+    out_entries = scoped_entries
+    pt_source_id: dict[str, str] = {}
+    if private_names is not None:
+        _assign_private_ids(
+            private_names, class_names=list(class_names), paths=list(scoped_entries),
+            group_name=group_name, safe_name=safe_name,
+        )  # fmt: skip
+        ids = private_names.sample_ids
+        out_entries = {
+            ids[path]: _private_entry(entry, ids[path], private_names, list(class_names))
+            for path, entry in sorted(scoped_entries.items())
+        }
+        # A tensor file shared by several samples (same bytes) names the first.
+        for sample_id in sorted(out_entries, reverse=True):
+            pt_source_id[_pt_filename(out_entries[sample_id]["cache_file"])] = sample_id
+
     pt_sha: dict[str, str] = {}
     for pt_name in pt_files:
         src = Path(global_cache_dir) / pt_name
         if not src.is_file():
             raise ScopedExportError(f"referenced cache file missing in global cache: {pt_name}")
-        shutil.copy2(src, cache_out / pt_name)
+        if private_names is None:
+            shutil.copy2(src, cache_out / pt_name)
+        else:
+            _write_private_tensor_file(src, cache_out / pt_name, pt_source_id[pt_name])
         if hash_pt:
             pt_sha[pt_name] = _sha256_file(cache_out / pt_name)
 
-    index_bytes = _scoped_index_bytes(scoped_entries)
+    index_bytes = _scoped_index_bytes(out_entries)
     cache_json_path = cache_out / _CACHE_INDEX_FILENAME
     cache_json_path.write_bytes(index_bytes)
     cache_json_sha = hashlib.sha256(index_bytes).hexdigest()
 
-    train_count = sum(1 for e in scoped_entries.values() if e.get("split") == "train")
-    val_count = sum(1 for e in scoped_entries.values() if e.get("split") == "val")
+    train_count = sum(1 for e in out_entries.values() if e.get("split") == "train")
+    val_count = sum(1 for e in out_entries.values() if e.get("split") == "val")
 
     # --- Hard assertions (non-negotiable) ---
     if len(scoped_entries) != len(auth_paths):
@@ -248,6 +391,8 @@ def build_scoped_export(
         )
     if set(scoped_entries) != auth_paths:
         raise ScopedExportError("scoped entries are not exactly the authoritative sample set")
+    if private_names is not None and set(out_entries) != set(private_names.sample_ids.values()):
+        raise ScopedExportError("the export's entries are not exactly the sample ids")
     for pt_name in pt_files:
         if not (cache_out / pt_name).is_file():
             raise ScopedExportError(f"export missing copied cache file: {pt_name}")
@@ -256,16 +401,19 @@ def build_scoped_export(
             f"eval/train split missing: train={train_count}, val={val_count}"
         )
 
+    if private_names is not None:
+        group_name = safe_name = private_names.group_alias
+        class_names = [private_names.class_ids[name] for name in class_names]
     manifest = ScopedExportManifest(
         group_name=group_name,
         safe_name=safe_name,
         modeltype=modeltype,
         num_classes=num_classes,
         class_names=list(class_names),
-        expected_entry_count=len(scoped_entries),
+        expected_entry_count=len(out_entries),
         train_count=train_count,
         val_count=val_count,
-        entry_paths=sorted(scoped_entries),
+        entry_paths=sorted(out_entries),
         pt_files=pt_files,
         cache_json_sha256=cache_json_sha,
         pt_sha256=pt_sha,
@@ -335,6 +483,56 @@ def verify_scoped_cache(
                 return False, "DATA_ERROR", f"sha256 mismatch for {pt_name} (corrupt/partial transfer)"
 
     return True, "", "ok"
+
+
+def scoped_export_strings(export_dir: str | os.PathLike) -> set[str]:
+    """Every string an export holds about its samples, classes and group: the
+    index keys, file names and paths, concept and class names, group names and
+    each tensor file's source path, plus the last part of every path and each
+    part of a concept name. For the caller's final check before anything is
+    uploaded. Every tensor file in the cache folder is read, listed in the
+    manifest or not."""
+    export_dir = Path(export_dir)
+    found: set[str] = set()
+
+    def _add(value: Any, *, path: bool = False, concept: bool = False) -> None:
+        if not isinstance(value, str) or not value:
+            return
+        found.add(value)
+        if path:
+            found.add(re.split(r"[\\/]", value)[-1])
+        if concept:
+            found.update(part for part in value.split("/") if part)
+
+    manifest_path = export_dir / "manifest.json"
+    if manifest_path.is_file():
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        _add(manifest.get("group_name"))
+        _add(manifest.get("safe_name"))
+        for name in manifest.get("class_names") or []:
+            _add(name)
+        for entry_path in manifest.get("entry_paths") or []:
+            _add(entry_path, path=True)
+    cache_dir = export_dir / "cache"
+    index_path = cache_dir / _CACHE_INDEX_FILENAME
+    if index_path.is_file():
+        index = json.loads(index_path.read_text(encoding="utf-8"))
+        for key, entry in (index.get("entries") or {}).items():
+            _add(key, path=True)
+            _add(entry.get("filename"))
+            _add(entry.get("filepath"), path=True)
+            _add(entry.get("concept_name"), concept=True)
+        for paths in (index.get("hash_index") or {}).values():
+            for indexed in paths:
+                _add(indexed, path=True)
+    if cache_dir.is_dir():
+        import torch
+
+        for pt_path in sorted(cache_dir.glob("*.pt")):
+            payload = torch.load(pt_path, map_location="cpu", weights_only=False)
+            if isinstance(payload, dict):
+                _add(payload.get("__source_path"), path=True)
+    return found
 
 
 def warm_group_cache(

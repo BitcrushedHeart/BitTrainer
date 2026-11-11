@@ -71,6 +71,60 @@ _PREFLIGHT_SHARE = 0.95
 # A settled GradScaler skips about one step in 2000 as it probes upwards; more
 # than this share of an epoch's steps skipped after it settled is logged.
 _SKIP_WARN_SHARE = 0.02
+# Late skips below this many are jitter around the level the scaler settled
+# at, not a collapse (Bitcrush ISSUE-1690).
+_COLLAPSE_MIN_LATE = 3
+
+
+def scaler_collapse(
+    *, epoch: int, steps: int, late_skipped: int, grad_scale: float | None
+) -> str:
+    """Empty when the fp16 GradScaler held through an epoch (1-based);
+    otherwise what went wrong, for a person to read (Bitcrush ISSUE-1690).
+
+    The scaler has collapsed when either holds:
+
+    * its scale is below 1. It starts at 65536 and halves on every skipped
+      step, so that is 17 halvings. Below 1 the gradients overflow half
+      precision even unscaled, and from there almost every step is thrown
+      away. On a T4 a group update from random weights ended at 0.0625; the
+      same update from a trained trunk skipped 2 steps and held 16384.
+    * after it settled (its first step that landed), at least 3 of an epoch's
+      steps were skipped and they were more than half of them.
+
+    The opening descent from 65536 is the scaler finding its level, however
+    much of a short first epoch it takes, and is not counted.
+    """
+    if grad_scale is not None and grad_scale < 1:
+        return (
+            f"The fp16 GradScaler collapsed in epoch {epoch}: its scale fell to "
+            f"{grad_scale:g}, below 1, where the gradients overflow half precision "
+            "even unscaled, so almost every step is thrown away. Start the run from a "
+            "trained backbone, or train this group on a card with bf16."
+        )
+    if late_skipped >= _COLLAPSE_MIN_LATE and 2 * late_skipped > steps:
+        return (
+            f"The fp16 GradScaler collapsed in epoch {epoch}: {late_skipped} of its "
+            f"{steps} steps were skipped after the scaler had settled (more than "
+            "half), so those steps trained nothing. Start the run from a trained "
+            "backbone, or train this group on a card with bf16."
+        )
+    return ""
+
+
+def scaler_collapse_in(epochs) -> str:
+    """:func:`scaler_collapse` over per-epoch rows (``epoch``, ``steps``,
+    ``late_skipped_steps``, ``grad_scale``): the first collapse, or empty."""
+    for row in epochs:
+        text = scaler_collapse(
+            epoch=int(row.get("epoch") or 0),
+            steps=int(row.get("steps") or 0),
+            late_skipped=int(row.get("late_skipped_steps") or 0),
+            grad_scale=row.get("grad_scale"),
+        )
+        if text:
+            return text
+    return ""
 
 
 def precision_frame(dtype: torch.dtype, *, scaler: bool, lean_grn: bool) -> dict:
@@ -157,6 +211,11 @@ class GroupTask(TrainingTask):
         self._epoch_skipped = 0
         self._epoch_late_skipped = 0
         self._epoch_steps = 0
+        # Per finished epoch, what the scaler did; and the first collapse said
+        # out loud (once an epoch, see _warn_if_collapsed).
+        self.scaler_epochs: list[dict] = []
+        self.scaler_warning: str | None = None
+        self._collapse_warned = False
 
     def _region_meta(self, model) -> dict:
         """Checkpoint metadata for the model's region head; empty without one."""
@@ -696,6 +755,7 @@ class GroupTask(TrainingTask):
         self._epoch_late_skipped = 0
         self._epoch_steps = 0
         self._grad_scale = self.scaler.get_scale()
+        self._collapse_warned = False
 
     def _count_skip(self, scaler) -> None:
         """Called after every ``scaler.update()``.
@@ -717,12 +777,42 @@ class GroupTask(TrainingTask):
         self._grad_scale = scale
 
     def _scaler_numbers(self) -> dict:
-        """What the fp16 run's scaler did, for its frames and result."""
+        """What the fp16 run's scaler did this epoch, for its frames."""
         return {
+            "steps": self._epoch_steps,
             "skipped_steps": self._epoch_skipped,
+            "late_skipped_steps": self._epoch_late_skipped,
             "skipped_steps_total": self.skipped_steps,
             "grad_scale": self._grad_scale,
         }
+
+    def _warn_if_collapsed(self, cb, epoch: int, *, epoch_done: bool) -> None:
+        """fp16 only: say it, once an epoch, when the scaler has collapsed (see
+        :func:`scaler_collapse`). Mid-epoch only a scale below 1 counts; the
+        share of skipped steps is judged on the whole epoch."""
+        if self.scaler is None or self._collapse_warned:
+            return
+        text = scaler_collapse(
+            epoch=epoch + 1,
+            steps=self._epoch_steps,
+            late_skipped=self._epoch_late_skipped if epoch_done else 0,
+            grad_scale=self._grad_scale,
+        )
+        if not text:
+            return
+        self._collapse_warned = True
+        self.scaler_warning = self.scaler_warning or text
+        logger.warning("Group training: %s", text)
+        cb(
+            {
+                "type": "training_progress",
+                "stage": "warning",
+                "status_text": text,
+                "warning": "grad_scaler_collapsed",
+                "epoch": epoch + 1,
+                **self._scaler_numbers(),
+            }
+        )
 
     def restore_resume_extra(self, ctx: TaskContext, resume_state: dict) -> None:
         self.soup_pool = [tuple(t) for t in (resume_state.get("soup_pool") or [])]
@@ -731,6 +821,8 @@ class GroupTask(TrainingTask):
         # in fp16, its scaler starts fresh, opening descent still to come.
         self.skipped_steps = int(resume_state.get("skipped_steps", 0))
         self._scaler_settled = bool(resume_state.get("scaler_settled", False))
+        self.scaler_epochs = [dict(row) for row in resume_state.get("scaler_epochs") or []]
+        self.scaler_warning = resume_state.get("scaler_warning")
         scaler_state = resume_state.get("grad_scaler")
         if self.scaler is not None and scaler_state:
             self.scaler.load_state_dict(scaler_state)
@@ -930,8 +1022,18 @@ class GroupTask(TrainingTask):
                 if throughput and throughput > 0
                 else None
             )
+            # fp16 only: the scaler's count so far rides the step frames, and a
+            # scale that fell below 1 is said now, not at the epoch's end.
+            scaler_numbers: dict = {}
+            if self.scaler is not None:
+                self._warn_if_collapsed(cb, epoch, epoch_done=False)
+                scaler_numbers = {
+                    "skipped_steps": self._epoch_skipped,
+                    "grad_scale": self._grad_scale,
+                }
             cb(
                 {
+                    **scaler_numbers,
                     "type": "training_progress",
                     "stage": "training",
                     "status_text": f"Training (epoch {epoch + 1}/{config.max_epochs}, step {step}/{total_steps})",
@@ -1235,7 +1337,17 @@ class GroupTask(TrainingTask):
         if self._train_region_loss is not None:
             msg["train_region_loss"] = self._train_region_loss
         if self.scaler is not None:
-            msg.update(self._scaler_numbers())
+            numbers = self._scaler_numbers()
+            msg.update(numbers)
+            self.scaler_epochs.append(
+                {
+                    "epoch": epoch + 1,
+                    **{k: numbers[k] for k in ("steps", "skipped_steps", "late_skipped_steps")},
+                    "grad_scale": numbers["grad_scale"],
+                }
+            )
+            # Said before the epoch frame, which puts the stream back on training.
+            self._warn_if_collapsed(ctx.cb, epoch, epoch_done=True)
             late = self._epoch_late_skipped
             if late >= 3 and late > _SKIP_WARN_SHARE * self._epoch_steps:
                 logger.warning(
@@ -1260,6 +1372,8 @@ class GroupTask(TrainingTask):
                 "grad_scaler": self.scaler.state_dict(),
                 "skipped_steps": self.skipped_steps,
                 "scaler_settled": self._scaler_settled,
+                "scaler_epochs": [dict(row) for row in self.scaler_epochs],
+                "scaler_warning": self.scaler_warning,
             }
         return {
             **scaler_state,
@@ -1463,6 +1577,9 @@ class GroupTask(TrainingTask):
                 lean_grn=self.lean_grn,
                 skipped_steps=self.skipped_steps,
                 grad_scale=self._grad_scale,
+                scaler_epochs=[dict(row) for row in self.scaler_epochs],
+                scaler_collapsed=self.scaler_warning is not None,
+                scaler_warning=self.scaler_warning,
             )
         stats_path = self._write_sample_stats(ctx.checkpoint_dir)
         if stats_path is not None and isinstance(result, dict):
