@@ -63,6 +63,9 @@ def test_auto_promote_skips_incumbent_load_and_promotes(tmp_path, monkeypatch):
     )
 
     assert result["promotion_reason"] == "auto_promote"
-    # The weak candidate shipped as best.pt; candidate.pt was moved into place.
+    # The weak candidate shipped as best.pt, copied into place with the current
+    # model kept aside; the trainer removes both once its backups are gone
+    # (Bitcrush ISSUE-1690).
     assert result["checkpoint_path"].endswith("best.pt")
-    assert not (ckpt_dir / "candidate.pt").exists()
+    assert (ckpt_dir / "best.pt").read_bytes() == (ckpt_dir / "candidate.pt").read_bytes()
+    assert finalize.kept_incumbent_path(ckpt_dir / "best.pt").exists()

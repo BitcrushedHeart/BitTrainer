@@ -42,7 +42,8 @@ rebuilt optimizer tuple or None) → :meth:`make_step_callback` →
 :meth:`selection_score` → (on improvement) :meth:`save_candidate` →
 :meth:`on_epoch_end` → :meth:`epoch_message` → :meth:`collect_extra_state`
 (folded into the epoch-boundary backup). Finally :meth:`finalize` builds the
-result dict (promotion, SWA/soup, bespoke result assembly).
+result dict (promotion, SWA/soup, bespoke result assembly), the backups are
+deleted, and :meth:`on_backups_deleted` removes what finalisation kept.
 
 Only ``make_context`` / ``fingerprint_init`` / ``loop_spec`` / ``prepare_data`` /
 ``create_model`` / ``resolve_batch_size`` / ``create_optimizer`` /
@@ -161,6 +162,13 @@ class TrainingTask(ABC):
     """
 
     trainer_name: str = "generic"
+
+    #: A backup taken once training is over resumes straight into
+    #: :meth:`finalize` (Bitcrush ISSUE-1690). The core then marks that backup,
+    #: runs :meth:`finalize` outside the exception backup, and stops for a pause
+    #: that came in after the last epoch. The task's finalisation must leave what
+    #: it reads in place until :meth:`on_backups_deleted`.
+    resumable_finalisation: bool = False
 
     # -- one-time setup ----------------------------------------------------
     @abstractmethod
@@ -285,3 +293,7 @@ class TrainingTask(ABC):
     @abstractmethod
     def finalize(self, ctx: TaskContext, model, best: BestTracker, epochs_completed: int) -> dict:
         """SWA / soup finalisation, promotion vs incumbent, build the result dict."""
+
+    def on_backups_deleted(self, ctx: TaskContext) -> None:
+        """A finished run's backups are deleted (straight after :meth:`finalize`
+        when it has none): remove what finalisation kept for a restart."""

@@ -11,6 +11,8 @@ here too. ``group_trainer`` re-imports every name below, keeping objects identic
 from __future__ import annotations
 
 import logging
+import os
+import shutil
 import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable
@@ -62,6 +64,88 @@ __all__ = [
 # most). The suite only needs enough resolution to draw a selective-metric curve;
 # evenly subsampling large val sets preserves the curve shape.
 _STRICTNESS_MAX_VAL_ROWS = 5000
+
+# Promotion never destroys what finalisation reads (Bitcrush ISSUE-1690). The
+# candidate is copied over the current model, never moved, and the current model
+# is first kept aside under ``<best>.incumbent`` (``<best>.no_incumbent`` when
+# there was none). A run killed anywhere after that has its current model put
+# back at its next start (``restore_kept_incumbent``) and finalises again from
+# the same inputs; the trainer removes the leftovers once its backups are gone
+# (``discard_finalise_leftovers``).
+_KEPT_SUFFIX = ".incumbent"
+_NO_INCUMBENT_SUFFIX = ".no_incumbent"
+_PART_SUFFIX = ".part"
+
+
+def _suffixed(path: Path, suffix: str) -> Path:
+    return path.with_name(path.name + suffix)
+
+
+def kept_incumbent_path(best: Path) -> Path:
+    """Where promotion keeps the current model ``best`` until the run is over."""
+    return _suffixed(Path(best), _KEPT_SUFFIX)
+
+
+def _copy_into_place(source: Path, target: Path) -> None:
+    """``target`` becomes a copy of ``source`` in one step: a partial copy is
+    only ever the ``.part`` file."""
+    part = _suffixed(target, _PART_SUFFIX)
+    shutil.copyfile(source, part)
+    os.replace(part, target)
+
+
+def _keep_incumbent_aside(best: Path) -> None:
+    """Keep the current model before the candidate lands on it: a hard link (no
+    extra disk), or a copy where links are not possible; a marker when there is
+    none. One already kept is the original and is never replaced."""
+    kept = kept_incumbent_path(best)
+    none = _suffixed(best, _NO_INCUMBENT_SUFFIX)
+    if kept.exists() or none.exists():
+        return
+    if not best.exists():
+        none.touch()
+        return
+    try:
+        os.link(best, kept)
+    except OSError:
+        _copy_into_place(best, kept)
+
+
+def restore_kept_incumbent(checkpoint_dir, best_model_name: str) -> bool:
+    """At a run's start: put back the current model an interrupted finalisation
+    kept aside, so the run sees what its first attempt saw. True when it did."""
+    best = Path(checkpoint_dir) / best_model_name
+    kept = kept_incumbent_path(best)
+    none = _suffixed(best, _NO_INCUMBENT_SUFFIX)
+    for part in (_suffixed(best, _PART_SUFFIX), _suffixed(kept, _PART_SUFFIX)):
+        part.unlink(missing_ok=True)
+    if kept.exists():
+        os.replace(kept, best)
+    elif none.exists():
+        best.unlink(missing_ok=True)
+        none.unlink()
+    else:
+        return False
+    logger.warning(
+        "An interrupted finalisation had promoted over %s: the current model it kept "
+        "aside is back in place",
+        best,
+    )
+    return True
+
+
+def discard_finalise_leftovers(checkpoint_dir, best_model_name: str, candidate) -> None:
+    """Once a run's backups are gone: remove the current model promotion kept
+    aside, then the candidate (``None``: there was none)."""
+    best = Path(checkpoint_dir) / best_model_name
+    for path in (
+        kept_incumbent_path(best),
+        _suffixed(best, _NO_INCUMBENT_SUFFIX),
+        _suffixed(best, _PART_SUFFIX),
+    ):
+        path.unlink(missing_ok=True)
+    if candidate is not None and Path(candidate) != best:
+        Path(candidate).unlink(missing_ok=True)
 
 
 def _persist_softmax_calibration(
@@ -196,6 +280,11 @@ def _compare_promote_finalize(
     reloading the checkpoint and running the trunk over every val image; a
     checkpoint with another trunk still gets the full pass. Every full pass
     reports per-batch progress.
+
+    Nothing it reads is destroyed (Bitcrush ISSUE-1690): the candidate file is
+    left where it is, and a promotion keeps the current model aside before
+    copying the candidate over it. The caller removes both with
+    :func:`discard_finalise_leftovers` once its backups are gone.
     """
     def _emit(stage: str, status_text: str) -> None:
         if cb is not None:
@@ -369,7 +458,11 @@ def _compare_promote_finalize(
         if promote:
             logger.info("Promoting new checkpoint (reason=%s)", promotion_reason.value)
             _emit("promoting", "Promoting new model")
-            Path(best_checkpoint_path).replace(existing_best)
+            # Copied, never moved, the current model kept aside first (Bitcrush
+            # ISSUE-1690): a run killed from here on needs both to finalise
+            # again. The trainer removes them once its backups are gone.
+            _keep_incumbent_aside(existing_best)
+            _copy_into_place(Path(best_checkpoint_path), existing_best)
             best_checkpoint_path = str(existing_best)
         else:
             logger.info(
@@ -379,7 +472,8 @@ def _compare_promote_finalize(
                 candidate_score,
             )
             _emit("promoting", "Keeping current model (scored higher)")
-            Path(best_checkpoint_path).unlink(missing_ok=True)
+            # The candidate stays until the trainer's backups are gone (Bitcrush
+            # ISSUE-1690), then the trainer removes it.
             best_checkpoint_path = str(existing_best)
             # The kept incumbent's metrics become the reported metrics. Sync ALL
             # summary scalars to it (not just the ordinal/non-ordinal selection

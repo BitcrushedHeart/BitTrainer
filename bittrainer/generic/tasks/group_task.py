@@ -27,6 +27,7 @@ from bittrainer.autobatch import _OPT_STATE_MULT, RunRefused, is_out_of_memory, 
 from bittrainer.dataset import resolution_ckpt_meta
 from bittrainer.dynamic_class_weights import DynamicClassWeightController
 from bittrainer.ema import ModelEMA
+from bittrainer.finalize import discard_finalise_leftovers, restore_kept_incumbent
 from bittrainer.generic.optimizer import optimizer_identity
 from bittrainer.generic.task import (
     BestTracker,
@@ -147,6 +148,7 @@ class GroupTask(TrainingTask):
     """Drives ``GenericTrainer`` for a single ConvNeXt V2 multi-class group."""
 
     trainer_name = "group"
+    resumable_finalisation = True
 
     def __init__(self, config: gt.GroupTrainConfig) -> None:
         self.config = config
@@ -216,6 +218,12 @@ class GroupTask(TrainingTask):
         self.scaler_epochs: list[dict] = []
         self.scaler_warning: str | None = None
         self._collapse_warned = False
+        # Resumable finalisation (Bitcrush ISSUE-1690): the val order the
+        # backed-up epochs scored in, the candidate finalisation judged, and
+        # whether the greedy soup ran (its ingredients go with the backups).
+        self._resumed_val_schedule: list[list[int]] | None = None
+        self._finalise_candidate: str | None = None
+        self._soup_ran = False
 
     def _region_meta(self, model) -> dict:
         """Checkpoint metadata for the model's region head; empty without one."""
@@ -259,6 +267,10 @@ class GroupTask(TrainingTask):
             else group_folder / "checkpoints"
         )
         checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        # A finalisation killed after promoting kept the current model aside:
+        # put it back, so this attempt warm-starts from, and is judged against,
+        # what the first one was (Bitcrush ISSUE-1690).
+        restore_kept_incumbent(checkpoint_dir, config.best_model_name)
         return TaskContext(
             device=device,
             dtype=dtype,
@@ -826,6 +838,11 @@ class GroupTask(TrainingTask):
         scaler_state = resume_state.get("grad_scaler")
         if self.scaler is not None and scaler_state:
             self.scaler.load_state_dict(scaler_state)
+            # The scale the backup was taken at: what a run resumed straight
+            # into finalisation reports (an epoch resets it from the scaler).
+            self._grad_scale = self.scaler.get_scale()
+        # The val order the backed-up epochs scored in (Bitcrush ISSUE-1690).
+        self._resumed_val_schedule = resume_state.get("val_schedule")
 
     def resumed_message(
         self, ctx: TaskContext, best: BestTracker, global_step: int, start_epoch: int
@@ -885,8 +902,8 @@ class GroupTask(TrainingTask):
         self._current_epoch = epoch
         return self._train_loader, schedule, start_batch
 
-    def _create_loaders(self, eff_bs: int, initial_batches: list[list[int]]) -> None:
-        """One-time train + val DataLoader construction (workers spawn once)."""
+    def _loader_parts(self) -> tuple:
+        """The collate function and DataLoader kwargs both loaders share."""
         config = self.config
         collate_fn = (
             gt._collate_multilabel_batch
@@ -898,6 +915,11 @@ class GroupTask(TrainingTask):
             # workers=0 (bit-exact resume mode): keep the DataLoader base-seed draw
             # off the global torch RNG so it stays purely augmentation-driven.
             lk["generator"] = torch.Generator().manual_seed(0)
+        return collate_fn, lk
+
+    def _create_loaders(self, eff_bs: int, initial_batches: list[list[int]]) -> None:
+        """One-time train + val DataLoader construction (workers spawn once)."""
+        collate_fn, lk = self._loader_parts()
         self._train_batch_sampler = _FixedBatchSampler(initial_batches)
         self._train_loader = DataLoader(
             self.train_ds,
@@ -913,6 +935,9 @@ class GroupTask(TrainingTask):
         val_schedule = [
             list(b) for b in build_group_bucket_sampler(self.val_ds, batch_size=eff_bs)
         ]
+        self._set_val_loader(val_schedule, collate_fn, lk)
+
+    def _set_val_loader(self, val_schedule: list[list[int]], collate_fn, lk: dict) -> None:
         val_sampler = _FixedBatchSampler(val_schedule)
         self._val_loader = DataLoader(
             self.val_ds,
@@ -923,6 +948,16 @@ class GroupTask(TrainingTask):
         self._collate_fn = collate_fn
         self._val_sampler = val_sampler
         self._val_schedule = val_schedule
+
+    def _finalisation_val_loader(self) -> None:
+        """For a resume that trains no epoch (Bitcrush ISSUE-1690): the val
+        loader, in the order the backed-up epochs scored in when the backup has
+        it, so finalisation scores what an uninterrupted run would have."""
+        collate_fn, lk = self._loader_parts()
+        schedule = self._resumed_val_schedule or build_group_bucket_sampler(
+            self.val_ds, batch_size=self.eff_bs
+        )
+        self._set_val_loader([list(b) for b in schedule], collate_fn, lk)
 
     def _release_loaders(self) -> None:
         """Drop the run's loaders so their persistent workers are reaped."""
@@ -1395,6 +1430,8 @@ class GroupTask(TrainingTask):
                 else None
             ),
             "head_hidden_size": self.head_hidden_size,
+            # Read only by a resume that trains no epoch (Bitcrush ISSUE-1690).
+            "val_schedule": [list(b) for b in self._val_schedule] or None,
         }
 
     # -- finalisation ------------------------------------------------------
@@ -1403,6 +1440,10 @@ class GroupTask(TrainingTask):
     ) -> dict:
         config = self.config
         device, dtype = ctx.device, ctx.dtype
+        # A resume that trained no epoch has built no loader (Bitcrush ISSUE-1690).
+        resumed = ctx.resume_state is not None
+        if resumed and self._val_loader is None:
+            self._finalisation_val_loader()
         val_loader = self._val_loader
         cb = ctx.cb
         none_index = gt._resolve_none_index(config.class_names)
@@ -1464,6 +1505,9 @@ class GroupTask(TrainingTask):
             and len(self.soup_pool) >= 2
             and best.best_checkpoint_path
         ):
+            # Its ingredients stay until the backups are gone: a restart soups
+            # again (Bitcrush ISSUE-1690). on_backups_deleted removes them.
+            self._soup_ran = True
 
             def _soup_metrics(state: dict) -> dict:
                 model.load_state_dict({k: v.to(device) for k, v in state.items()})
@@ -1540,17 +1584,8 @@ class GroupTask(TrainingTask):
                     "Greedy soup failed; keeping best single-epoch checkpoint",
                     exc_info=True,
                 )
-            finally:
-                for _s, _e, _p in self.soup_pool:
-                    try:
-                        Path(_p).unlink()
-                    except OSError:
-                        pass
-                try:
-                    self.soup_dir.rmdir()
-                except OSError:
-                    pass
 
+        self._finalise_candidate = best.best_checkpoint_path
         result = gt._compare_promote_finalize(
             config,
             candidate_path=best.best_checkpoint_path,
@@ -1581,10 +1616,40 @@ class GroupTask(TrainingTask):
                 scaler_collapsed=self.scaler_warning is not None,
                 scaler_warning=self.scaler_warning,
             )
-        stats_path = self._write_sample_stats(ctx.checkpoint_dir)
+        stats_file = ctx.checkpoint_dir / "sample_stats.json"
+        if (
+            resumed
+            and self.sample_stats is not None
+            and self.sample_stats.epochs == 0
+            and stats_file.is_file()
+        ):
+            # A resume that trained no epoch recorded nothing: the file the last
+            # epoch wrote is the run's record (Bitcrush ISSUE-1690).
+            stats_path = stats_file
+        else:
+            stats_path = self._write_sample_stats(ctx.checkpoint_dir)
         if stats_path is not None and isinstance(result, dict):
             result["sample_stats_path"] = str(stats_path)
         # The run-long loaders are done: drop them so their persistent workers
         # shut down instead of lingering for the life of the task object.
         self._release_loaders()
         return result
+
+    def on_backups_deleted(self, ctx: TaskContext) -> None:
+        """What finalisation kept for a restart goes once the backups have
+        (Bitcrush ISSUE-1690): the current model promotion kept aside, the
+        candidate, and the greedy soup's ingredients when it ran."""
+        discard_finalise_leftovers(
+            ctx.checkpoint_dir, self.config.best_model_name, self._finalise_candidate
+        )
+        if not self._soup_ran:
+            return
+        for _s, _e, path in self.soup_pool:
+            try:
+                Path(path).unlink()
+            except OSError:
+                pass
+        try:
+            self.soup_dir.rmdir()
+        except OSError:
+            pass

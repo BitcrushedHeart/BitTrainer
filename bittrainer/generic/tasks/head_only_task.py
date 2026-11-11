@@ -36,6 +36,7 @@ from bittrainer.amp import resolve_amp_dtype, wants_grad_scaler
 from bittrainer.cached_eval import CachedValScorer, val_inputs_are_cache_inputs
 from bittrainer.dataset import resolution_ckpt_meta
 from bittrainer.embedding_cache import EmbeddingCache
+from bittrainer.finalize import discard_finalise_leftovers, restore_kept_incumbent
 from bittrainer.generic.task import BestTracker, LoopSpec, TaskContext, TrainingTask
 from bittrainer.generic.tasks.group_task import precision_frame
 from bittrainer.group_dataset import build_group_bucket_sampler, labelled_samples
@@ -275,6 +276,10 @@ class HeadOnlyTask(TrainingTask):
             Path(config.checkpoint_dir) if config.checkpoint_dir else group_folder / "checkpoints"
         )
         checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        # A finalisation killed after promoting kept the current model aside:
+        # put it back, so this run warm-starts from, and is judged against, the
+        # model the killed one was (Bitcrush ISSUE-1690).
+        restore_kept_incumbent(checkpoint_dir, config.best_model_name)
         return TaskContext(
             device=device, dtype=dtype, em=em, cb=em.raw, checkpoint_dir=checkpoint_dir,
             stop_event=stop_event, stop_now_event=stop_now_event, pause_event=pause_event,
@@ -659,3 +664,11 @@ class HeadOnlyTask(TrainingTask):
             "best_epoch": self.probe["best_epoch"],
         })
         return result
+
+    def on_backups_deleted(self, ctx: TaskContext) -> None:
+        """Head-only has no backups: straight after finalisation, the current
+        model promotion kept aside and the candidate go (Bitcrush ISSUE-1690)."""
+        if self.candidate_path is not None:
+            discard_finalise_leftovers(
+                ctx.checkpoint_dir, self.config.best_model_name, self.candidate_path
+            )

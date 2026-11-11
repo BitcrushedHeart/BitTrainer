@@ -440,7 +440,12 @@ class TrainingStateManager:
         """Remove all backup files (incl. stray tmps) and the backup dir (best effort)."""
         if not self.backup_dir.exists():
             return
-        for path in self.backup_dir.glob("backup_*.pt*"):  # matches .pt and .pt.tmp
+        # Stray temps, then the backups oldest first (Bitcrush ISSUE-1690): one
+        # killed part-way through leaves its newest backup, never only an older
+        # one a restart would train from again.
+        backups = self.list_backups()
+        strays = [p for p in self.backup_dir.glob("backup_*.pt*") if p not in backups]
+        for path in [*strays, *backups]:  # matches .pt and .pt.tmp
             try:
                 path.unlink()
             except OSError:

@@ -51,6 +51,13 @@ class GenericTrainer:
         ``stop_event`` breaks at the next epoch boundary; ``stop_now_event`` also
         interrupts the epoch mid-batch — both still finalise. ``pause_event``
         backs up and returns ``{"paused": True, ...}`` WITHOUT finalising.
+
+        A task with ``resumable_finalisation`` (Bitcrush ISSUE-1690): the backup
+        that ends training is marked ``finalising`` (written for the purpose
+        when a stop ended it), a resume from it goes straight to ``finalize``,
+        a pause that came in after the last epoch stops there, and a failure in
+        finalisation writes no backup over it. After the backups are deleted,
+        ``on_backups_deleted`` removes what finalisation kept for a restart.
         """
         ctx = task.make_context(progress_callback, stop_event, stop_now_event, pause_event)
         task.fingerprint_init(ctx)
@@ -84,6 +91,8 @@ class GenericTrainer:
         best = BestTracker()
         global_step = 0
         start_epoch = 0
+        # Resumed from a backup taken once training was over: finalise only.
+        finishing = False
         # Mid-epoch resume state (one-shot; cleared after the first resumed epoch).
         resume_batch_in_epoch = 0
         resume_schedule: list[list[int]] | None = None
@@ -100,6 +109,7 @@ class GenericTrainer:
             # ``epoch`` in the envelope is always the epoch to resume INTO (a
             # boundary backup stores epoch+1, so it never re-runs a finished epoch).
             start_epoch = int(resume_state["epoch"])
+            finishing = task.resumable_finalisation and bool(resume_state.get("finalising"))
             resume_bs_changed = bool(resume_state.get("_resume_bs_changed"))
             # A stored schedule only replays when the batch size is unchanged AND
             # the backup uses the current schedule indexing; otherwise the epoch
@@ -130,17 +140,20 @@ class GenericTrainer:
 
         epoch = start_epoch - 1  # so epochs_completed is defined if the loop is empty
         exc_epoch = [start_epoch]  # boxed so the exception hook sees the live value
+        stopped = False  # a stop event, not the epochs or the patience, ended training
 
         with coordinator.backup_on_exception(lambda: _collect_state(exc_epoch[0], 0, None)):
-            for epoch in range(start_epoch, spec.max_epochs):
+            for epoch in range(start_epoch, start_epoch if finishing else spec.max_epochs):
                 exc_epoch[0] = epoch
                 if stop_now_event is not None and stop_now_event.is_set():
                     logger.info("Stop-now requested before epoch %d — running final comparison", epoch)
                     cb({"type": "stop_now", "epoch": epoch, "max_epochs": spec.max_epochs})
+                    stopped = True
                     break
                 if stop_event is not None and stop_event.is_set():
                     logger.info("Graceful stop requested after epoch %d — running final comparison", epoch)
                     cb({"type": "graceful_stop", "epoch": epoch, "max_epochs": spec.max_epochs})
+                    stopped = True
                     break
                 if coordinator.paused:
                     # Pause at an epoch boundary (before any training this epoch):
@@ -253,15 +266,38 @@ class GenericTrainer:
                 # Epoch-boundary backup: the cleanest resume point. Stored as
                 # epoch+1/batch_in_epoch=0 so a resume starts the NEXT epoch fresh.
                 if coordinator.enabled:
-                    coordinator.save(_collect_state(epoch + 1, 0, None), reason="periodic")
+                    state = _collect_state(epoch + 1, 0, None)
+                    if task.resumable_finalisation and (
+                        epoch + 1 >= spec.max_epochs or best.patience_counter >= spec.patience
+                    ):
+                        # Training ends here: a resume from this backup finalises.
+                        state["finalising"] = True
+                    coordinator.save(state, reason="periodic")
 
                 if best.patience_counter >= spec.patience:
                     logger.info("Early stopping at epoch %d (patience=%d)", epoch + 1, spec.patience)
                     break
 
+            if not task.resumable_finalisation:
+                result = task.finalize(ctx, model, best, epochs_completed=epoch + 1)
+            elif stopped and coordinator.enabled:
+                # A stop ended training early: back up that it did, so a restart
+                # finalises instead of training the epochs the stop skipped.
+                state = _collect_state(epoch + 1, 0, None)
+                state["finalising"] = True
+                coordinator.save(state, reason="finalise")
+
+        if task.resumable_finalisation:
+            if coordinator.enabled and coordinator.paused:
+                # Training is over and backed up: a pause that came in since stops
+                # here, and the restart resumes into finalisation.
+                return _paused(epoch + 1, global_step, coordinator.last_backup_path)
+            # Outside the exception backup: a failure in finalisation leaves the
+            # newest backup, the one that resumes into it, the newest.
             result = task.finalize(ctx, model, best, epochs_completed=epoch + 1)
 
         # Training completed successfully (no pause, no exception): the backups are
         # obsolete — clear them so a later run doesn't resume a finished job.
         coordinator.delete_backups()
+        task.on_backups_deleted(ctx)
         return result

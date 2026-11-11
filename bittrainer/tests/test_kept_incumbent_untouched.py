@@ -89,7 +89,10 @@ def test_a_kept_single_label_incumbent_is_never_rewritten(tmp_path, monkeypatch)
 
     assert result["promotion_reason"] == "incumbent_wins"
     assert _digest(tmp_path / "best.pt") == before
-    assert not (tmp_path / "candidate.pt").exists()
+    # Nothing kept aside; the candidate is left for the trainer to remove once
+    # its backups are gone (Bitcrush ISSUE-1690).
+    assert not finalize.kept_incumbent_path(tmp_path / "best.pt").exists()
+    assert (tmp_path / "candidate.pt").exists()
     assert passes["n"] == 1  # the comparison pass only; no calibration pass
     # The incumbent's own decode on today's split, under its stored calibration.
     assert result["best_val_qwk"] == pytest.approx(0.90)

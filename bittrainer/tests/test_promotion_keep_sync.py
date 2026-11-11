@@ -79,6 +79,8 @@ def test_ordinal_keep_syncs_all_summary_metrics(tmp_path, monkeypatch):
     assert result["final_val_macro_f1"] == 0.441
     assert result["best_val_qwk"] == 0.547
     assert result["final_val_loss"] == 0.798
-    # candidate.pt is discarded; best.pt stays the deployed model
+    # best.pt stays the deployed model, nothing kept aside; candidate.pt is left
+    # for the trainer to remove once its backups are gone (Bitcrush ISSUE-1690)
     assert result["checkpoint_path"].endswith("best.pt")
-    assert not (ckpt_dir / "candidate.pt").exists()
+    assert not finalize.kept_incumbent_path(ckpt_dir / "best.pt").exists()
+    assert (ckpt_dir / "candidate.pt").exists()
