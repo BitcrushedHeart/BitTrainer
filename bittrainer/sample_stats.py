@@ -102,6 +102,30 @@ class SampleStatsRecorder:
             loss = -math.log(max(p_label, 1e-12))
             per_epoch[epoch] = ([_r(v) for v in p[i].tolist()], _r(loss))
 
+    def carry_over(self, path: Path | str, *, before: int) -> None:
+        """Take up the epochs before ``before`` from the file this run wrote
+        before it was resumed (Bitcrush ISSUE-1690), rows in their order. A
+        missing, unreadable or other group's file adds nothing."""
+        try:
+            payload = json.loads(Path(path).read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return
+        kept = min(int(payload.get("epochs") or 0), int(before))
+        if payload.get("class_names") != self.class_names or kept <= 0:
+            return
+        for item in payload.get("samples") or []:
+            row = self._row(item["path"], int(item["label"]), item["split"])
+            if item["split"] == "train":
+                for epoch, loss in enumerate((item.get("train_loss") or [])[:kept]):
+                    if loss is not None:
+                        self._train_acc[(item["path"], epoch)] = [float(loss), 1]
+                continue
+            losses = item.get("val_loss") or []
+            for epoch, probs in enumerate((item.get("val_probs") or [])[:kept]):
+                if probs is not None:
+                    row.setdefault("_val", {})[epoch] = (list(probs), losses[epoch])
+        self._max_epoch = max(self._max_epoch, kept - 1)
+
     # -- output ------------------------------------------------------------
 
     @property

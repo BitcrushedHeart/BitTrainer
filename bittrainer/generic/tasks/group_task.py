@@ -843,6 +843,18 @@ class GroupTask(TrainingTask):
             self._grad_scale = self.scaler.get_scale()
         # The val order the backed-up epochs scored in (Bitcrush ISSUE-1690).
         self._resumed_val_schedule = resume_state.get("val_schedule")
+        # Soft targets or not, as the run decided before its sweeps; prepare_data
+        # decided it again from the smoothing they chose. An older backup
+        # without it keeps that (Bitcrush ISSUE-1690).
+        if "use_soft" in resume_state:
+            self.use_soft = bool(resume_state["use_soft"])
+        # The epochs before this resume are only in the file they wrote: take
+        # them up, so the run's record keeps them (Bitcrush ISSUE-1690).
+        if self.sample_stats is not None and resume_state.get("epoch") is not None:
+            self.sample_stats.carry_over(
+                Path(ctx.checkpoint_dir) / "sample_stats.json",
+                before=int(resume_state["epoch"]),
+            )
 
     def resumed_message(
         self, ctx: TaskContext, best: BestTracker, global_step: int, start_epoch: int
@@ -1432,6 +1444,9 @@ class GroupTask(TrainingTask):
             "head_hidden_size": self.head_hidden_size,
             # Read only by a resume that trains no epoch (Bitcrush ISSUE-1690).
             "val_schedule": [list(b) for b in self._val_schedule] or None,
+            # Decided before the sweeps ran (Bitcrush ISSUE-1690): a resume would
+            # decide it again from the smoothing they chose.
+            "use_soft": self.use_soft,
         }
 
     # -- finalisation ------------------------------------------------------
@@ -1616,18 +1631,7 @@ class GroupTask(TrainingTask):
                 scaler_collapsed=self.scaler_warning is not None,
                 scaler_warning=self.scaler_warning,
             )
-        stats_file = ctx.checkpoint_dir / "sample_stats.json"
-        if (
-            resumed
-            and self.sample_stats is not None
-            and self.sample_stats.epochs == 0
-            and stats_file.is_file()
-        ):
-            # A resume that trained no epoch recorded nothing: the file the last
-            # epoch wrote is the run's record (Bitcrush ISSUE-1690).
-            stats_path = stats_file
-        else:
-            stats_path = self._write_sample_stats(ctx.checkpoint_dir)
+        stats_path = self._write_sample_stats(ctx.checkpoint_dir)
         if stats_path is not None and isinstance(result, dict):
             result["sample_stats_path"] = str(stats_path)
         # The run-long loaders are done: drop them so their persistent workers

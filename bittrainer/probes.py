@@ -73,21 +73,42 @@ def _resolved_snapshot(config: GroupTrainConfig) -> dict:
     loop; a resume skips those sweeps, so the backup must carry the RESOLVED
     values and re-apply them (via :func:`_apply_resolved`) so the loss, soft
     targets and dataset composition match the interrupted run exactly. Everything
-    else (``use_soft``, ``mixup_enabled``, ``swa_start_epoch``, ``balance_mode``)
-    is recomputed deterministically from these fields, so it needn't be stored.
+    else (``mixup_enabled``, ``swa_start_epoch``, ``balance_mode``) is recomputed
+    deterministically from these fields, so it needn't be stored; ``use_soft``
+    rides the backup on its own (the group task's), as it was decided before
+    the sweeps ran. What the sweeps found rides along too (Bitcrush ISSUE-1690),
+    so a resumed run reports it; a backup without it resumes as before.
     """
     return {
         "oversample_none": bool(config.oversample_none),
         "label_smoothing": float(config.label_smoothing),
         "ordinal_sigma": float(config.ordinal_sigma),
         "class_balance_mode": config.class_balance_mode,
+        **{name: copy.deepcopy(getattr(config, name)) for name in _SWEEP_REPORTS},
     }
+
+
+# What the sweeps found, for the result only: training never reads these.
+_SWEEP_REPORTS = (
+    "selected_softness_kind",
+    "selected_softness_value",
+    "soft_label_tuning_metric",
+    "soft_label_tuning_results",
+    "soft_label_tuning_elapsed_ms",
+    "selected_oversample_none",
+    "oversample_tuning_metric",
+    "oversample_tuning_results",
+    "oversample_tuning_elapsed_ms",
+)
 
 
 def _apply_resolved(config: GroupTrainConfig, resolved: dict) -> None:
     for key in ("oversample_none", "label_smoothing", "ordinal_sigma", "class_balance_mode"):
         if key in resolved:
             setattr(config, key, resolved[key])
+    for key in _SWEEP_REPORTS:
+        if key in resolved:
+            setattr(config, key, copy.deepcopy(resolved[key]))
 
 
 def _apply_softness(config: GroupTrainConfig, kind: str, value: float) -> None:
