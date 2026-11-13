@@ -9,7 +9,13 @@ progress_callback=...)`` with a request assembled from the suite DB:
             / "convnextv2_size": str,
         "candidate_checkpoint_path": str,   # where to write the safetensors
         "records": [ {content_hash, file_paths, binary{concept: label},
-                      groups{group: class}, splits{split: n}} ],
+                      groups{group: class}, splits{split: n},
+                      held?: [concept or group, ...]} ],
+                                            # held: answers of this record that
+                                            # are validation answers at home;
+                                            # they never train, and when any
+                                            # record has one they are the
+                                            # validation set (see _split_samples)
         "dataset_snapshot_id" / "content_hash_index_id": str,
         "heads": {...},                     # head status block (echoed back)
         "training_config": {image_size, batch_size, epochs, max_steps,
@@ -261,15 +267,44 @@ class _ImpliedNegative(float):
 
 
 class _Sample:
-    __slots__ = ("path", "binary", "groups")
+    """One image's labels. ``held_binary`` / ``held_groups`` are the answers
+    held back for validation at home (Bitcrush ISSUE-1718): never in ``binary``
+    or ``groups``, so they never train, and kept so the planner knows the image
+    is not unlabelled for those heads."""
 
-    def __init__(self, path: str, binary: dict[str, float], groups: dict[str, int]):
+    __slots__ = ("path", "binary", "groups", "held_binary", "held_groups")
+
+    def __init__(
+        self,
+        path: str,
+        binary: dict[str, float],
+        groups: dict[str, int],
+        held_binary: dict[str, float] | None = None,
+        held_groups: dict[str, int] | None = None,
+    ):
         self.path = path
         self.binary = binary
         self.groups = groups
+        self.held_binary = held_binary or {}
+        self.held_groups = held_groups or {}
+
+
+HOME_SPLIT = "home_split"
+CONTENT_HASH = "content_hash"
+
+
+def validation_source(records: list[dict]) -> str:
+    """Where a run's validation comes from: ``"home_split"`` when any record
+    holds an answer back (see :func:`_split_samples`), else ``"content_hash"``."""
+    return HOME_SPLIT if any(record.get("held") for record in records) else CONTENT_HASH
 
 
 def _build_samples(records: list[dict], vocab: _Vocab) -> tuple[list[_Sample], int]:
+    """One sample per image with a file and a usable answer.
+
+    A record's ``held`` answers go to the sample's ``held_binary`` /
+    ``held_groups`` and never to its ``binary`` / ``groups``; a sample whose
+    answers are all held is still built, for validation."""
     samples: list[_Sample] = []
     missing = 0
     duplicates = 0
@@ -284,28 +319,33 @@ def _build_samples(records: list[dict], vocab: _Vocab) -> tuple[list[_Sample], i
         if path is None:
             missing += 1
             continue
+        held = {str(name) for name in record.get("held") or ()}
         binary: dict[str, float] = {}
+        held_binary: dict[str, float] = {}
         for concept, label in (record.get("binary") or {}).items():
             lowered = str(label).lower()
             key = _safe_module_key(concept)
+            into = held_binary if concept in held else binary
             if lowered in _POSITIVE_LABELS:
-                binary[key] = 1.0
+                into[key] = 1.0
             elif lowered in _NEGATIVE_LABELS:
-                binary[key] = 0.0
+                into[key] = 0.0
         groups: dict[str, int] = {}
+        held_groups: dict[str, int] = {}
         for group, class_name in (record.get("groups") or {}).items():
             key = _safe_module_key(group)
             classes = vocab.groups.get(key)
             if classes and str(class_name) in classes:
-                groups[key] = classes.index(str(class_name))
-        if not (binary or groups):
+                into = held_groups if group in held else groups
+                into[key] = classes.index(str(class_name))
+        if not (binary or groups or held_binary or held_groups):
             continue
         dedup_key = str(record.get("content_hash") or path)
         if dedup_key in seen:
             duplicates += 1
             continue
         seen.add(dedup_key)
-        samples.append(_Sample(path, binary, groups))
+        samples.append(_Sample(path, binary, groups, held_binary, held_groups))
     if duplicates:
         logger.warning(
             "Backbone training: skipped %d duplicate record(s) sharing a content_hash",
@@ -317,7 +357,24 @@ def _build_samples(records: list[dict], vocab: _Vocab) -> tuple[list[_Sample], i
 def _split_samples(
     records: list[dict], samples: list[_Sample], validation_split: float
 ) -> tuple[list[_Sample], list[_Sample]]:
-    """Deterministic content-hash split so re-runs see the same partition."""
+    """Deterministic content-hash split so re-runs see the same partition.
+
+    When any record holds answers back (``validation_source`` is
+    ``"home_split"``, Bitcrush ISSUE-1718) validation is those answers and
+    nothing else, and no image is held out by hash: every sample with an answer
+    left to train is a training sample (its held answers stay out of its
+    labels), and every sample with a held answer gives a validation sample
+    carrying only those. An image can be on both sides, with disjoint answers.
+    Training is never swapped with validation here: that would train on them.
+    """
+    if validation_source(records) == HOME_SPLIT:
+        train = [sample for sample in samples if sample.binary or sample.groups]
+        val = [
+            _Sample(sample.path, dict(sample.held_binary), dict(sample.held_groups))
+            for sample in samples
+            if sample.held_binary or sample.held_groups
+        ]
+        return train, val
     hash_by_path: dict[str, str] = {}
     for record in records:
         for path in record.get("file_paths") or []:
@@ -394,13 +451,25 @@ def _plan_epoch_samples(
     eff_binary: list[dict[str, float]] = [{} for _ in samples]
     replicas: list[_Sample] = []
     stats: dict[str, dict] = {}
+    # Answers held back for validation (Bitcrush ISSUE-1718) are not in
+    # ``binary``, so they cannot be drawn as a label or a replica. An image
+    # holding ANY answer back is never drawn as an implied negative, for any
+    # head: at home a concept's validation negatives include other concepts'
+    # validation yes images, so an image held for one head may be a validation
+    # no for another without carrying an answer for it here. Its other answers
+    # train as usual. An image held for a head does not count as an image
+    # without a yes in that head's prior.
+    held_count: dict[str, int] = {}
+    for sample in samples:
+        for concept in sample.held_binary:
+            held_count[concept] = held_count.get(concept, 0) + 1
 
     for concept in vocab.concepts:
         rng = random.Random(f"{seed}|{epoch}|{concept}")
         pos = [i for i, s in enumerate(samples) if s.binary.get(concept) == 1.0]
         neg = [i for i, s in enumerate(samples) if s.binary.get(concept) == 0.0]
         pos_total = len(pos)
-        priors[concept] = pos_total / max(len(samples), 1)
+        priors[concept] = pos_total / max(len(samples) - held_count.get(concept, 0), 1)
         common = max_prior is not None and priors[concept] > float(max_prior)
         if 0 < positive_cap < len(pos):
             if positive_cap_mode == "random":
@@ -418,7 +487,11 @@ def _plan_epoch_samples(
 
         ratio = _effective_neg_ratio(len(pos), neg_pos_ratio)
         unlabelled = (
-            [i for i, s in enumerate(samples) if concept not in s.binary]
+            [
+                i
+                for i, s in enumerate(samples)
+                if concept not in s.binary and not (s.held_binary or s.held_groups)
+            ]
             if soft and not common
             else []
         )

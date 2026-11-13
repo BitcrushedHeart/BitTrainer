@@ -15,7 +15,11 @@ Everything the run produces goes into ``--out``:
 
     progress.jsonl                 every progress frame, appended
     backbone_candidate.safetensors the trained backbone and its heads
-    result.json                    scores of the exported epoch
+    result.json                    scores of the exported epoch, and where its
+                                   validation came from: "validation_source"
+                                   is "home_split" when the pack (format 2)
+                                   marks answers held for validation at home,
+                                   which then never train, else "content_hash"
     backbone_candidate.val_scores.npz
                                    that epoch's raw validation scores, to work
                                    thresholds out again later
@@ -319,10 +323,19 @@ def _line(frame: dict) -> str | None:
         return f"WARNING: {frame.get('status_text')}"
     if stage == "preparing" and "train_samples" in frame:
         scaler = " with a GradScaler" if frame.get("grad_scaler") else ""
+        source = frame.get("validation_source")
+        validation = ""
+        if source == "home_split":
+            validation = (
+                f"; validation: home split, {frame.get('held_answers', 0):,} held "
+                f"answers on {frame.get('held_images', 0):,} images"
+            )
+        elif source:
+            validation = "; validation: by content hash"
         return (
             f"{frame['train_samples']:,} train / {frame['val_samples']:,} validation images, "
             f"{frame.get('concepts', 0):,} yes/no heads, {frame.get('groups', 0):,} groups; "
-            f"{frame.get('device')}, precision {frame.get('amp_dtype')}{scaler}"
+            f"{frame.get('device')}, precision {frame.get('amp_dtype')}{scaler}{validation}"
         )
     if stage == "training_step":
         speed = frame.get("images_per_second") or 0.0
@@ -509,6 +522,11 @@ def train_from_pack(
     watcher = threading.Thread(target=_watch, name="pack-train-control", daemon=True)
     watcher.start()
     _log(f"{counts['images']:,} images from the pack; output in {out}")
+    if "held_answers" in counts:  # a format 2 pack: answers held for validation
+        _log(
+            f"{counts['held_answers']:,} answers on {counts['held_images']:,} images "
+            "are validation answers at home: they validate and never train"
+        )
     result: dict | None = None
     failure: str | None = None
     refusal: str | None = None

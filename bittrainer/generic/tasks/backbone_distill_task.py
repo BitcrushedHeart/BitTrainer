@@ -401,6 +401,7 @@ class BackboneDistillTask(BackboneTask):
         self.head_match: HeadMatch | None = None
         self._uses_heads = False
         self._unlabelled: list = []
+        self.teacher_validation_source: str | None = None
         # The head report waits for the parent's preparing frame (see _emit).
         self._pending_report: dict | None = None
         self._last_terms: dict[str, float] = {}
@@ -429,6 +430,29 @@ class BackboneDistillTask(BackboneTask):
         )
         self.head_match = match
         self._uses_heads = match.shared > 0 and self.logit_weight > 0
+        # The teacher's answers reach every image, held ones included (Bitcrush
+        # ISSUE-1718). That only keeps the held answers out of training if the
+        # teacher never trained on them either; a teacher whose candidate does
+        # not say it was validated on the home split may have.
+        self.teacher_validation_source = self.teacher.metadata.get("validation_source")
+        if (
+            self.validation_source == bb.HOME_SPLIT
+            and self.teacher_validation_source != bb.HOME_SPLIT
+        ):
+            text = (
+                f"Teacher {self.teacher_path.name} was not trained with the answers "
+                "held for validation at home left out (its validation was "
+                f"{self.teacher_validation_source or 'not recorded'}): it may have "
+                "trained on them, and its answers would carry them into this run's "
+                "validation scores."
+            )
+            logger.warning("Backbone distillation: %s", text)
+            self._emit(
+                "warning",
+                text,
+                warning="teacher_not_home_split",
+                teacher_validation_source=self.teacher_validation_source,
+            )
         if not self._uses_heads and self.feature_weight <= 0:
             if match.shared == 0:
                 raise RuntimeError(
@@ -460,6 +484,7 @@ class BackboneDistillTask(BackboneTask):
                 "shared_groups": len(match.groups),
                 "mismatched_groups": list(match.mismatched_groups),
                 "unlabelled_images": len(self._unlabelled),
+                "teacher_validation_source": self.teacher_validation_source,
                 **self._recipe(),
             },
         }
@@ -735,6 +760,7 @@ class BackboneDistillTask(BackboneTask):
         distilled_from["teacher_checkpoint"] = self.teacher_path.name
         metadata["distilled_from"] = distilled_from
         used = dict(self._recipe())
+        used["teacher_validation_source"] = self.teacher_validation_source
         if self.head_match is not None:
             used.update(
                 shared_heads=self.head_match.shared,

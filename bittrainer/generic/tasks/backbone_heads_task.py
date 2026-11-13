@@ -165,7 +165,12 @@ class BackboneHeadsTask(BackboneTask):
             # image_size, distinct from any bucketed cache of the same trunk.
             preproc_sig=f"val_imagenet@{self.image_size}sq",
         )
-        all_samples = self.train_samples + self.val_samples
+        # One vector per image: with answers held at home (Bitcrush ISSUE-1718)
+        # an image can be both a training and a validation sample.
+        unique: dict[str, object] = {}
+        for sample in self.train_samples + self.val_samples:
+            unique.setdefault(sample.path, sample)
+        all_samples = list(unique.values())
         cache_samples = [self._cache_sample(s) for s in all_samples]
         self._emit(
             "embedding_build",
@@ -373,4 +378,5 @@ class BackboneHeadsTask(BackboneTask):
             "mode": "backbone_head_only",
             "backbone_hash": self.backbone_hash,
             "embedding_cache_stats": self.embedding_cache_stats,
+            **self._validation_record(),
         }

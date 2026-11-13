@@ -359,6 +359,12 @@ class BackboneTask(TrainingTask):
         self.train_samples: list = []
         self.val_samples: list = []
         self._unique_images = 0
+        # Where validation comes from (bb.validation_source, Bitcrush
+        # ISSUE-1718) and, for a home split, how many answers and images it
+        # holds. Set in make_context.
+        self.validation_source: str | None = None
+        self.held_answers = 0
+        self.held_images = 0
         self.model = None
         self.ema: ModelEMA | None = None
         self.feature_dim = 0
@@ -436,6 +442,18 @@ class BackboneTask(TrainingTask):
             records, samples, self.validation_split
         )
         self._unique_images = len(samples)
+        self.validation_source = bb.validation_source(records)
+        if self.validation_source == bb.HOME_SPLIT:
+            # The validation samples carry the held answers and nothing else.
+            self.held_answers = sum(
+                len(s.binary) + len(s.groups) for s in self.val_samples
+            )
+            self.held_images = len(self.val_samples)
+            if not self.train_samples:
+                raise RuntimeError(
+                    "Every answer of every image is held for validation at home: "
+                    "nothing is left to train on."
+                )
 
         class _Emitter:
             """Backbone emits raw frames only; ``.stage`` is a no-op the core calls
@@ -565,6 +583,7 @@ class BackboneTask(TrainingTask):
             f"({len(self.train_samples)} train / {len(self.val_samples)} val)",
             train_samples=len(self.train_samples),
             val_samples=len(self.val_samples),
+            **self._validation_record(),
             unique_images=self._unique_images,
             concepts=len(self.vocab.concepts),
             groups=len(self.vocab.groups),
@@ -1338,6 +1357,16 @@ class BackboneTask(TrainingTask):
             # fp16 only: optimizer steps the GradScaler skipped, and its scale.
             "skipped_steps": int(self.skipped_steps),
             "grad_scale": self._grad_scale,
+            **self._validation_record(),
+        }
+
+    def _validation_record(self) -> dict:
+        """Where validation came from, and how many answers and images were
+        held back for it (0 and 0 for a content-hash split)."""
+        return {
+            "validation_source": self.validation_source,
+            "held_answers": int(self.held_answers),
+            "held_images": int(self.held_images),
         }
 
     def _training_actual(self) -> dict:
@@ -1406,6 +1435,9 @@ class BackboneTask(TrainingTask):
             "backbone_feature_dim": self.feature_dim,
             "heads_concepts_json": list(self.vocab.concepts),
             "heads_groups_json": {g: list(cs) for g, cs in self.vocab.groups.items()},
+            # Validation on the answers held at home, or by content hash
+            # (Bitcrush ISSUE-1718); every backbone task records it.
+            **self._validation_record(),
         }
         for key in (
             "pretrained_model_id",
