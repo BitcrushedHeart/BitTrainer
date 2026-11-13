@@ -374,6 +374,9 @@ class BackboneTask(TrainingTask):
         self._val_loader = None
         self.best_backbone_state: dict | None = None
         self.best_heads_state: dict | None = None
+        # (epoch, size the backup planned, size now) when a resume changes the
+        # image size of the epoch it resumes into (ISSUE-1721).
+        self._resolution_change: tuple[int, int, int] | None = None
         self.best_metrics: dict = {}
         self.best_score = -1.0
         self.validation_metrics: dict = {}
@@ -485,11 +488,14 @@ class BackboneTask(TrainingTask):
             pause_event=ctx.pause_event,
             cb=ctx.cb,
         )
+        # The image sizes are not part of a backup's identity (ISSUE-1721): the
+        # schedule runs over epochs, and nothing a backup holds depends on the
+        # size, so a paused run may come back at another resolution. Backups
+        # carry the sizes they were planned with ("resolution") instead.
         fingerprint = bb._backbone_fingerprint(
             self.vocab,
             self.model_size,
             self.epochs,
-            resolution=self._resolution_signature(),
             optimizer_identity=optimizer_identity(
                 llrd=self.llrd,
                 llrd_decay=self.llrd_decay,
@@ -502,9 +508,54 @@ class BackboneTask(TrainingTask):
             if resume_from
             else None
         )
+        if resume_state is not None:
+            self._restart_best_if_resized(resume_state)
         ctx.coordinator = coordinator
         ctx.fingerprint = fingerprint
         ctx.resume_state = resume_state
+
+    @staticmethod
+    def _planned_size(signature: str, epochs: int, epoch: int) -> int | None:
+        """The image size *signature* ("384" or "224->384@5") gave *epoch*."""
+        try:
+            main, _, tail = str(signature).partition("->")
+            if not tail:
+                return int(main)
+            tail_size, _, tail_epochs = tail.partition("@")
+            if epoch >= epochs - int(tail_epochs):
+                return int(tail_size)
+            return int(main)
+        except ValueError:
+            return None
+
+    def _restart_best_if_resized(self, resume_state: dict) -> None:
+        """Validation scores at two image sizes are not comparable: when the
+        epoch a run resumes into is planned at another size than the backup had
+        it, the best so far restarts (as at the switch into the tail), so a
+        lower-resolution epoch is never the exported candidate."""
+        signature = resume_state.get("resolution") or (
+            resume_state.get("fingerprint") or {}
+        ).get("resolution")
+        if not signature:
+            return
+        epoch = int(resume_state.get("epoch", 0))
+        before = self._planned_size(signature, self.epochs, epoch)
+        now = self._epoch_image_size(epoch)
+        if before is None or before == now:
+            return
+        best = dict(resume_state.get("best") or {})
+        best.update(
+            best_validation_score=-1.0,
+            best_val_macro_f1=-1.0,
+            best_val_qwk=-1.0,
+            best_epoch=0,
+            patience_counter=0,
+            best_metrics={},
+        )
+        resume_state["best"] = best
+        for key in ("best_backbone_state", "best_heads_state", "best_val_scores"):
+            resume_state[key] = None
+        self._resolution_change = (epoch, before, now)
 
     def loop_spec(self) -> LoopSpec:
         # Backbone selects on strict improvement in the mean validation metric (no
@@ -847,6 +898,17 @@ class BackboneTask(TrainingTask):
         # The winning epoch's raw validation scores: without them a resumed run
         # that never beats that epoch would export it with no thresholds.
         self._best_val_scores = resume_state.get("best_val_scores")
+        if self._resolution_change is not None:
+            epoch, before, now = self._resolution_change
+            self._emit(
+                "training",
+                f"Resuming at {now}px (the backup planned {before}px for epoch "
+                f"{epoch + 1}): the best score restarts at this resolution",
+                resolution_changed=True,
+                from_size=before,
+                to_size=now,
+                epoch=epoch + 1,
+            )
         self.skipped_steps = int(resume_state.get("skipped_steps", 0))
         # A backup from before the count existed is from a run under way.
         self._scaler_settled = bool(resume_state.get("scaler_settled", True))
@@ -1267,6 +1329,8 @@ class BackboneTask(TrainingTask):
             else None,
             "skipped_steps": self.skipped_steps,
             "scaler_settled": self._scaler_settled,
+            # The sizes this backup was planned with, for a resume at new ones.
+            "resolution": self._resolution_signature(),
         }
 
     # -- finalisation ------------------------------------------------------

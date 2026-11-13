@@ -324,8 +324,9 @@ def test_the_tail_batch_size_is_not_part_of_a_backups_identity(tmp_path):
     )
 
     assert fingerprint_matches(two, three) and fingerprint_matches(three, two)
-    # The tail's resolution still is: those backups belong to another run.
-    assert not fingerprint_matches(two, larger)
+    # Since ISSUE-1721 neither is the tail's resolution: a paused run may come
+    # back at new sizes (test_backbone_resolution_resume.py).
+    assert fingerprint_matches(two, larger)
 
 
 # -- the preflight ------------------------------------------------------------
