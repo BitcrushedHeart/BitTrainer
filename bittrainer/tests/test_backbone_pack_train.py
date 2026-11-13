@@ -7,7 +7,9 @@ by content hash and labels keyed by head ids, with no names in it.
 a file, a heartbeat inside each epoch, backups, pause / stop / resume, and a
 refusal to start over on top of another run's backups.
 
-CPU-only, ``atto`` backbone, a couple of dozen generated 64px images.
+CPU-only, ``atto`` backbone, a couple of dozen generated 64px images. Every
+run starts from the Apache V1 conversion (Bitcrush ISSUE-1721), faked here so
+nothing is downloaded.
 """
 
 from __future__ import annotations
@@ -25,7 +27,7 @@ import bittrainer.tools.backbone_pack_train as runner
 from bittrainer.backbone_pack import PackError, pack_records, read_manifest
 from bittrainer.generic.tasks.backbone_distill_task import BackboneDistillTask
 from bittrainer.generic.tasks.backbone_task import BackboneTask
-from bittrainer.tests.backbone_stub import use_stub_trunk
+from bittrainer.tests.backbone_stub import fake_v1_converter, use_stub_trunk
 from bittrainer.tools.backbone_proof import make_fixture_dataset
 
 _CONCEPT_IDS = {"striped": "c11", "ringed": "c12"}
@@ -60,6 +62,11 @@ def _make_pack(root: Path, *, images: int = 24) -> Path:
     return pack
 
 
+@pytest.fixture(autouse=True)
+def _no_download(monkeypatch):
+    monkeypatch.setattr(runner, "write_v1_trunk", fake_v1_converter)
+
+
 def _options(**overrides) -> dict:
     options = {
         "size": "atto",
@@ -68,7 +75,7 @@ def _options(**overrides) -> dict:
         "batch_size": 4,
         "device": "cpu",
         "amp": "off",
-        "init": "random",
+        "init": "apache",
         "workers": 0,
         "progress_every_steps": 1,
     }
@@ -139,16 +146,30 @@ def test_only_a_known_pack_format_is_read(tmp_path):
 # -- the request --------------------------------------------------------------
 
 
-def test_options_map_onto_the_training_request(tmp_path):
+def test_options_map_onto_the_training_request(tmp_path, monkeypatch):
     pack = _make_pack(tmp_path)
     out = tmp_path / "run"
+
+    def _convert(size, path, weights=None):  # a Base trunk is not built here
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        Path(path).write_bytes(b"a converted trunk")
+        name = "convnext_base.fb_in22k_ft_in1k"
+        return {
+            "model_id": f"timm/{name}",
+            "license": "apache-2.0",
+            "source_url": f"https://huggingface.co/timm/{name}",
+            "max_abs_difference": 0.0,
+            "path": str(path),
+        }
+
+    monkeypatch.setattr(runner, "write_v1_trunk", _convert)
 
     request, _counts = runner.build_request(
         pack,
         out,
         **_options(
             size="base",
-            init="timm",
+            init="apache",
             image_size=224,
             finetune_image_size=384,
             finetune_epochs=5,
@@ -177,29 +198,26 @@ def test_options_map_onto_the_training_request(tmp_path):
     assert config["backup_every_steps"] == 1000
     assert config["neg_pos_ratio"] == 3 and config["llrd_decay"] == 0.75
     # Pretrained weights are named, with their licence, in what gets exported.
-    assert request["backbone_init"] == {"source": "timm_pretrained"}
-    assert request["pretrained_model_id"] == "timm/convnextv2_base.fcmae_ft_in22k_in1k"
-    assert request["pretrained_license"] == "CC-BY-NC-4.0"
-    assert request["non_commercial_only"] is True
+    assert request["backbone_init"]["source"] == "local_candidate"
+    assert request["pretrained_model_id"] == "timm/convnext_base.fb_in22k_ft_in1k"
+    assert request["pretrained_license"] == "apache-2.0"
+    assert request["non_commercial_only"] is False
 
 
-def test_a_local_trunk_or_random_weights_carry_no_outside_licence(tmp_path):
+def test_a_local_trunk_carries_no_outside_licence(tmp_path):
     pack = _make_pack(tmp_path)
-    trunk = tmp_path / "fcmae.safetensors"
+    trunk = fake_v1_converter("atto", tmp_path / "v1.safetensors")["path"]
 
     local, _ = runner.build_request(
-        pack, tmp_path / "a", **_options(init_checkpoint=str(trunk))
+        pack, tmp_path / "a", **_options(init_checkpoint=trunk)
     )
-    random, _ = runner.build_request(pack, tmp_path / "b", **_options())
 
     assert local["backbone_init"] == {
         "source": "local_candidate",
-        "checkpoint_path": str(trunk),
+        "checkpoint_path": trunk,
     }
-    assert random["backbone_init"]["source"] == "random_init"
-    for request in (local, random):
-        assert request["external_pretrained_used"] is False
-        assert "pretrained_license" not in request
+    assert local["external_pretrained_used"] is False
+    assert "pretrained_license" not in local
 
 
 # -- running ------------------------------------------------------------------
@@ -393,6 +411,7 @@ def test_weights_that_are_refused_refuse_the_run(tmp_path, monkeypatch):
 def test_a_teacher_turns_the_run_into_a_distillation(tmp_path):
     pack = _make_pack(tmp_path)
     teacher = tmp_path / "base" / "backbone_candidate.safetensors"
+    fake_v1_converter("atto", teacher)  # a file with an Apache root
 
     distilled, _ = runner.build_request(
         pack,
@@ -572,7 +591,7 @@ def test_command_line_options_reach_the_run(monkeypatch, tmp_path):
 
     assert code == 0
     assert seen["pack"] == tmp_path / "pack" and seen["out"] == tmp_path / "run"
-    assert seen["size"] == "base" and seen["init"] == "timm"
+    assert seen["size"] == "base" and seen["init"] == "apache"
     assert (
         seen["image_size"] == 224 and seen["epochs"] == 30 and seen["batch_size"] == 64
     )

@@ -1443,6 +1443,7 @@ class BackboneTask(TrainingTask):
             "pretrained_model_id",
             "pretrained_license",
             "pretrained_source_url",
+            "lineage_json",  # where the weights came from (Bitcrush ISSUE-1721)
         ):
             value = self.request.get(key)
             if value is not None:

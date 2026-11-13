@@ -34,7 +34,11 @@ import bittrainer.generic.tasks.backbone_task as bt
 import bittrainer.tools.backbone_pack_train as runner
 from bittrainer.backbone_pack import PackError, pack_records
 from bittrainer.backbone_trainer import run_backbone_training
-from bittrainer.tests.backbone_stub import StubTrunk, use_stub_trunk
+from bittrainer.tests.backbone_stub import (
+    StubTrunk,
+    fake_v1_converter,
+    use_stub_trunk,
+)
 
 _SOFT = {"mode": "soft_implicit_negative", "implicit_negative_value": 0.1}
 
@@ -703,6 +707,8 @@ def _format_2_pack(root: Path) -> tuple[Path, int, int]:
 
 def test_the_runner_records_the_validation_source(tmp_path, monkeypatch):
     use_stub_trunk(monkeypatch)
+    # Only an Apache start trains (Bitcrush ISSUE-1721); faked, no download.
+    monkeypatch.setattr(runner, "write_v1_trunk", fake_v1_converter)
     pack, answers, images = _format_2_pack(tmp_path)
     out = tmp_path / "run"
     options = {
@@ -712,7 +718,7 @@ def test_the_runner_records_the_validation_source(tmp_path, monkeypatch):
         "batch_size": 4,
         "device": "cpu",
         "amp": "off",
-        "init": "random",
+        "init": "apache",
         "workers": 0,
         "soft_negatives": True,
     }

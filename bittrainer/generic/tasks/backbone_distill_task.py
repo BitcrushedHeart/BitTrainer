@@ -57,7 +57,8 @@ from bittrainer.generic.optimizer import clip_gradients
 from bittrainer.generic.task import TaskContext
 from bittrainer.generic.tasks.backbone_task import BackboneTask
 from bittrainer.lean_grn import use_lean_grn
-from bittrainer.model import create_model
+from bittrainer.lineage import apache_root, extend, lineage_of
+from bittrainer.model import backbone_state_hash, create_model
 
 logger = logging.getLogger(__name__)
 
@@ -263,6 +264,8 @@ class Teacher:
     groups: dict[str, list[str]]
     feature_dim: int
     metadata: dict[str, str]
+    # The teacher's trunk, as the student's lineage names it (Bitcrush ISSUE-1721).
+    trunk_hash: str | None = None
 
 
 def load_teacher(path, device) -> Teacher:
@@ -337,7 +340,15 @@ def load_teacher(path, device) -> Teacher:
         len(concepts),
         len(groups),
     )
-    return Teacher(path, model, concepts, groups, int(trunk.num_features), metadata)
+    return Teacher(
+        path,
+        model,
+        concepts,
+        groups,
+        int(trunk.num_features),
+        metadata,
+        trunk_hash=backbone_state_hash(trunk_state),
+    )
 
 
 class _StudentWithProjector(bb._BackboneWithHeads):
@@ -768,4 +779,18 @@ class BackboneDistillTask(BackboneTask):
                 teacher_only_heads=len(self.head_match.teacher_only),
             )
         metadata["distillation_json"] = used
+        # The student's lineage is its teacher's plus this distillation, with
+        # the student's own start named (Bitcrush ISSUE-1721). A teacher that
+        # does not descend from the Apache weights leaves the student none.
+        metadata.pop("lineage_json", None)
+        if lineage_of(teacher_metadata) is not None:
+            step = {
+                "kind": "distil",
+                "size": str(self.request.get("convnextv2_size") or self.model_size),
+                "from_trunk": self.teacher.trunk_hash,
+            }
+            own_start = apache_root(self.request.get("lineage_start"))
+            if own_start is not None:
+                step["init"] = own_start
+            metadata["lineage_json"] = extend(teacher_metadata, step)
         return metadata

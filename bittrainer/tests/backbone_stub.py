@@ -37,3 +37,42 @@ class StubTrunk(nn.Module):
 def use_stub_trunk(monkeypatch) -> None:
     """Make the backbone task build a :class:`StubTrunk` instead of a ConvNeXt."""
     monkeypatch.setattr(bt, "create_model", lambda **_kwargs: StubTrunk())
+
+
+def fake_v1_converter(size, path, weights=None):
+    """Stands in for ``convnext_v1_init.write_v1_trunk`` (Bitcrush ISSUE-1721).
+
+    Writes what the real converter writes, a bare trunk whose metadata names
+    the Apache-2.0 V1 weights it came from, without downloading anything: the
+    weights are the trunk the backbone task builds (a :class:`StubTrunk` when
+    :func:`use_stub_trunk` is on), at random.
+    """
+    from pathlib import Path
+
+    from safetensors.torch import save_file
+
+    from bittrainer.convnext_v1_init import V1_WEIGHTS
+
+    name = weights or V1_WEIGHTS[size]
+    trunk = bt.create_model(
+        model_size=size, pretrained=False, num_classes=0, drop_path_rate=0.0
+    )
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    save_file(
+        {key: value.contiguous() for key, value in trunk.state_dict().items()},
+        str(path),
+        metadata={
+            "architecture": "convnextv2",
+            "convnextv2_size": size,
+            "converted_from": f"timm/{name}",
+            "license": "apache-2.0",
+        },
+    )
+    return {
+        "model_id": f"timm/{name}",
+        "license": "apache-2.0",
+        "source_url": f"https://huggingface.co/timm/{name}",
+        "max_abs_difference": 0.0,
+        "path": str(path),
+    }

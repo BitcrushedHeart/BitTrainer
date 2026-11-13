@@ -47,6 +47,13 @@ resolution and batch size the run will use. If one does not fit the card the
 run is refused there and then, naming which, instead of failing at the switch
 to the tail a day in.
 
+Every run starts from the Apache-2.0 ConvNeXt V1 weights (Bitcrush ISSUE-1721):
+``--init apache`` (the default), or an ``--init-checkpoint`` / ``--teacher``
+that descends from them. ``--init timm`` (CC-BY-NC-4.0) and ``--init random``
+are refused, as is a trunk or teacher whose lineage does not reach them. The
+candidate records its lineage (``lineage_json``, see ``bittrainer.lineage``),
+and so does ``result.json``.
+
 Exit codes: 0 finished, 1 failed, 2 refused, 3 paused.
 """
 
@@ -66,7 +73,14 @@ from pathlib import Path
 
 from bittrainer.backbone_pack import PackError, pack_geometry_sensitive, pack_records
 from bittrainer.convnext_v1_init import write_v1_trunk
-from bittrainer.convnextv2_catalog import get_convnextv2_pretrained_source
+from bittrainer.lineage import (
+    LineageError,
+    extend,
+    lineage_of,
+    read_metadata,
+    require_apache,
+    trunk_hash,
+)
 
 _AMP_CHOICES = {"auto": "auto", "fp16": "float16", "bf16": "bfloat16"}
 _EXIT_CODES = {"finished": 0, "failed": 1, "refused": 2, "paused": 3}
@@ -108,6 +122,38 @@ def _backup_files(out: Path) -> list[Path]:
     return sorted((Path(out) / "backups").glob("backup_*.pt"))
 
 
+def _header(path, what: str) -> dict:
+    """The metadata of a model file named on the command line."""
+    try:
+        return read_metadata(path)
+    except Exception as exc:  # missing, not a model file, unreadable
+        raise LineageError(f"{what} cannot be read: {exc}") from exc
+
+
+def _check_start(
+    init: str, init_checkpoint: str | None, teacher: str | None
+) -> dict | None:
+    """Refuse any start that does not descend from the Apache ConvNeXt V1
+    weights (Bitcrush ISSUE-1721), before anything is read or written. Returns
+    the lineage of ``init_checkpoint`` when one is named."""
+    start = None
+    if init_checkpoint:
+        what = f"the --init-checkpoint {Path(init_checkpoint).name}"
+        meta = _header(init_checkpoint, what)
+        require_apache(meta, what)
+        start = lineage_of(meta)
+    elif init != "apache":
+        raise LineageError(
+            f"--init {init} is refused: every model starts from the Apache ConvNeXt V1 "
+            "weights (--init apache) or from a trunk that descends from them "
+            "(--init-checkpoint), Bitcrush ISSUE-1721"
+        )
+    if teacher:
+        what = f"the teacher {Path(teacher).name}"
+        require_apache(_header(teacher, what), what)
+    return start
+
+
 def build_request(
     pack: Path,
     out: Path,
@@ -119,7 +165,7 @@ def build_request(
     finetune_batch_size: int | None = None,
     device: str | None = None,
     amp: str = "auto",
-    init: str = "timm",
+    init: str = "apache",
     init_checkpoint: str | None = None,
     v1_weights: str | None = None,
     teacher: str | None = None,
@@ -149,14 +195,22 @@ def build_request(
 
     ``init="apache"`` converts Apache-2.0 ConvNeXt V1 weights into the run's
     folder once (see ``bittrainer.convnext_v1_init``) and starts from that
-    trunk; a resumed run reuses the file. ``teacher`` (a trained candidate)
-    turns the run into a distillation of it, tuned by ``distill``.
+    trunk; a resumed run reuses the file. ``init_checkpoint`` starts from a
+    trunk that descends from them instead. Any other start raises
+    :class:`~bittrainer.lineage.LineageError` (Bitcrush ISSUE-1721).
+    ``teacher`` (a trained candidate with an Apache root) turns the run into a
+    distillation of it, tuned by ``distill``.
+
+    The request carries the lineage the candidate records: ``lineage_json``
+    for a plain run; for a distillation ``lineage_start`` (its own start),
+    which the distillation task extends from the teacher's lineage.
 
     ``stock_grn`` trains with timm's own GRN layer instead of the lean one the
     trainer uses by default (``bittrainer.lean_grn``): slower and heavier under
     half precision, there for comparison.
     """
     pack, out = Path(pack), Path(out)
+    start = _check_start(init, init_checkpoint, teacher)
     records, counts = pack_records(pack, limit=limit)
     backups = out / "backups"
     if fresh:
@@ -224,27 +278,15 @@ def build_request(
     geometry_sensitive = pack_geometry_sensitive(pack)
     if geometry_sensitive is not None:  # an empty list still says "looked, none"
         request["geometry_sensitive"] = geometry_sensitive
+    from_trunk = None
     if init_checkpoint:
         request["backbone_init"] = {
             "source": "local_candidate",
             "checkpoint_path": str(init_checkpoint),
         }
         request["initialization_source"] = "local_candidate"
-    elif init == "timm":
-        # The weights this run starts from are named, with their licence, in
-        # everything it exports.
-        source = get_convnextv2_pretrained_source(size)
-        request["backbone_init"] = {"source": "timm_pretrained"}
-        request.update(
-            initialization_source="timm_pretrained",
-            license_provenance=source.model_id,
-            pretrained_model_id=source.model_id,
-            pretrained_license=source.license,
-            pretrained_source_url=source.source_url,
-            non_commercial_only=source.non_commercial_only,
-            external_pretrained_used=True,
-        )
-    elif init == "apache":
+        from_trunk = trunk_hash(init_checkpoint)
+    else:
         # Converted once into the run's folder; the note beside it carries
         # where it came from, so a resumed run does not download it again.
         trunk, note = out / "init_trunk.safetensors", out / "init_trunk.json"
@@ -266,14 +308,23 @@ def build_request(
             non_commercial_only=False,
             external_pretrained_used=True,
         )
-    else:
-        request["backbone_init"] = {"source": "random_init", "checkpoint_path": None}
-        request["initialization_source"] = "random_init"
+        start = lineage_of(
+            {"converted_from": source["model_id"], "license": source["license"]}
+        )
+        if start is None:
+            raise LineageError(
+                f"--init apache: {source['model_id']} ({source['license']}) is not "
+                "Apache ConvNeXt V1 weights"
+            )
     if teacher:
         request["distillation"] = {
             "teacher_checkpoint_path": str(teacher),
             **(distill or {}),
         }
+        request["lineage_start"] = start
+    else:
+        step = {"kind": "backbone", "size": size, "from_trunk": from_trunk}
+        request["lineage_json"] = extend(start, step)
     return request, counts
 
 
@@ -574,6 +625,12 @@ def train_from_pack(
         if torch.cuda.is_available():
             # What the run needed at its peak, to size the batch for the next one.
             result["peak_vram_mb"] = round(torch.cuda.max_memory_allocated() / 2**20)
+        # Where the candidate came from, beside its scores (Bitcrush ISSUE-1721).
+        try:
+            candidate = read_metadata(result.get("candidate_checkpoint_path"))
+            result["lineage_json"] = lineage_of(candidate)
+        except (OSError, TypeError, ValueError):
+            result["lineage_json"] = None
         (out / "result.json").write_text(
             json.dumps(result, indent=1, default=_jsonable), encoding="utf-8"
         )
@@ -644,18 +701,21 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument(
         "--init",
-        default="timm",
+        default="apache",
         choices=["timm", "apache", "random"],
         help=(
-            "timm = the published ConvNeXt V2 weights (CC-BY-NC-4.0); apache = ConvNeXt "
-            "V1 weights (Apache-2.0) converted into a V2 trunk; random = from nothing"
+            "apache (the default) = ConvNeXt V1 weights (Apache-2.0) converted into a "
+            "V2 trunk. timm (the CC-BY-NC-4.0 ConvNeXt V2 weights) and random are "
+            "refused: every model descends from the Apache weights"
         ),
     )
     parser.add_argument(
         "--v1-weights", default=None, help="with --init apache: another timm V1 weight"
     )
     parser.add_argument(
-        "--init-checkpoint", default=None, help="start from a local trunk"
+        "--init-checkpoint",
+        default=None,
+        help="start from a local trunk that descends from the Apache weights",
     )
     parser.add_argument(
         "--teacher", default=None, help="distil this trained candidate into the run"
