@@ -248,10 +248,60 @@ class _Vocab:
         # Each concept's prior, written by _plan_epoch_samples from the training
         # images; validation bands its recall figures by it.
         self.priors: dict[str, float] = {}
+        # Ordinal groups (see _attach_ordinal): group -> each class's rank on
+        # the scale, in vocab order; None for a class off the scale (__none__).
+        self.ordinal: dict[str, list[int | None]] = {}
+        self.ordinal_sigma: dict[str, float] = {}
 
     @property
     def has_targets(self) -> bool:
         return bool(self.concepts or self.groups)
+
+
+def _attach_ordinal(vocab: _Vocab, ordinal_groups: dict[str, dict] | None) -> None:
+    """Record which of the vocab's groups are ordinal (Bitcrush ISSUE-1721).
+
+    ``ordinal_groups`` is the pack's ``{"g6": {"order": [...], "sigma": s}}``.
+    The vocab sorts class ids as strings, so each class gets its rank from the
+    order instead; a class the order does not name (``__none__``) is off the
+    scale. A group needs two ranked classes to have a scale at all."""
+    vocab.ordinal, vocab.ordinal_sigma = {}, {}
+    for group, entry in (ordinal_groups or {}).items():
+        key = _safe_module_key(group)
+        classes = vocab.groups.get(key)
+        if not classes:
+            continue
+        rank_of = {str(name): rank for rank, name in enumerate(entry.get("order") or [])}
+        ranks = [rank_of.get(name) for name in classes]
+        if sum(rank is not None for rank in ranks) < 2:
+            continue
+        vocab.ordinal[key] = ranks
+        sigma = entry.get("sigma")
+        vocab.ordinal_sigma[key] = 1.0 if sigma is None else float(sigma)
+
+
+def _ordinal_kernels(vocab: _Vocab, device: torch.device) -> dict[str, torch.Tensor]:
+    """Each ordinal group's soft-target matrix: row ``t`` is the target for an
+    answer of class ``t``, a Gaussian over rank distance (the group trainer's
+    ordinal smoothing, ``soft_labels._build_gaussian_kernel``), normalised per
+    row. A class off the scale keeps a one-hot row and takes no mass from the
+    others, so ``__none__`` is never a neighbour of the lowest class."""
+    kernels: dict[str, torch.Tensor] = {}
+    for group, ranks in vocab.ordinal.items():
+        sigma = vocab.ordinal_sigma.get(group, 1.0)
+        size = len(ranks)
+        kernel = torch.eye(size, dtype=torch.float32)
+        if sigma <= 0:  # no smoothing: a one-hot target, as in the group trainer
+            kernels[group] = kernel.to(device)
+            continue
+        for row, rank_row in enumerate(ranks):
+            if rank_row is None:
+                continue
+            for col, rank_col in enumerate(ranks):
+                if rank_col is not None:
+                    kernel[row, col] = math.exp(-((rank_row - rank_col) ** 2) / (2 * sigma**2))
+        kernels[group] = (kernel / kernel.sum(dim=1, keepdim=True)).to(device)
+    return kernels
 
 
 class _ImpliedNegative(float):
@@ -853,6 +903,7 @@ def _batch_loss(
     *,
     pos_weight: dict[str, float] | None = None,
     group_label_smoothing: float = 0.0,
+    group_soft_targets: dict[str, torch.Tensor] | None = None,
     reduction: str = "sum",
     label_policy: dict | None = None,
     epoch: int | None = None,
@@ -966,6 +1017,13 @@ def _batch_loss(
     for group, (rows, targets_list) in group_rows.items():
         logits = group_heads[group](features[rows])
         group_targets = torch.tensor(targets_list, device=device)
+        kernel = (group_soft_targets or {}).get(group)
+        if kernel is not None:
+            # An ordinal group: cross-entropy towards its Gaussian soft target.
+            log_probs = torch.log_softmax(logits.float(), dim=1)
+            soft = kernel.to(log_probs.device)[group_targets]
+            losses.append((-(soft * log_probs).sum(dim=1).mean()).reshape(1))
+            continue
         losses.append(
             ce(logits, group_targets, label_smoothing=group_label_smoothing).reshape(1)
         )
@@ -1147,13 +1205,37 @@ def _per_class_scores(
     )
 
 
+def _ordinal_scores(
+    group: str, ranks: list[int | None], targets: np.ndarray, preds: np.ndarray
+) -> dict[str, float]:
+    """QWK and mean error of one ordinal group, on its ranks (see
+    :func:`_backbone_metrics`); an answer off the scale either side is left out."""
+    from bittrainer.group_validation import compute_ordinal_metrics
+
+    rank = np.array([-1 if r is None else r for r in ranks], dtype=np.int64)
+    true_rank, pred_rank = rank[targets], rank[preds]
+    keep = (true_rank >= 0) & (pred_rank >= 0)
+    if not keep.any():
+        return {}
+    scored = compute_ordinal_metrics(
+        true_rank[keep].tolist(), pred_rank[keep].tolist(), int(rank.max()) + 1
+    )
+    return {f"group_qwk/{group}": scored["qwk"], f"group_mae/{group}": scored["ordinal_mae"]}
+
+
 def _backbone_metrics(
     binary_scores: dict[str, tuple[np.ndarray, np.ndarray]],
     group_scores: dict[str, tuple[np.ndarray, np.ndarray]],
     *,
     priors: dict[str, float] | None = None,
+    ordinal: dict[str, list[int | None]] | None = None,
 ) -> dict[str, float]:
     """Per-head F1/AP + per-group macro-F1 + a defensible ``selection`` aggregate.
+
+    ``ordinal`` (``vocab.ordinal``) adds ``group_qwk/<g>`` and ``group_mae/<g>``
+    (in steps of the scale) for the ordinal groups, over the answers whose true
+    and predicted class are both on the scale. Their F1 and the selection score
+    stay on the argmax, as the group trainer selects its epochs.
 
     Accuracy at ``logit > 0`` saturates on imbalanced heads and the blind mean of
     accuracies is dominated by easy heads, so selection moves to F1/AP. Legacy
@@ -1235,6 +1317,9 @@ def _backbone_metrics(
             f1 = float(_per_class_scores(confusion)[2].mean())
             metrics[f"group_f1/{group}"] = f1
             group_f1s.append(f1)
+        ranks = (ordinal or {}).get(group)
+        if n and ranks:
+            metrics.update(_ordinal_scores(group, ranks, tgt, preds))
 
     aggregates: list[float] = []
     if binary_f1s:
@@ -1357,7 +1442,10 @@ def _evaluate(
         score_sink["binary"] = binary_scores
         score_sink["groups"] = group_scores
     return _backbone_metrics(
-        binary_scores, group_scores, priors=getattr(vocab, "priors", None)
+        binary_scores,
+        group_scores,
+        priors=getattr(vocab, "priors", None),
+        ordinal=getattr(vocab, "ordinal", None),
     )
 
 

@@ -434,6 +434,9 @@ class BackboneTask(TrainingTask):
                 "Backbone training needs at least one labelled binary concept or "
                 "group with 2+ classes; the dataset audit found none."
             )
+        # Ordinal groups train on soft targets over their scale (ISSUE-1721).
+        bb._attach_ordinal(self.vocab, self.request.get("ordinal_groups"))
+        self._group_soft = bb._ordinal_kernels(self.vocab, device)
         samples, missing = bb._build_samples(records, self.vocab)
         if not samples:
             raise RuntimeError("No labelled images with existing files to train on.")
@@ -1119,6 +1122,7 @@ class BackboneTask(TrainingTask):
                     device,
                     pos_weight=self._pos_weight,
                     group_label_smoothing=self.group_label_smoothing,
+                    group_soft_targets=getattr(self, "_group_soft", None),
                     reduction=self.loss_reduction,
                     label_policy=self.label_policy,
                     epoch=self._planned_epoch,

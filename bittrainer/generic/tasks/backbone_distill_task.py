@@ -617,6 +617,7 @@ class BackboneDistillTask(BackboneTask):
                 device,
                 pos_weight=self._pos_weight,
                 group_label_smoothing=self.group_label_smoothing,
+                group_soft_targets=getattr(self, "_group_soft", None),
                 reduction=self.loss_reduction,
                 label_policy=self.label_policy,
                 epoch=self._planned_epoch,

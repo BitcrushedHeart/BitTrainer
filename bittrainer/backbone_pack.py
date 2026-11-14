@@ -113,6 +113,31 @@ def pack_geometry_sensitive(pack: Path) -> list[str] | None:
     return [str(name) for name in names]
 
 
+def pack_ordinal(pack: Path) -> dict[str, dict] | None:
+    """The manifest's ``ordinal`` groups, for the training request (Bitcrush
+    ISSUE-1721): ``{"g6": {"order": ["k3", "k10", ...], "sigma": 1.0}}``, the
+    class ids from the lowest to the highest, ``__none__`` left out. ``None``
+    when the manifest has no such key; the groups then train as plain classes.
+    The key is optional and the format number does not change for it."""
+    manifest = read_manifest(pack)
+    if "ordinal" not in manifest:
+        return None
+    groups = manifest["ordinal"] or {}
+    if not isinstance(groups, dict):
+        raise PackError(f"ordinal in the manifest of {pack} is not a mapping")
+    found: dict[str, dict] = {}
+    for group, entry in groups.items():
+        order = entry.get("order") if isinstance(entry, dict) else None
+        if not isinstance(order, list):
+            raise PackError(f"ordinal group {group} in the manifest of {pack} has no order")
+        found[str(group)] = {
+            "order": [str(name) for name in order],
+            # 0 is a real setting (no smoothing); only a missing one means 1.
+            "sigma": 1.0 if entry.get("sigma") is None else float(entry["sigma"]),
+        }
+    return found
+
+
 def pack_records(pack: Path, *, limit: int | None = None) -> tuple[list[dict], dict]:
     """The pack as ``run_backbone_training`` records, plus what was found.
 

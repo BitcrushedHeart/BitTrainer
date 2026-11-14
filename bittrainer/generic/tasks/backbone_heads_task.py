@@ -290,6 +290,7 @@ class BackboneHeadsTask(BackboneTask):
                 group_labels,
                 device,
                 pos_weight=self._pos_weight,
+                group_soft_targets=getattr(self, "_group_soft", None),
                 label_policy=self.label_policy,
                 epoch=self._planned_epoch,
             )

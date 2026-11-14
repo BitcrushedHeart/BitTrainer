@@ -71,7 +71,12 @@ import time
 import traceback
 from pathlib import Path
 
-from bittrainer.backbone_pack import PackError, pack_geometry_sensitive, pack_records
+from bittrainer.backbone_pack import (
+    PackError,
+    pack_geometry_sensitive,
+    pack_ordinal,
+    pack_records,
+)
 from bittrainer.convnext_v1_init import write_v1_trunk
 from bittrainer.lineage import (
     LineageError,
@@ -278,6 +283,9 @@ def build_request(
     geometry_sensitive = pack_geometry_sensitive(pack)
     if geometry_sensitive is not None:  # an empty list still says "looked, none"
         request["geometry_sensitive"] = geometry_sensitive
+    ordinal = pack_ordinal(pack)
+    if ordinal:
+        request["ordinal_groups"] = ordinal
     from_trunk = None
     if init_checkpoint:
         request["backbone_init"] = {
