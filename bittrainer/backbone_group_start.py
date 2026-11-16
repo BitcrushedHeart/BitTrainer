@@ -101,13 +101,15 @@ def start_group_model(
 
     With a linear head (``head_hidden_size`` None) ``head.fc`` is the
     backbone's head for the group, its rows put in *class_ids* order, so the
-    model answers as the backbone does. With a hidden-MLP head the trunk is
-    kept and the head tail starts fresh.
+    model answers as the backbone does. A class labelled since the backbone's
+    pack keeps the fresh model's row (a class the group no longer has is
+    dropped); a head sharing no class, or a hidden-MLP head, keeps the trunk
+    and starts the head fresh.
 
     Refuses (:class:`~bittrainer.lineage.LineageError`) a trunk that does not
     descend from the Apache ConvNeXt V1 weights, and
-    (:class:`GroupStartError`) a trunk of another size, one with no head for
-    the group, or a head whose classes are not *class_ids*.
+    (:class:`GroupStartError`) a trunk of another size or one with no head for
+    the group.
 
     *out* (optional) is where the start is written, with its ``lineage_json``:
     a ``.safetensors`` for the group trainer's ``backbone_init``, or a
@@ -127,14 +129,6 @@ def start_group_model(
     if len(set(classes)) != len(classes):
         raise GroupStartError(f"the class ids repeat: {classes}")
     head_classes = _head_classes(meta, group_key, name)
-    if set(head_classes) != set(classes):
-        only_here = sorted(set(classes) - set(head_classes))
-        only_head = sorted(set(head_classes) - set(classes))
-        raise GroupStartError(
-            f"the backbone's head for {group_key} has other classes than the group: "
-            f"the group only has {only_here or 'none'}, the head only has "
-            f"{only_head or 'none'}"
-        )
 
     from safetensors.torch import load_file
 
@@ -166,12 +160,33 @@ def start_group_model(
         )
     seed = {k: trunk_state[k].to(target[k].dtype) for k in wanted}
 
-    if head_hidden_size is None:
-        order = [head_classes.index(class_id) for class_id in classes]
-        seed["head.fc.weight"] = weight[order].to(target["head.fc.weight"].dtype)
-        seed["head.fc.bias"] = bias[order].to(target["head.fc.bias"].dtype)
+    known = [class_id for class_id in classes if class_id in head_classes]
+    new = [class_id for class_id in classes if class_id not in head_classes]
+    if head_hidden_size is None and known:
+        # A class labelled since the backbone's pack keeps the fresh model's row; the
+        # rest start as the backbone's head; a class the group no longer has is dropped.
+        fc_weight = target["head.fc.weight"].clone()
+        fc_bias = target["head.fc.bias"].clone()
+        for row, class_id in enumerate(classes):
+            if class_id in head_classes:
+                fc_weight[row] = weight[head_classes.index(class_id)].to(fc_weight.dtype)
+                fc_bias[row] = bias[head_classes.index(class_id)].to(fc_bias.dtype)
+        seed["head.fc.weight"], seed["head.fc.bias"] = fc_weight, fc_bias
         seeded = True
         note = f"head.fc starts as the backbone's {group_key} head, in Engine's class order"
+        if new:
+            note += (
+                f" ({len(known)} of {len(classes)} classes; new since the backbone, "
+                f"starting fresh: {', '.join(new)})"
+            )
+            logger.warning("Group start for %s: %s", group_key, note)
+    elif head_hidden_size is None:
+        seeded = False
+        note = (
+            f"the backbone's {group_key} head shares no class with the group: the trunk "
+            "is kept and the head starts fresh"
+        )
+        logger.warning("Group start for %s: %s", group_key, note)
     else:
         seeded = False
         note = (

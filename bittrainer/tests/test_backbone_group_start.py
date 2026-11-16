@@ -192,13 +192,42 @@ def test_a_trunk_with_no_head_for_the_group_is_refused(tmp_path):
         start_group_model(trunk_file, "g8", _CLASSES, "atto")
 
 
-def test_a_head_with_other_classes_is_refused(tmp_path):
-    trunk_file, _trunk, _heads = _candidate(tmp_path / "small.safetensors")
+def test_a_class_labelled_since_the_backbone_starts_fresh_the_rest_seeded(tmp_path):
+    """Bitcrush 2026-11-16: Age gained two classes after its pack was exported and
+    was refused. Classes the backbone's head knows keep its rows; a new class keeps
+    the fresh model's row; a class the group no longer has is dropped."""
+    trunk_file, _trunk, heads = _candidate(tmp_path / "small.safetensors")
+    classes = ["k9", "k11", "k10"]  # k11 is new; __none__ left the group
 
-    with pytest.raises(GroupStartError, match="k11"):
-        start_group_model(trunk_file, "g6", ["k9", "k10", "k11"], "atto")
-    with pytest.raises(GroupStartError):
-        start_group_model(trunk_file, "g6", ["k9", "k10"], "atto")
+    start = start_group_model(trunk_file, "g6", classes, "atto")
+
+    state = start.model.state_dict()
+    known = sorted(_CLASSES)
+    for row, name in enumerate(classes):
+        if name == "k11":
+            continue
+        torch.testing.assert_close(
+            state["head.fc.weight"][row], heads["heads.groups.g6.weight"][known.index(name)]
+        )
+        torch.testing.assert_close(
+            state["head.fc.bias"][row], heads["heads.groups.g6.bias"][known.index(name)]
+        )
+    assert state["head.fc.weight"].shape == (3, start.model.num_features)
+    assert start.head_seeded is True
+    assert "2 of 3" in start.note and "k11" in start.note
+    assert start.class_names == classes
+
+
+def test_a_head_sharing_no_class_keeps_the_trunk_and_starts_its_head_fresh(tmp_path):
+    trunk_file, trunk, _heads = _candidate(tmp_path / "small.safetensors")
+
+    start = start_group_model(trunk_file, "g6", ["k20", "k21"], "atto")
+
+    assert start.head_seeded is False
+    assert "fresh" in start.note
+    state = start.model.state_dict()
+    for key, value in trunk.state_dict().items():
+        torch.testing.assert_close(state[key], value)
 
 
 def test_a_hidden_mlp_head_keeps_the_trunk_and_starts_its_tail_fresh(tmp_path):
