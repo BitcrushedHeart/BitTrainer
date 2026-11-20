@@ -61,13 +61,9 @@ def test_precision_choice_maps_onto_the_training_config(tmp_path):
     assert config(workers=4, channels_last=True)["dataloader_workers"] == 4
     assert config(workers=4, channels_last=True)["channels_last"] is True
 
-    request = proof.build_request(tmp_path, records, size="base", init="timm")
+    request = proof.build_request(tmp_path, records, size="base")
     assert request["convnextv2_size"] == "base"
-    assert request["backbone_init"]["source"] == "timm_pretrained"
-    assert (
-        proof.build_request(tmp_path, records)["backbone_init"]["source"]
-        == "random_init"
-    )
+    assert request["backbone_init"]["source"] == "random_init"
 
 
 def test_proof_run_completes_on_cpu(tmp_path):
@@ -144,7 +140,6 @@ def test_command_line_options_reach_the_run(monkeypatch, tmp_path):
             "--workers", "4",
             "--amp", "fp16",
             "--channels-last",
-            "--init", "timm",
             "--min-score", "0.7",
             "--device", "cuda",
             "--seed", "5",
@@ -163,7 +158,6 @@ def test_command_line_options_reach_the_run(monkeypatch, tmp_path):
         "amp": "fp16",
         "channels_last": True,
         "stock_grn": False,
-        "init": "timm",
         "min_score": 0.7,
         "device": "cuda",
         "seed": 5,

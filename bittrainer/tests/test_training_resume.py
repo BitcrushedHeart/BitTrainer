@@ -22,7 +22,15 @@ _CLASSES = ["a", "b", "c"]
 
 def _make_group(root, *, per_class=6, seed=0):
     """Write a tiny deterministic group folder: root/<class>/<split>/img.png."""
-    _make_labelled_group(root, _CLASSES, per_class=per_class, seed=seed)
+    rng = np.random.default_rng(seed)
+    for split, n in (("train", per_class), ("val", max(2, per_class // 2))):
+        for cname in _CLASSES:
+            d = root / cname / split
+            d.mkdir(parents=True, exist_ok=True)
+            for j in range(n):
+                Image.fromarray(rng.integers(0, 256, (64, 64, 3), dtype=np.uint8)).save(
+                    d / f"{cname}_{j}.png"
+                )
 
 
 def _cfg(group_folder, checkpoint_dir, **kw) -> GroupTrainConfig:
@@ -464,92 +472,4 @@ def test_binary_pause_resume_across_unfreeze_boundary(tmp_path):
     )
     assert "paused" not in resumed
     assert resumed["checkpoint_path"].endswith("best.pt")
-    assert resumed["epochs_completed"] == 3
-
-
-# ---------------------------------------------------------------------------
-# Multi-head + dual-branch mirror trainers: pause + epoch-restart resume
-# ---------------------------------------------------------------------------
-
-
-def _make_labelled_group(root, classes, *, per_class=6, seed=0):
-    rng = np.random.default_rng(seed)
-    for split, n in (("train", per_class), ("val", max(2, per_class // 2))):
-        for cname in classes:
-            d = root / cname / split
-            d.mkdir(parents=True, exist_ok=True)
-            for j in range(n):
-                Image.fromarray(rng.integers(0, 256, (64, 64, 3), dtype=np.uint8)).save(
-                    d / f"{cname}_{j}.png"
-                )
-
-
-def test_multihead_pause_and_resume_completes(tmp_path):
-    """Regression guard: multi-head trainer pauses at an epoch boundary, backs up,
-    and a resume rebuilds + restarts the epoch, completing without a crash."""
-    from bittrainer.multihead_trainer import MultiHeadTrainConfig, run_multihead_training
-
-    sizes = ["__none__", "34A", "34B", "36A", "36B"]
-    _make_labelled_group(tmp_path / "grp", sizes, per_class=6, seed=0)
-
-    def _cfg(**kw):
-        return MultiHeadTrainConfig(
-            group_folder=str(tmp_path / "grp"), size_classes=sizes,
-            checkpoint_dir=str(tmp_path / "ck"), max_epochs=3, patience=99,
-            backbone_variant="atto", device="cpu", dtype="float32", batch_size=4,
-            use_compile=False, channels_last=False, from_scratch=True, dataloader_workers=0,
-            backbone_init={"source": "random_init", "checkpoint_path": None}, **kw,
-        )
-
-    pause, _cb = _pause_at_epoch(1)
-
-    _seed(0)
-    first = run_multihead_training(
-        _cfg(backup_dir=str(tmp_path / "ck" / "backups")),
-        progress_callback=_cb, pause_event=pause,
-    )
-    assert first["paused"] is True
-
-    _seed(0)
-    resumed = run_multihead_training(
-        _cfg(backup_dir=str(tmp_path / "ck" / "backups"), resume_from=str(tmp_path / "ck" / "backups")),
-    )
-    assert "paused" not in resumed
-    assert resumed["checkpoint_path"] is not None
-    assert resumed["epochs_completed"] == 3
-
-
-def test_dual_branch_pause_and_resume_completes(tmp_path):
-    """Regression guard: dual-branch trainer pauses at an epoch boundary, backs
-    up, and a resume rebuilds + restarts the epoch, completing without a crash."""
-    from bittrainer.dual_branch_trainer import DualBranchTrainConfig, run_dual_branch_training
-
-    classes = ["a", "b", "c"]
-    _make_labelled_group(tmp_path / "crops", classes, per_class=6, seed=0)
-    _make_labelled_group(tmp_path / "context", classes, per_class=6, seed=0)
-
-    def _cfg(**kw):
-        return DualBranchTrainConfig(
-            group_folder=str(tmp_path / "crops"), context_folder=str(tmp_path / "context"),
-            num_classes=3, class_names=classes, checkpoint_dir=str(tmp_path / "ck"),
-            max_epochs=3, patience=99, backbone_variant="atto", device="cpu", dtype="float32",
-            batch_size=4, use_compile=False, channels_last=False, from_scratch=True,
-            dataloader_workers=0, backbone_init={"source": "random_init", "checkpoint_path": None}, **kw,
-        )
-
-    pause, _cb = _pause_at_epoch(1)
-
-    _seed(0)
-    first = run_dual_branch_training(
-        _cfg(backup_dir=str(tmp_path / "ck" / "backups")),
-        progress_callback=_cb, pause_event=pause,
-    )
-    assert first["paused"] is True
-
-    _seed(0)
-    resumed = run_dual_branch_training(
-        _cfg(backup_dir=str(tmp_path / "ck" / "backups"), resume_from=str(tmp_path / "ck" / "backups")),
-    )
-    assert "paused" not in resumed
-    assert resumed["checkpoint_path"] is not None
     assert resumed["epochs_completed"] == 3

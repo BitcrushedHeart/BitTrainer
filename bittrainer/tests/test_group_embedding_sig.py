@@ -82,13 +82,11 @@ def _build_group(root):
                 Image.fromarray(arr.astype(np.uint8)).save(d / f"i{j}.png")
 
 
-def test_prune_false_keeps_the_other_eras(tmp_path, monkeypatch):
+def test_prune_false_keeps_the_other_eras(tmp_path):
     """A comparison candidate (``embedding_cache_prune=False``) shares the
     group's cache root without deleting the group's own era."""
     from bittrainer.head_only_trainer import run_head_only_training
-    from bittrainer.tests.siglip_fixtures import install_tiny_trunk
 
-    install_tiny_trunk(monkeypatch)
     root = tmp_path / "grp"
     _build_group(root)
     embed = tmp_path / "embed"
@@ -101,7 +99,8 @@ def test_prune_false_keeps_the_other_eras(tmp_path, monkeypatch):
         ckpt.mkdir()
         return run_head_only_training(gt.GroupTrainConfig(
             group_folder=str(root), num_classes=2, class_names=["a", "b"],
-            backbone_variant="siglip2_base", device="cpu", dtype="float32",
+            backbone_variant="atto", backbone_init={"source": "random_init"},
+            device="cpu", dtype="float32",
             use_cache=False, checkpoint_dir=str(ckpt), embedding_cache_dir=str(embed),
             head_max_epochs=2, head_patience=1, train_resolution=128,
             embedding_cache_prune=prune,

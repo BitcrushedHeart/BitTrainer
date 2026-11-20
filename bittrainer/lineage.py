@@ -138,10 +138,6 @@ def _derived(meta: dict) -> tuple[dict | None, str]:
             None,
             "it was started from random weights, not the Apache ConvNeXt V1 ones",
         )
-    if source in ("timm_pretrained", "temporary_timm_pretrained_fallback"):
-        model = meta.get("pretrained_model_id") or "timm's ConvNeXt V2 weights"
-        licence = meta.get("pretrained_license") or "CC-BY-NC-4.0"
-        return None, f"it was started from {model} ({licence})"
     return None, "it records no lineage and no Apache ConvNeXt V1 start"
 
 

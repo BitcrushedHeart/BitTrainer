@@ -143,14 +143,12 @@ def test_candidate_metadata_carries_pretrained_provenance(tmp_path):
     request = _request(tmp_path)
     request.update(
         {
-            "initialization_source": "timm_pretrained",
-            "license_provenance": "timm/convnextv2_atto.fcmae_ft_in1k",
-            "pretrained_model_id": "timm/convnextv2_atto.fcmae_ft_in1k",
-            "pretrained_license": "CC-BY-NC-4.0",
-            "pretrained_source_url": (
-                "https://huggingface.co/timm/convnextv2_atto.fcmae_ft_in1k"
-            ),
-            "non_commercial_only": True,
+            "initialization_source": "convnext_v1_converted",
+            "license_provenance": "timm/convnext_atto.d2_in1k",
+            "pretrained_model_id": "timm/convnext_atto.d2_in1k",
+            "pretrained_license": "apache-2.0",
+            "pretrained_source_url": "https://huggingface.co/timm/convnext_atto.d2_in1k",
+            "non_commercial_only": False,
             "external_pretrained_used": True,
             "temporary_timm_fallback_used": False,
             "release_blocking": False,
@@ -161,11 +159,11 @@ def test_candidate_metadata_carries_pretrained_provenance(tmp_path):
     task.vocab = bb._Vocab(request["records"])
     metadata = task._candidate_metadata(0.75, {"selection": 0.75})
 
-    assert metadata["initialization_source"] == "timm_pretrained"
+    assert metadata["initialization_source"] == "convnext_v1_converted"
     assert metadata["pretrained_model_id"] == request["pretrained_model_id"]
-    assert metadata["pretrained_license"] == "CC-BY-NC-4.0"
+    assert metadata["pretrained_license"] == "apache-2.0"
     assert metadata["pretrained_source_url"] == request["pretrained_source_url"]
-    assert metadata["non_commercial_only"] is True
+    assert metadata["non_commercial_only"] is False
     assert metadata["external_pretrained_used"] is True
     assert metadata["temporary_timm_fallback_used"] is False
     assert metadata["release_blocking"] is False

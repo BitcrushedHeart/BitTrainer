@@ -6,8 +6,8 @@ resume / best / patience mechanics, and finalisation. Everything trainer-specifi
 (the group loss zoo, SWA / greedy-soup / DCW, skin-tone dual-view scoring,
 promotion) lives behind the :class:`TrainingTask` hooks the core calls.
 
-All five trainers now ride this seam — group, head-only, binary, backbone,
-multihead and dual-branch — each a thin ``run_*`` wrapper over
+The trainers all ride this seam — group, head-only, binary and backbone —
+each a thin ``run_*`` wrapper over
 ``GenericTrainer().run(SomeTask(cfg))``. The core never branches on a task type;
 every trainer-specific richness rides in a hook (``on_epoch_end``, ``finalize``,
 ``collect_extra_state``, ``on_epoch_start``).

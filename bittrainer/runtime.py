@@ -79,9 +79,8 @@ def _compile_targets(model: nn.Module) -> list[nn.Module]:
     """The repeated ConvNeXt blocks to compile individually.
 
     Walks every submodule exposing a timm ``.stages`` container — covering the
-    plain classifier (``model.stages``), the dual-branch model (``crop_branch``
-    / ``context_branch``) and the multi-head model (``backbone``) — and collects
-    each stage's ``.blocks``. The cheap, shape-specific stem/downsample/head are
+    plain classifier (``model.stages``) and the backbone builder's wrapper
+    (``backbone``) — and collects each stage's ``.blocks``. The cheap, shape-specific stem/downsample/head are
     deliberately left eager: that is exactly where the compile cost is *not*.
     """
     targets: list[nn.Module] = []

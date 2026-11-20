@@ -36,10 +36,9 @@ from bittrainer.generic.task import (
     TaskContext,
     TrainingTask,
 )
-from bittrainer.backbones import is_siglip
 from bittrainer.group_dataset import build_group_bucket_sampler
 from bittrainer.lean_grn import use_lean_grn
-from bittrainer.model import _infer_region_head, create_model, prepare_for_finetune
+from bittrainer.model import _infer_region_head, create_model, unfreeze_backbone
 from bittrainer.model_soup import greedy_soup
 from bittrainer.ordinal_threshold import (
     THRESHOLD_HEAD,
@@ -51,7 +50,6 @@ from bittrainer.progress import ProgressEmitter, Stage
 from bittrainer.regions import install_region_head, region_head_ckpt_meta
 from bittrainer.runtime import configure_cuda_backend, maybe_compile, prewarm_compile
 from bittrainer.sample_stats import SampleStatsRecorder
-from bittrainer.siglip_model import is_siglip_model, trainable_param_count
 from bittrainer.smart_cache import _noop_callback
 from bittrainer.training_state import (
     _FixedBatchSampler,
@@ -230,20 +228,12 @@ class GroupTask(TrainingTask):
         names = self.region_manifest.type_names if self.region_manifest is not None else None
         return region_head_ckpt_meta(model, names)
 
-    def _arch_meta(self, model, state: dict) -> dict:
-        """Architecture keys for a checkpoint of ``state`` (Bitcrush ISSUE-1106);
-        empty for a ConvNeXt softmax model."""
-        return gt._architecture_ckpt_meta(self.config, model, state=state)
-
     # -- one-time setup ----------------------------------------------------
     def make_context(
         self, progress_callback, stop_event, stop_now_event, pause_event
     ) -> TaskContext:
         config = self.config
-        # Refuse impossible backbone settings before anything is built and
-        # switch off the ConvNeXt-only speedups for SigLIP (a no-op for ConvNeXt).
-        notes = gt.validate_backbone_config(config, mode="full")
-        notes += gt.validate_ordinal_head(config)
+        notes = gt.validate_ordinal_head(config)
         em = ProgressEmitter(
             progress_callback or config.progress_callback or _noop_callback
         )
@@ -302,11 +292,6 @@ class GroupTask(TrainingTask):
                 llrd=config.llrd,
                 llrd_decay=config.llrd_decay,
                 wd_exclusions=config.wd_exclusions,
-                # SigLIP's optimizer holds only the unfrozen blocks; ConvNeXt
-                # passes None and keeps its historical identity.
-                trainable_blocks=(
-                    int(config.finetune_blocks) if is_siglip(config.backbone_variant) else None
-                ),
             ),
             # None for an ordinary group, which keeps its historical fingerprint.
             region_types=gt.region_type_names(config),
@@ -401,7 +386,7 @@ class GroupTask(TrainingTask):
         model = model.to(device)
         if self.memory_format is not None:
             model = model.to(memory_format=self.memory_format)
-        prepare_for_finetune(model, getattr(config, "finetune_blocks", 4))
+        unfreeze_backbone(model)
         return model
 
     def _use_lean_grn(self, model) -> None:
@@ -427,9 +412,8 @@ class GroupTask(TrainingTask):
             stop_event=ctx.stop_event,
             stop_now_event=ctx.stop_now_event,
         )
-        # The probe froze the backbone: restore the fine-tune's trainable set
-        # (ConvNeXt: everything; SigLIP: heads + the last finetune_blocks blocks).
-        prepare_for_finetune(model, getattr(self.config, "finetune_blocks", 4))
+        # The probe froze the backbone: the fine-tune trains everything.
+        unfreeze_backbone(model)
 
     def resolve_batch_size(
         self, ctx: TaskContext, model, resume_state: dict | None
@@ -487,11 +471,6 @@ class GroupTask(TrainingTask):
                 )
 
             ctx.em.stage(Stage.autobatch, "Probing optimal batch size")
-            # SigLIP trains only part of its trunk: budget optimizer state for
-            # that part. ConvNeXt's call is unchanged.
-            scope: dict = {}
-            if is_siglip_model(model):
-                scope["trainable_params"] = trainable_param_count(model)
             auto_result = determine_batch_size(
                 model,
                 self.bucket_counts,
@@ -501,7 +480,6 @@ class GroupTask(TrainingTask):
                 use_ema=config.use_ema,
                 memory_format=self.memory_format,
                 progress_callback=_probe_progress,
-                **scope,
             )
             eff_bs = auto_result["batch_size"]
             ctx.cb({"type": "autobatch", **auto_result})
@@ -1289,7 +1267,7 @@ class GroupTask(TrainingTask):
             **gt._spatial_ckpt_meta(config),
             **resolution_ckpt_meta(config.train_resolution),
             **self._region_meta(model),
-            **self._arch_meta(model, primary_state),
+            **gt._architecture_ckpt_meta(model),
         }
         if self.head_hidden_size is not None:
             ckpt_meta["head_hidden_size"] = self.head_hidden_size
@@ -1337,7 +1315,7 @@ class GroupTask(TrainingTask):
                 **gt._spatial_ckpt_meta(config),
                 **resolution_ckpt_meta(config.train_resolution),
                 **self._region_meta(model),
-                **self._arch_meta(model, snap_state),
+                **gt._architecture_ckpt_meta(model),
             }
             if self.head_hidden_size is not None:
                 snap_meta["head_hidden_size"] = self.head_hidden_size
@@ -1496,7 +1474,7 @@ class GroupTask(TrainingTask):
                         **gt._spatial_ckpt_meta(config),
                         **resolution_ckpt_meta(config.train_resolution),
                         **self._region_meta(model),
-                        **self._arch_meta(model, swa_sd_cpu),
+                        **gt._architecture_ckpt_meta(model),
                     }
                     if self.head_hidden_size is not None:
                         ckpt_meta["head_hidden_size"] = self.head_hidden_size
@@ -1574,7 +1552,7 @@ class GroupTask(TrainingTask):
                         **gt._spatial_ckpt_meta(config),
                         **resolution_ckpt_meta(config.train_resolution),
                         **self._region_meta(model),
-                        **self._arch_meta(model, soup_cpu),
+                        **gt._architecture_ckpt_meta(model),
                     }
                     if self.head_hidden_size is not None:
                         ckpt_meta["head_hidden_size"] = self.head_hidden_size

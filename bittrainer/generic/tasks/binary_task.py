@@ -368,7 +368,10 @@ class BinaryTask(TrainingTask):
         )
 
         if resume_state is not None:
-            model = bt._fresh_binary_model(config, dtype=dtype).to(device)
+            # The backup holds every weight: no backbone file is needed (or asked for).
+            model = bt.create_model(
+                model_size=config.model_size, pretrained=False, dtype=dtype
+            ).to(device)
             model.load_state_dict(resume_state["model"])
             self.use_gradual_unfreeze = bool(
                 resume_state.get("use_gradual_unfreeze", self.use_gradual_unfreeze)
@@ -391,7 +394,7 @@ class BinaryTask(TrainingTask):
                 )
             except Exception:
                 logger.warning(
-                    "Failed to load existing checkpoint, starting from pretrained",
+                    "Failed to load existing checkpoint, starting from the configured backbone",
                     exc_info=True,
                 )
                 model = bt._fresh_binary_model(config, dtype=dtype).to(device)

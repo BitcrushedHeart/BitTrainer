@@ -295,7 +295,7 @@ def test_the_settings_reach_the_trainer(tmp_path):
         tmp_path / "g", tmp_path / "ck", cache_dir=tmp_path / "c",
         embedding_dir=tmp_path / "e", size="base", bucket_size=384, epochs=3,
         batch_size=0, amp="auto", device="cuda", compile=False, stock_grn=True,
-        init="random", workers=4, sourceless=True, preflight=True,
+        workers=4, sourceless=True, preflight=True,
         backup_dir=tmp_path / "b",
     )  # fmt: skip
 
@@ -309,10 +309,6 @@ def test_the_settings_reach_the_trainer(tmp_path):
         tmp_path / "g", tmp_path / "ck", cache_dir=tmp_path / "c",
         embedding_dir=tmp_path / "e", amp="fp16", trunk="trunks/base.safetensors",
     ).backbone_init == {"source": "local_candidate", "checkpoint_path": "trunks/base.safetensors"}  # fmt: skip
-    assert proof.build_config(
-        tmp_path / "g", tmp_path / "ck", cache_dir=tmp_path / "c",
-        embedding_dir=tmp_path / "e", amp="off", init="timm",
-    ).backbone_init is None  # fmt: skip
 
 
 def test_command_line_options_reach_the_run(monkeypatch, tmp_path):
@@ -335,7 +331,6 @@ def test_command_line_options_reach_the_run(monkeypatch, tmp_path):
             "--amp", "fp16",
             "--no-compile",
             "--stock-grn",
-            "--init", "timm",
             "--workers", "2",
             "--pause-after-steps", "5",
             "--preflight",
@@ -358,7 +353,6 @@ def test_command_line_options_reach_the_run(monkeypatch, tmp_path):
         "amp": "fp16",
         "compile": False,
         "stock_grn": True,
-        "init": "timm",
         "trunk": None,
         "workers": 2,
         "pause_after_steps": 5,

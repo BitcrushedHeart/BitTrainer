@@ -298,7 +298,7 @@ def test_head_only_retraining_keeps_its_metadata_as_it_was(tmp_path):
     from bittrainer.generic.tasks.backbone_heads_task import BackboneHeadsTask
 
     request = _request(tmp_path)
-    request["backbone_init"] = {"source": "timm_pretrained"}
+    request["backbone_init"] = {"source": "random_init"}
     task = BackboneHeadsTask(request)
     task.vocab = bb._Vocab(request["records"])
 

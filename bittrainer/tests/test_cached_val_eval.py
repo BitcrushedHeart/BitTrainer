@@ -1,7 +1,7 @@
 """Head-only candidates are scored on the CACHED val features (Bitcrush ISSUE-1110).
 
-Job 1593's ``pre_loop`` pushed all 2,267 val images through the full SigLIP
-so400m model after the probe (>20 min under GPU contention, no progress frames)
+Job 1593's ``pre_loop`` pushed all 2,267 val images through the full model
+after the probe (>20 min under GPU contention, no progress frames)
 and finalisation's calibration ran a second full pass after reloading the
 1.6 GB checkpoint — although the frozen trunk's pooled vector for every val
 image was already in the embedding cache. ``model(x)`` is exactly
@@ -13,7 +13,7 @@ same RNG draws, the same metrics), that a checkpoint whose trunk differs from
 the cache's still gets the full pass, and that a head-only run no longer runs
 the trunk over the val set.
 
-CPU-only, float32, tiny random trunks; no download.
+CPU-only, float32, random-init ConvNeXt atto; no download.
 """
 
 from __future__ import annotations
@@ -38,9 +38,8 @@ from bittrainer.collate import _collate_bucket_batch, _collate_multilabel_batch
 from bittrainer.embedding_cache import EmbeddingCache
 from bittrainer.generic.evaluation import _collect_val_logits, _evaluate
 from bittrainer.group_dataset import GroupDataset, build_group_bucket_sampler
-from bittrainer.model import backbone_feature_hash, create_model
+from bittrainer.model import backbone_feature_hash, create_model, trunk_state
 from bittrainer.ordinal_threshold import install_ordinal_threshold_head
-from bittrainer.tests.siglip_fixtures import install_tiny_trunk
 
 _DEV = torch.device("cpu")
 _DT = torch.float32
@@ -61,10 +60,9 @@ def _build_group(root, per_class=(5, 4)):
                 Image.fromarray(arr).save(d / f"i{j}.png")
 
 
-def _siglip(monkeypatch, *, threshold=False, mlp=False):
-    install_tiny_trunk(monkeypatch)
+def _atto(*, threshold=False, mlp=False):
     torch.manual_seed(0)
-    model = create_model(model_size="siglip2_base", pretrained=False, num_classes=4,
+    model = create_model(model_size="atto", pretrained=False, num_classes=4,
                          head_hidden_size=16 if mlp else None)
     if threshold:
         install_ordinal_threshold_head(model, 4, 0)
@@ -119,10 +117,10 @@ def _assert_same_metrics(full: dict, cached: dict) -> None:
 
 
 @pytest.mark.parametrize("variant", ["linear", "threshold", "mlp"])
-def test_cached_eval_equals_the_full_model_eval(monkeypatch, tmp_path, variant):
+def test_cached_eval_equals_the_full_model_eval(tmp_path, variant):
     root = tmp_path / "grp"
     _build_group(root)
-    model = _siglip(monkeypatch, threshold=variant == "threshold", mlp=variant == "mlp")
+    model = _atto(threshold=variant == "threshold", mlp=variant == "mlp")
     val_ds = _val(root)
     assert len({s["bucket"] for s in val_ds.samples}) > 1, "fixture must mix buckets"
     feats = _features(model, val_ds, tmp_path)
@@ -145,10 +143,10 @@ def test_cached_eval_equals_the_full_model_eval(monkeypatch, tmp_path, variant):
     assert torch.equal(labels_c, labels_f)
 
 
-def test_cached_eval_equals_full_eval_multilabel(monkeypatch, tmp_path):
+def test_cached_eval_equals_full_eval_multilabel(tmp_path):
     root = tmp_path / "grp"
     _build_group(root)
-    model = _siglip(monkeypatch)
+    model = _atto()
     val_ds = _val(root, multi_label=True)
     feats = _features(model, val_ds, tmp_path)
     loader = _loader(val_ds, multi_label=True)
@@ -159,33 +157,18 @@ def test_cached_eval_equals_full_eval_multilabel(monkeypatch, tmp_path):
     _assert_same_metrics(full, cached)
 
 
-def test_cached_eval_equals_full_eval_convnext(tmp_path):
-    root = tmp_path / "grp"
-    _build_group(root, per_class=(2, 2))
-    torch.manual_seed(0)
-    model = create_model(model_size="atto", pretrained=False, num_classes=4).eval()
-    val_ds = _val(root)
-    feats = _features(model, val_ds, tmp_path)
-    loader = _loader(val_ds)
-    random.seed(2)
-    full = _evaluate(model, loader, 4, _DEV, _DT, ordinal=True, none_index=0)
-    random.seed(2)
-    cached = evaluate_cached(model, feats, loader, 4, _DEV, _DT, ordinal=True, none_index=0)
-    _assert_same_metrics(full, cached)
-
-
-def test_scorer_serves_a_same_trunk_checkpoint_and_refuses_another(monkeypatch, tmp_path):
+def test_scorer_serves_a_same_trunk_checkpoint_and_refuses_another(tmp_path):
     root = tmp_path / "grp"
     _build_group(root)
-    model = _siglip(monkeypatch)
+    model = _atto()
     val_ds = _val(root)
     feats = _features(model, val_ds, tmp_path)
     loader = _loader(val_ds)
     scorer = CachedValScorer(model, feats, backbone_feature_hash(model))
 
     # An incumbent with the same frozen trunk and its own head.
-    incumbent = _siglip(monkeypatch)
-    incumbent.trunk.load_state_dict(model.trunk.state_dict())
+    incumbent = _atto()
+    incumbent.load_state_dict(trunk_state(model.state_dict()), strict=False)
     with torch.no_grad():
         incumbent.head.fc.weight.normal_()
     same = scorer.model_for_state(incumbent.state_dict())
@@ -198,13 +181,13 @@ def test_scorer_serves_a_same_trunk_checkpoint_and_refuses_another(monkeypatch, 
     assert torch.equal(labels_g, labels_w)
 
     # A moved trunk is a different feature space: the scorer must refuse it.
-    other = _siglip(monkeypatch)
+    other = _atto()
     with torch.no_grad():
-        other.trunk.attn_pool.latent.add_(0.5)
+        other.stem[0].weight.add_(0.5)
     assert scorer.model_for_state(other.state_dict()) is None
     # A head of another shape (MLP vs linear) cannot be served either.
-    mlp = _siglip(monkeypatch, mlp=True)
-    mlp.trunk.load_state_dict(model.trunk.state_dict())
+    mlp = _atto(mlp=True)
+    mlp.load_state_dict(trunk_state(model.state_dict()), strict=False)
     assert scorer.model_for_state(mlp.state_dict()) is None
 
 
@@ -235,7 +218,8 @@ def test_val_inputs_check():
 def _head_only_cfg(root, ckpt_dir, embed_dir, **kw):
     return gt.GroupTrainConfig(
         group_folder=str(root), num_classes=4, class_names=_CLASSES, ordinal=True,
-        backbone_variant="siglip2_base", device="cpu", dtype="float32", use_cache=False,
+        backbone_variant="atto", backbone_init={"source": "random_init"},
+        device="cpu", dtype="float32", use_cache=False,
         checkpoint_dir=str(ckpt_dir), embedding_cache_dir=str(embed_dir),
         probe_head="linear", head_max_epochs=4, head_patience=2, train_resolution=128,
         **kw,
@@ -267,7 +251,6 @@ def test_head_only_run_scores_on_cached_features_with_same_result(monkeypatch, t
     from bittrainer.generic.generic_trainer import GenericTrainer
     from bittrainer.generic.tasks.head_only_task import HeadOnlyTask
 
-    install_tiny_trunk(monkeypatch)
     root = tmp_path / "grp"
     _build_group(root)
     calls = _count_full_passes(monkeypatch)
@@ -304,7 +287,6 @@ def test_incumbent_with_the_same_trunk_is_scored_on_cached_features(monkeypatch,
     from bittrainer.generic.generic_trainer import GenericTrainer
     from bittrainer.generic.tasks.head_only_task import HeadOnlyTask
 
-    install_tiny_trunk(monkeypatch)
     root = tmp_path / "grp"
     _build_group(root)
     ckpt_dir = tmp_path / "ck"
@@ -329,17 +311,16 @@ def test_incumbent_with_another_trunk_still_gets_a_full_pass_with_progress(monke
     from bittrainer.generic.generic_trainer import GenericTrainer
     from bittrainer.generic.tasks.head_only_task import HeadOnlyTask
 
-    install_tiny_trunk(monkeypatch)
     root = tmp_path / "grp"
     _build_group(root)
     ckpt_dir = tmp_path / "ck"
     ckpt_dir.mkdir()
-    other = create_model(model_size="siglip2_base", pretrained=False, num_classes=4)
+    other = create_model(model_size="atto", pretrained=False, num_classes=4)
     install_ordinal_threshold_head(other, 4, 0)
     with torch.no_grad():
-        other.trunk.attn_pool.latent.add_(0.5)
+        other.stem[0].weight.add_(0.5)
     torch.save({"state_dict": other.state_dict(), "num_classes": 4,
-                "model_size": "siglip2_base", "class_names": _CLASSES},
+                "model_size": "atto", "class_names": _CLASSES},
                ckpt_dir / "best.pt")
     calls = _count_full_passes(monkeypatch)
     frames: list[dict] = []

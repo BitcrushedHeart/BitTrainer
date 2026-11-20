@@ -54,6 +54,7 @@ def _cfg(root, ckpt_dir, embed_dir):
         device="cpu", dtype="float32", use_cache=False,
         checkpoint_dir=str(ckpt_dir), embedding_cache_dir=str(embed_dir),
         probe_head="linear", head_max_epochs=20, head_patience=6,
+        backbone_init={"source": "random_init"},
     )
 
 

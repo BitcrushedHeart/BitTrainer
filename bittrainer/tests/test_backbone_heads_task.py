@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 
+import pytest
 import torch
 from safetensors import safe_open
 from safetensors.torch import load_file
@@ -48,26 +49,13 @@ def _heads_request(tmp_path, source_path, *, epochs=1, max_steps=8, n=8):
     return request
 
 
-def _timm_heads_request(tmp_path, *, epochs=1, max_steps=8, n=8):
+def _random_heads_request(tmp_path, *, epochs=1, max_steps=8, n=8):
     request = _request(tmp_path, epochs=epochs, max_steps=max_steps, n=n)
-    request["run_id"] = "run_heads_timm_test"
+    request["run_id"] = "run_heads_random_test"
     request["candidate_checkpoint_path"] = str(
-        tmp_path / "candidates" / "candidate_heads_timm.safetensors"
+        tmp_path / "candidates" / "candidate_heads_random.safetensors"
     )
-    request["backbone_init"] = {
-        "source": "timm_pretrained",
-        "checkpoint_path": None,
-        "model_id": "timm/convnextv2_atto.fcmae_ft_in1k",
-    }
-    request["initialization_source"] = "timm_pretrained"
-    request["license_provenance"] = "timm/convnextv2_atto.fcmae_ft_in1k"
-    request["pretrained_model_id"] = "timm/convnextv2_atto.fcmae_ft_in1k"
-    request["pretrained_license"] = "CC-BY-NC-4.0"
-    request["pretrained_source_url"] = (
-        "https://huggingface.co/timm/convnextv2_atto.fcmae_ft_in1k"
-    )
-    request["non_commercial_only"] = True
-    request["external_pretrained_used"] = True
+    request["backbone_init"] = {"source": "random_init", "checkpoint_path": None}
     request["training_config"]["embedding_cache_dir"] = str(tmp_path / "embed")
     return request
 
@@ -118,33 +106,26 @@ def test_head_only_trains_from_cache_and_exports_convention(tmp_path):
     )
 
 
-def test_head_only_accepts_timm_pretrained_and_exports_frozen_trunk(
-    tmp_path, monkeypatch
-):
+def test_head_only_without_a_trunk_file_exports_the_frozen_model(tmp_path, monkeypatch):
+    """``random_init`` (the no-file seam): the trunk is exported from the model."""
     import bittrainer.generic.tasks.backbone_heads_task as task_module
 
     real_create_model = task_module.create_model
     created: dict[str, object] = {}
 
-    def _offline_pretrained_model(*, model_size, pretrained, num_classes):
-        # Exercise the routing contract without downloading weights in the unit suite.
-        created["pretrained"] = pretrained
-        model = real_create_model(
-            model_size=model_size,
-            pretrained=False,
-            num_classes=num_classes,
-        )
+    def _recording_model(**kwargs):
+        created["pretrained"] = kwargs["pretrained"]
+        model = real_create_model(**kwargs)
         created["state"] = {
             key: value.detach().cpu().clone()
             for key, value in model.state_dict().items()
         }
         return model
 
-    monkeypatch.setattr(task_module, "create_model", _offline_pretrained_model)
-    request = _timm_heads_request(tmp_path)
-    result = _run_heads(request)
+    monkeypatch.setattr(task_module, "create_model", _recording_model)
+    result = _run_heads(_random_heads_request(tmp_path))
 
-    assert created["pretrained"] is True
+    assert created["pretrained"] is False
     saved = load_file(result["candidate_checkpoint_path"])
     source_state = created["state"]
     backbone_keys = [key for key in saved if not key.startswith("heads.")]
@@ -155,12 +136,15 @@ def test_head_only_accepts_timm_pretrained_and_exports_frozen_trunk(
     with safe_open(result["candidate_checkpoint_path"], framework="pt") as f:
         metadata = f.metadata()
     assert metadata["head_only_retrain"] == "1"
-    assert metadata["initialization_source"] == "timm_pretrained"
-    assert metadata["pretrained_model_id"] == "timm/convnextv2_atto.fcmae_ft_in1k"
-    assert metadata["pretrained_license"] == "CC-BY-NC-4.0"
-    assert metadata["external_pretrained_used"] == "true"
-    assert metadata["non_commercial_only"] == "true"
     assert "source_backbone_checkpoint" not in metadata
+
+
+@pytest.mark.parametrize("source", [None, "timm_pretrained", "local_candidate"])
+def test_head_only_refuses_any_other_source(tmp_path, source):
+    request = _random_heads_request(tmp_path)
+    request["backbone_init"] = {"source": source} if source else None
+    with pytest.raises(RuntimeError, match="local_active"):
+        _run_heads(request)
 
 
 def test_backbone_frozen_during_head_training(tmp_path, monkeypatch):

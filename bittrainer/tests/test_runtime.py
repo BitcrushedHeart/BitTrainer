@@ -51,17 +51,10 @@ class _FakeConvNeXt(nn.Module):
         return self.stages(x)
 
 
-class _FakeMultiHead(nn.Module):
+class _FakeWrapped(nn.Module):
     def __init__(self) -> None:
         super().__init__()
         self.backbone = _FakeConvNeXt(depths=(1, 1, 3, 1))
-
-
-class _FakeDualBranch(nn.Module):
-    def __init__(self) -> None:
-        super().__init__()
-        self.crop_branch = _FakeConvNeXt(depths=(1, 1, 2, 1))
-        self.context_branch = _FakeConvNeXt(depths=(1, 1, 2, 1))
 
 
 class TestMaybeCompile:
@@ -118,14 +111,9 @@ class TestRegionalCompile:
         blocks = [m for m in model.modules() if isinstance(m, _FakeBlock)]
         assert all(b._compiled_call_impl is None for b in blocks)
 
-    def test_multihead_backbone_blocks_found(self):
-        model = _FakeMultiHead()
+    def test_wrapped_backbone_blocks_found(self):
+        model = _FakeWrapped()
         assert len(runtime._compile_targets(model)) == 6
-
-    def test_dual_branch_both_branches_found(self):
-        model = _FakeDualBranch()
-        # 5 blocks per branch (1+1+2+1), two branches.
-        assert len(runtime._compile_targets(model)) == 10
 
     def test_no_stages_yields_no_targets(self):
         assert runtime._compile_targets(_tiny_model()) == []

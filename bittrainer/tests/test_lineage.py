@@ -116,7 +116,7 @@ def test_a_converted_v1_trunk_is_a_root_with_no_steps():
 @pytest.mark.parametrize(
     ("meta", "said"),
     [
-        (_LEGACY_TIMM, "CC-BY-NC-4.0"),
+        (_LEGACY_TIMM, "no lineage"),
         ({"initialization_source": "random_init"}, "random"),
         ({}, "no lineage"),
         # A 5982d6e student: its own start was Apache, its teacher's is unknown.
@@ -171,13 +171,16 @@ def _cli(pack: Path, out: Path, *extra: str) -> list[str]:
 
 
 @pytest.mark.parametrize("init", ["timm", "random"])
-def test_a_timm_or_random_start_is_refused_with_exit_2(tmp_path, init, capsys):
+def test_a_timm_or_random_start_is_refused_with_exit_2(tmp_path, init):
     pack = _make_pack(tmp_path)
     out = tmp_path / "run"
 
-    assert runner.main(_cli(pack, out, "--init", init)) == 2
+    with pytest.raises(SystemExit) as refused:  # no longer a choice at all
+        runner.main(_cli(pack, out, "--init", init))
+    assert refused.value.code == 2
+    with pytest.raises(lineage.LineageError, match="Apache"):
+        runner.build_request(pack, out, size="atto", init=init)
 
-    assert "Apache" in capsys.readouterr().out
     assert not (out / "result.json").exists()
     assert not (out / "progress.jsonl").exists()
 

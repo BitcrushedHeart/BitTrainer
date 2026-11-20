@@ -8,7 +8,7 @@ home and on a rented GPU::
 
     python -m bittrainer.tools.backbone_proof
     python -m bittrainer.tools.backbone_proof --size base --image-size 224 \
-        --images 4000 --epochs 2 --batch-size 64 --workers 4 --init timm
+        --images 4000 --epochs 2 --batch-size 64 --workers 4
 
 The images carry signals a ConvNeXt learns quickly and that survive the
 trainer's augmentation: a three-way ``layout`` group (two halves side by side,
@@ -149,7 +149,6 @@ def build_request(
     amp: str = "auto",
     workers: int = 0,
     channels_last: bool = False,
-    init: str = "random",
     stock_grn: bool = False,
 ) -> dict:
     """The ``run_backbone_training`` request for a proof run. Every training
@@ -172,11 +171,6 @@ def build_request(
     else:
         config["use_amp"] = True
         config["amp_dtype"] = _AMP_CHOICES[amp]
-    backbone_init = (
-        {"source": "timm_pretrained"}
-        if init == "timm"
-        else {"source": "random_init", "checkpoint_path": None}
-    )
     return {
         "run_id": "backbone_proof",
         "family_name": "bitcrush_backbone",
@@ -189,9 +183,9 @@ def build_request(
         ),
         "records": records,
         "training_config": config,
-        "backbone_init": backbone_init,
+        "backbone_init": {"source": "random_init", "checkpoint_path": None},
         "license_provenance": "proof_run",
-        "external_pretrained_used": init == "timm",
+        "external_pretrained_used": False,
     }
 
 
@@ -219,7 +213,6 @@ def run_proof(
     amp: str = "auto",
     workers: int = 0,
     channels_last: bool = False,
-    init: str = "random",
     stock_grn: bool = False,
     min_score: float | None = DEFAULT_MIN_SCORE,
     seed: int = 0,
@@ -250,7 +243,6 @@ def run_proof(
         amp=amp,
         workers=workers,
         channels_last=channels_last,
-        init=init,
         stock_grn=stock_grn,
     )
 
@@ -329,7 +321,6 @@ def run_proof(
         "gpu_name": gpu_name,
         "compute_capability": capability,
         "size": size,
-        "init": init,
         "image_size": image_size,
         "batch_size": batch_size,
         "images": images,
@@ -383,7 +374,6 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="train with timm's own GRN layer (slower in half precision)",
     )
-    parser.add_argument("--init", default="random", choices=["random", "timm"])
     parser.add_argument(
         "--min-score",
         type=float,
@@ -408,7 +398,6 @@ def main(argv: list[str] | None = None) -> int:
         "amp": args.amp,
         "channels_last": args.channels_last,
         "stock_grn": args.stock_grn,
-        "init": args.init,
         "min_score": None if args.min_score < 0 else args.min_score,
         "device": None if args.device == "auto" else args.device,
         "seed": args.seed,

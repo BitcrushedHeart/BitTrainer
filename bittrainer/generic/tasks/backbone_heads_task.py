@@ -1,7 +1,7 @@
 """Backbone head-only retraining on cached pooled features.
 
 ``BackboneHeadsTask`` retrains the multi-task concept/group heads against a
-FROZEN active-local or approved timm-pretrained backbone: one embedding pass per era
+FROZEN active-local backbone: one embedding pass per era
 (memoised in :class:`~bittrainer.embedding_cache.EmbeddingCache`, namespaced by
 backbone-feature hash x preprocessing signature), then head epochs over cached
 vectors — seconds per epoch instead of a full backbone forward per image. This
@@ -12,8 +12,8 @@ Subclasses :class:`BackboneTask` so the record/vocab assembly, the per-epoch
 sampling plan (neg:pos cap, tiny-head oversample, pos_weight, label policy —
 ISSUE-0545/0546) and the selection/early-stop shape are shared; only the
 model/build/loss plumbing swaps images for vectors. The exported candidate
-keeps the 0542 convention — BARE backbone keys (byte-copied from a local source
-or exported from the frozen timm trunk) + fresh ``heads.*`` tensors — so
+keeps the 0542 convention — BARE backbone keys (byte-copied from the local
+source) + fresh ``heads.*`` tensors — so
 ``apply_backbone_init`` and every existing consumer reads it unchanged.
 
 No backup/resume (runs are minutes; always fresh) and no EMA on the heads.
@@ -99,10 +99,10 @@ class BackboneHeadsTask(BackboneTask):
                 "Backbone head-only local_active training requires "
                 "backbone_init.checkpoint_path."
             )
-        if source not in {"local_active", "timm_pretrained"}:
+        if source not in {"local_active", "random_init"}:
             raise RuntimeError(
                 "Backbone head-only training requires backbone_init.source to be "
-                "'local_active' or 'timm_pretrained'."
+                "'local_active' (or 'random_init', for a run with no trunk file)."
             )
 
     def resolve_batch_size(
@@ -123,16 +123,8 @@ class BackboneHeadsTask(BackboneTask):
 
     def create_model(self, ctx: TaskContext, resume_state: dict | None):
         spec = self.request.get("backbone_init") or {}
-        backbone = create_model(
-            model_size=self.model_size,
-            pretrained=spec.get("source") == "timm_pretrained",
-            num_classes=0,
-        )
-        loaded_local = apply_backbone_init(backbone, spec)
-        if spec.get("source") == "local_active" and not loaded_local:
-            raise RuntimeError(
-                f"Could not load the source backbone checkpoint {spec.get('checkpoint_path')!r}"
-            )
+        backbone = create_model(model_size=self.model_size, pretrained=False, num_classes=0)
+        apply_backbone_init(backbone, spec)
         backbone = backbone.to(ctx.device).eval()
         backbone.requires_grad_(False)
         self.feature_dim = backbone.num_features
@@ -326,8 +318,8 @@ class BackboneHeadsTask(BackboneTask):
 
         from safetensors.torch import load_file, save_file
 
-        # A local trunk is byte-copied from its source checkpoint. A timm trunk
-        # has no local source file, so export the frozen model state directly.
+        # A local trunk is byte-copied from its source checkpoint. A random_init
+        # trunk has no source file, so export the frozen model state directly.
         spec = self.request.get("backbone_init") or {}
         source_path = spec.get("checkpoint_path")
         if source_path:

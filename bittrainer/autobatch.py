@@ -326,7 +326,6 @@ def determine_batch_size(
     make_inputs: Callable[[int], tuple[torch.Tensor, ...]] | None = None,
     memory_format: torch.memory_format | None = None,
     progress_callback: Callable[[int, int, int, str], None] | None = None,
-    trainable_params: int | None = None,
 ) -> dict:
     """Determine the optimal batch size from data distribution and VRAM.
 
@@ -335,13 +334,8 @@ def determine_batch_size(
     batch size. Pass ``use_ema`` so the EMA shadow copy is budgeted,
     ``memory_format`` so the probe measures the same layout training uses
     (e.g. channels_last), and ``make_inputs`` to override the dummy forward
-    inputs (e.g. the dual-branch crops+context pair); the default builds a
-    single ``(batch, 3, h, w)`` tensor at the largest active bucket.
-
-    ``trainable_params`` (SigLIP only, Bitcrush ISSUE-1106) budgets the
-    optimizer state for just the parameters that will train — a partially
-    frozen SigLIP trunk never gets Prodigy state. The EMA shadow still copies
-    the whole model. ``None`` keeps the historical whole-model budget.
+    inputs; the default builds a single ``(batch, 3, h, w)`` tensor at the
+    largest active bucket.
     """
     from bittrainer.dataset import ASPECT_RATIO_BUCKETS
 
@@ -361,13 +355,7 @@ def determine_batch_size(
         bytes_per_elem = param.element_size()
     except StopIteration:
         num_params, bytes_per_elem = 0, 2
-    if trainable_params is None:
-        overhead = int((_OPT_STATE_MULT + (1.0 if use_ema else 0.0)) * num_params * bytes_per_elem)
-    else:
-        overhead = int(
-            (_OPT_STATE_MULT * int(trainable_params) + (num_params if use_ema else 0))
-            * bytes_per_elem
-        )
+    overhead = int((_OPT_STATE_MULT + (1.0 if use_ema else 0.0)) * num_params * bytes_per_elem)
 
     if make_inputs is None:
         def make_inputs(b: int) -> tuple[torch.Tensor, ...]:

@@ -42,7 +42,7 @@ import torch
 import torch.nn as nn
 from PIL import Image
 
-from bittrainer.backbone_init import apply_backbone_init, wants_timm_pretrained
+from bittrainer.backbone_init import apply_backbone_init
 from bittrainer.dataset import (
     DEFAULT_TRAIN_RESOLUTION,
     _list_split_images,
@@ -294,9 +294,7 @@ def run_resolution_probe(
         request.get("device") or ("cuda" if torch.cuda.is_available() else "cpu")
     )
     model_size = str(request.get("model_size") or "nano")
-    backbone = create_model(
-        model_size=model_size, pretrained=wants_timm_pretrained(spec), num_classes=0
-    )
+    backbone = create_model(model_size=model_size, pretrained=False, num_classes=0)
     apply_backbone_init(backbone, spec)
     backbone = backbone.to(device).eval()
     backbone_hash = backbone_feature_hash(backbone)

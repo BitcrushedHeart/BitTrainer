@@ -113,11 +113,9 @@ def make_group_folder(
     return counts
 
 
-def _backbone_init(init: str, trunk: str | None) -> dict | None:
+def _backbone_init(trunk: str | None) -> dict:
     if trunk:
         return {"source": "local_candidate", "checkpoint_path": str(trunk)}
-    if init == "timm":
-        return None  # timm's pretrained weights, the trainer's default
     return {"source": "random_init", "checkpoint_path": None}
 
 
@@ -135,7 +133,6 @@ def build_config(
     device: str = "cpu",
     compile: bool = True,
     stock_grn: bool = False,
-    init: str = "random",
     trunk: str | None = None,
     workers: int = 4,
     from_scratch: bool = False,
@@ -174,7 +171,7 @@ def build_config(
         lean_grn=not stock_grn,
         preflight=preflight,
         dataloader_workers=int(workers),
-        backbone_init=_backbone_init(init, trunk),
+        backbone_init=_backbone_init(trunk),
         from_scratch=from_scratch,
         sourceless=sourceless,
         backup_dir=str(backup_dir) if backup_dir else None,
@@ -294,7 +291,6 @@ def run_proof(
     amp: str = "auto",
     compile: bool = True,
     stock_grn: bool = False,
-    init: str = "random",
     trunk: str | None = None,
     workers: int = 4,
     pause_after_steps: int = 0,
@@ -332,7 +328,7 @@ def run_proof(
     group = home / GROUP
     settings = dict(
         size=size, bucket_size=bucket_size, epochs=epochs, batch_size=batch_size,
-        amp=amp, device=device, compile=compile, stock_grn=stock_grn, init=init,
+        amp=amp, device=device, compile=compile, stock_grn=stock_grn,
         trunk=trunk, workers=workers,
     )  # fmt: skip
     counts = make_group_folder(
@@ -603,7 +599,6 @@ def main(argv: list[str] | None = None) -> int:
         "--stock-grn", action="store_true",
         help="timm's own GRN layer instead of the lean one (fp16 cards only)",
     )  # fmt: skip
-    parser.add_argument("--init", default="random", choices=["random", "timm"])
     parser.add_argument("--trunk", default=None, help="a local trunk .safetensors to start from")
     parser.add_argument("--workers", type=int, default=4, help="DataLoader workers")
     parser.add_argument(
@@ -644,7 +639,6 @@ def main(argv: list[str] | None = None) -> int:
         "amp": args.amp,
         "compile": args.compile,
         "stock_grn": args.stock_grn,
-        "init": args.init,
         "trunk": args.trunk,
         "workers": args.workers,
         "pause_after_steps": args.pause_after_steps,

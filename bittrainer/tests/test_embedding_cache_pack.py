@@ -12,7 +12,7 @@ replaced in place — a reader holding it open on Windows cannot block a
 writer), is read fully into memory (never memory-mapped), and is ignored when
 it fails validation.
 
-CPU-only, tiny random SigLIP trunk; no download.
+CPU-only, random-init ConvNeXt atto; no download.
 """
 
 from __future__ import annotations
@@ -24,16 +24,15 @@ from PIL import Image
 
 from bittrainer.embedding_cache import EmbeddingCache, _content_hash
 from bittrainer.model import backbone_feature_hash, create_model
-from bittrainer.tests.siglip_fixtures import TINY_DIM, install_tiny_trunk
 
 _DEV = torch.device("cpu")
 _DT = torch.float32
+_DIM = 320  # atto's pooled width
 
 
 @pytest.fixture
-def model(monkeypatch):
-    install_tiny_trunk(monkeypatch)
-    return create_model(model_size="siglip2_base", pretrained=False, num_classes=3).eval()
+def model():
+    return create_model(model_size="atto", pretrained=False, num_classes=3).eval()
 
 
 def _samples(tmp_path, n=6, name="imgs"):
@@ -52,7 +51,7 @@ def _samples(tmp_path, n=6, name="imgs"):
 
 
 def _cache(root, model, *, packed):
-    return EmbeddingCache(root, backbone_feature_hash(model), TINY_DIM, packed=packed)
+    return EmbeddingCache(root, backbone_feature_hash(model), _DIM, packed=packed)
 
 
 def _packs(cache):
@@ -109,7 +108,7 @@ def test_vectors_for_aligns_rows_and_marks_missing(model, tmp_path):
     cache.ensure(samples[:4], model, None, device=_DEV, dtype=_DT)
     ask = [samples[1], samples[5], samples[1], samples[0]]
     matrix, present = cache.vectors_for(ask, None)
-    assert matrix.shape == (4, TINY_DIM) and matrix.dtype == np.float32
+    assert matrix.shape == (4, _DIM) and matrix.dtype == np.float32
     assert present.tolist() == [True, False, True, True]
     np.testing.assert_array_equal(matrix[0], matrix[2])
     np.testing.assert_array_equal(matrix[0], cache.get_vector(samples[1]["path"], None))
@@ -171,7 +170,7 @@ def test_a_pack_from_another_era_is_rejected(model, tmp_path):
     cache = _cache(tmp_path / "embed", model, packed=True)
     cache.ensure(samples, model, None, device=_DEV, dtype=_DT)
     (pack,) = _packs(cache)
-    other = EmbeddingCache(tmp_path / "embed", "0" * 16, TINY_DIM, packed=True)
+    other = EmbeddingCache(tmp_path / "embed", "0" * 16, _DIM, packed=True)
     other.root.mkdir(parents=True)
     (other.root / pack.name).write_bytes(pack.read_bytes())
     assert other._load_pack() is None
@@ -187,7 +186,7 @@ def test_get_vector_serves_the_pack(model, tmp_path, monkeypatch):
         lambda self, path: (_ for _ in ()).throw(AssertionError("per-photo read")),
     )
     fresh = _cache(tmp_path / "embed", model, packed=True)
-    assert fresh.get_vector(samples[3]["path"], None).shape == (TINY_DIM,)
+    assert fresh.get_vector(samples[3]["path"], None).shape == (_DIM,)
 
 
 def test_check_progress_reports_the_audit(model, tmp_path):

@@ -15,7 +15,7 @@ from adv_optm import Prodigy_adv
 from torch.utils.data import DataLoader
 
 from bittrainer.dataset import MAX_BINARY_NEG_POS_RATIO, ConceptDataset
-from bittrainer.backbone_init import apply_backbone_init, wants_timm_pretrained
+from bittrainer.backbone_init import apply_backbone_init
 from bittrainer.ema import ModelEMA
 from bittrainer.generic.optimizer import make_optimizer
 from bittrainer.model import create_model
@@ -67,7 +67,7 @@ class TrainConfig:
     # ISSUE-1732), as GroupTrainConfig.auto_promote does for a group.
     auto_promote: bool = False
     # Bitcrush Engine backbone spec (see bittrainer.backbone_init) — governs
-    # where fresh-model backbone weights come from. None = timm pretrained.
+    # where fresh-model backbone weights come from. None = refused.
     backbone_init: dict | None = None
     extra_positive_dirs: list[str] = field(default_factory=list)
     negative_dirs: list[str] = field(default_factory=list)
@@ -165,11 +165,7 @@ class TrainConfig:
 
 
 def _fresh_binary_model(config: "TrainConfig", *, dtype: torch.dtype) -> nn.Module:
-    model = create_model(
-        model_size=config.model_size,
-        pretrained=wants_timm_pretrained(config.backbone_init),
-        dtype=dtype,
-    )
+    model = create_model(model_size=config.model_size, pretrained=False, dtype=dtype)
     apply_backbone_init(model, config.backbone_init)
     return model
 

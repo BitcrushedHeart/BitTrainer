@@ -23,17 +23,16 @@ import bittrainer.head_probe as head_probe
 import bittrainer.probes as probes
 from bittrainer.embedding_cache import EmbeddingCache
 from bittrainer.model import backbone_feature_hash, create_model
-from bittrainer.tests.siglip_fixtures import TINY_DIM, install_tiny_trunk
 
 _DEV = torch.device("cpu")
 _DT = torch.float32
 _CLASSES = ["__none__", "low", "mid", "high"]
+_DIM = 320  # atto's pooled width
 
 
 @pytest.fixture
-def model(monkeypatch):
-    install_tiny_trunk(monkeypatch)
-    return create_model(model_size="siglip2_base", pretrained=False, num_classes=4).eval()
+def model():
+    return create_model(model_size="atto", pretrained=False, num_classes=4).eval()
 
 
 def _samples(tmp_path, n, name):
@@ -67,7 +66,7 @@ def _config(**kw):
 
 
 def _built_cache(model, tmp_path, samples, *, packed=True):
-    cache = EmbeddingCache(tmp_path / "embed", backbone_feature_hash(model), TINY_DIM,
+    cache = EmbeddingCache(tmp_path / "embed", backbone_feature_hash(model), _DIM,
                            packed=packed)
     cache.ensure(samples, model, None, device=_DEV, dtype=_DT)
     return cache
@@ -109,7 +108,7 @@ def test_sweeps_reuse_preloaded_tensors_and_results_are_unchanged(model, tmp_pat
 
     def _run(tensors):
         torch.manual_seed(7)
-        m = create_model(model_size="siglip2_base", pretrained=False, num_classes=4).eval()
+        m = create_model(model_size="atto", pretrained=False, num_classes=4).eval()
         cfg = _config()
         soft = gt._run_auto_softness_probe(
             m, cfg, cache, None, train, val, device=_DEV, none_index=none_index,
@@ -154,7 +153,7 @@ def test_no_sweep_path_uses_the_preloaded_tensors(model, tmp_path, monkeypatch):
         lambda *a, **k: (_ for _ in ()).throw(AssertionError("re-gathered")),
     )
     cfg = _config(auto_label_softness=False)
-    m = create_model(model_size="siglip2_base", pretrained=False, num_classes=4).eval()
+    m = create_model(model_size="atto", pretrained=False, num_classes=4).eval()
     result = gt._run_auto_softness_probe(
         m, cfg, cache, None, train, val, device=_DEV, none_index=0,
         cb=lambda _m: None, stop_event=None, tensors=tensors,
@@ -171,12 +170,12 @@ def test_train_head_probe_equals_the_from_tensors_path(model, tmp_path):
     cfg = _config()
 
     torch.manual_seed(3)
-    a = create_model(model_size="siglip2_base", pretrained=False, num_classes=4).eval()
+    a = create_model(model_size="atto", pretrained=False, num_classes=4).eval()
     torch.manual_seed(11)
     res_a = head_probe.train_head_probe(a, cache, None, train, val, cfg, device=_DEV,
                                         none_index=0)
     torch.manual_seed(3)
-    b = create_model(model_size="siglip2_base", pretrained=False, num_classes=4).eval()
+    b = create_model(model_size="atto", pretrained=False, num_classes=4).eval()
     tensors = head_probe.prepare_head_probe_tensors(cache, None, train, val, cfg)
     torch.manual_seed(11)
     res_b = head_probe.train_head_probe_from_tensors(b, *tensors, cfg, device=_DEV,

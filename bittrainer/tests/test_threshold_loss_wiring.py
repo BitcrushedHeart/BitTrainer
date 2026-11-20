@@ -361,7 +361,7 @@ def test_threshold_checkpoint_records_the_head(tmp_path):
     torch.manual_seed(0)
     model = create_model(model_size="atto", pretrained=False, num_classes=5)
     install_ordinal_threshold_head(model, 5, none_index=4)
-    assert gt._architecture_ckpt_meta(_config(), model) == {"ordinal_head": "threshold"}
+    assert gt._architecture_ckpt_meta(model) == {"ordinal_head": "threshold"}
     task = GroupTask(_config(tmp_path))
     task.ema = None
     task.save_candidate(
@@ -389,7 +389,7 @@ def test_finalize_result_names_the_threshold_head(tmp_path):
             "num_classes": 5,
             "model_size": "atto",
             "class_names": list(_NAMES),
-            **gt._architecture_ckpt_meta(config, model),
+            **gt._architecture_ckpt_meta(model),
         },
         candidate,
     )

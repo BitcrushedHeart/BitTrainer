@@ -1,8 +1,7 @@
 """Resumable training-state backups + pause/resume (Bitcrush ISSUE-0405).
 
 This module is the trainer-agnostic backbone of the Backup / Pause / Resume
-feature. The four training entry points (``run_group_training``,
-``run_training``, ``run_multihead_training``, ``run_dual_branch_training``) all
+feature. The training entry points (``run_group_training``, ``run_training``)
 lean on the primitives here so the per-trainer diff stays thin:
 
 * :class:`TrainingStateManager` — crash-safe rotating on-disk backups. Every

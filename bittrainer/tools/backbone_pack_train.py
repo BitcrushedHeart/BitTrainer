@@ -49,8 +49,8 @@ to the tail a day in.
 
 Every run starts from the Apache-2.0 ConvNeXt V1 weights (Bitcrush ISSUE-1721):
 ``--init apache`` (the default), or an ``--init-checkpoint`` / ``--teacher``
-that descends from them. ``--init timm`` (CC-BY-NC-4.0) and ``--init random``
-are refused, as is a trunk or teacher whose lineage does not reach them. The
+that descends from them. Any other start is refused, as is a trunk or teacher
+whose lineage does not reach them. The
 candidate records its lineage (``lineage_json``, see ``bittrainer.lineage``),
 and so does ``result.json``.
 
@@ -710,12 +710,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--init",
         default="apache",
-        choices=["timm", "apache", "random"],
-        help=(
-            "apache (the default) = ConvNeXt V1 weights (Apache-2.0) converted into a "
-            "V2 trunk. timm (the CC-BY-NC-4.0 ConvNeXt V2 weights) and random are "
-            "refused: every model descends from the Apache weights"
-        ),
+        choices=["apache"],
+        help="ConvNeXt V1 weights (Apache-2.0) converted into a V2 trunk",
     )
     parser.add_argument(
         "--v1-weights", default=None, help="with --init apache: another timm V1 weight"

@@ -174,7 +174,7 @@ def test_a_trunk_without_an_apache_root_is_refused(tmp_path):
         non_commercial_only="true",
     )
 
-    with pytest.raises(lineage.LineageError, match="CC-BY-NC-4.0"):
+    with pytest.raises(lineage.LineageError, match="no Apache ConvNeXt V1 start"):
         start_group_model(trunk_file, "g6", _CLASSES, "atto")
 
 

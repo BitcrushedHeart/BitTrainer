@@ -6,7 +6,7 @@ logit when the group has a none class — and emits K exact log-probabilities vi
 the thermometer construction, so softmax, temperature, priors, calibration and
 every Engine consumer keep the one-probability-per-class contract.
 
-CPU-only: random-init ConvNeXt atto and a tiny SigLIP trunk; no download.
+CPU-only: random-init ConvNeXt atto; no download.
 """
 
 from __future__ import annotations
@@ -31,7 +31,6 @@ from bittrainer.ordinal_threshold import (
     ordinal_threshold_loss,
     threshold_logits_from_scores,
 )
-from bittrainer.tests.siglip_fixtures import install_tiny_trunk
 
 
 def _explicit_scores(
@@ -219,19 +218,6 @@ def test_install_on_convnext_keeps_the_head_contract():
         torch.testing.assert_close(
             head_tail_logits(model, pooled_features(model, x)), out
         )
-
-
-def test_install_on_a_tiny_siglip(monkeypatch):
-    install_tiny_trunk(monkeypatch)
-    model = create_model(
-        model_size="siglip2_base", pretrained=False, num_classes=4
-    ).eval()
-    install_ordinal_threshold_head(model, 4, none_index=-1)
-    with torch.no_grad():
-        out = model(torch.randn(1, 3, 32, 32))
-    torch.testing.assert_close(
-        torch.logsumexp(out, 1), torch.zeros(1), atol=1e-5, rtol=0
-    )
 
 
 @pytest.mark.parametrize("with_names", [True, False])

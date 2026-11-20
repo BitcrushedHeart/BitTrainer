@@ -5,7 +5,7 @@ pooled_features(model, x))`` — exactly ``model(x)``. The embedding cache alrea
 holds ``pooled_features`` for every val image, computed from the same dataset
 tensors through the same ``apply_val_transform`` and autocast dtype, so a val
 pass over the cached vectors gives the full pass's logits without running the
-trunk (for SigLIP so400m at 384 px that is the whole cost of the pass).
+trunk.
 
 Only the trunk is skipped. Everything else is the full pass's own code path:
 the batches come from the val loader's OWN batch sampler (same bucket batches,

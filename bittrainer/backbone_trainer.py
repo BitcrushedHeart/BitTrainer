@@ -1686,8 +1686,7 @@ async def run_backbone_head_training(
     """Retrain the multi-task heads against a FROZEN backbone.
 
     Same request contract as :func:`run_backbone_training`, except
-    ``backbone_init`` must explicitly select either an active-local checkpoint
-    or the exact size-matched approved timm-pretrained model, and
+    ``backbone_init`` must explicitly select an active-local checkpoint, and
     ``training_config`` may carry ``embedding_cache_dir`` (default: an
     ``.embedding_cache`` dir next to the candidate) and ``head_batch_size``
     (default 256). One embedding pass per backbone era is memoised in the

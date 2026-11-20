@@ -54,7 +54,7 @@ from bittrainer.autobatch import (
     is_out_of_memory,
     vram_room,
 )
-from bittrainer.backbone_init import apply_backbone_init, wants_timm_pretrained
+from bittrainer.backbone_init import apply_backbone_init
 from bittrainer.ema import ModelEMA
 from bittrainer.generic.optimizer import (
     clip_gradients,
@@ -652,7 +652,7 @@ class BackboneTask(TrainingTask):
         spec = self.request.get("backbone_init")
         backbone = create_model(
             model_size=self.model_size,
-            pretrained=wants_timm_pretrained(spec),
+            pretrained=False,
             num_classes=0,
             drop_path_rate=self.drop_path_rate,
         )
