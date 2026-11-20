@@ -63,6 +63,9 @@ class TrainConfig:
     # best.pt's trunk carries over, head.fc starts fresh. No effect on a
     # from-scratch run or without best.pt.
     fresh_head: bool = False
+    # The new model goes live whatever the one it replaces scores (Bitcrush
+    # ISSUE-1732), as GroupTrainConfig.auto_promote does for a group.
+    auto_promote: bool = False
     # Bitcrush Engine backbone spec (see bittrainer.backbone_init) — governs
     # where fresh-model backbone weights come from. None = timm pretrained.
     backbone_init: dict | None = None
@@ -482,7 +485,7 @@ def _binary_compare_promote(
     body ends in a single call (Bitcrush ISSUE-0405)."""
     optimal_threshold = 0.5
     if best_checkpoint_path:
-        if existing_best.exists():
+        if existing_best.exists() and not getattr(config, "auto_promote", False):
             # Re-evaluate the old best.pt on the current validation set
             try:
                 old_data = torch.load(
