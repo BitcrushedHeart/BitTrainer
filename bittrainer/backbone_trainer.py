@@ -42,7 +42,14 @@ progress_callback=...)`` with a request assembled from the suite DB:
                                                      #  "reject_from_epoch": 2
                                                      #    (see _reject_share),
                                                      #  "implicit_negative_max_prior":
-                                                     #    None (see _plan_epoch_samples).
+                                                     #    None (see _plan_epoch_samples),
+                                                     #  "scaled_implied_negatives":
+                                                     #    False, with
+                                                     #    "implied_per_positive": 20,
+                                                     #    "implied_mass": 1.0 and
+                                                     #    "implied_mass_real_no_scale":
+                                                     #    20 (Bitcrush ISSUE-1753; see
+                                                     #    _plan_epoch_samples).
                             use_pos_weight,          # BCE pos_weight from the residual
                                                      # post-cap ratio, clamped to [1, 10]
                             max_positives_per_class, # per-head positive cap, default 1000;
@@ -316,6 +323,22 @@ class _ImpliedNegative(float):
     __slots__ = ()
 
 
+class _WeightedImpliedNegative(_ImpliedNegative):
+    """An implied negative that counts in the loss by ``weight`` (Bitcrush
+    ISSUE-1753): drawn many to a head under ``scaled_implied_negatives``, each
+    one weighed down so that together they carry a bounded mass."""
+
+    __slots__ = ("weight",)
+
+    def __new__(cls, value: float, weight: float = 1.0):
+        label = super().__new__(cls, value)
+        label.weight = float(weight)
+        return label
+
+    def __reduce__(self):  # loader workers pickle every batch
+        return (type(self), (float(self), self.weight))
+
+
 class _Sample:
     """One image's labels. ``held_binary`` / ``held_groups`` are the answers
     held back for validation at home (Bitcrush ISSUE-1718): never in ``binary``
@@ -491,11 +514,40 @@ def _plan_epoch_samples(
     concept whose prior is above it takes no implied negatives: unlabelled as
     negative helps rare classes and hurts common ones (Ben-Baruch et al. 2022,
     arXiv 2110.10955, who used 0.05 on OpenImages and 0.5 in a COCO example).
+
+    ``scaled_implied_negatives`` (soft mode only, off by default; Bitcrush
+    ISSUE-1753) is for the heads with few or no human no: the median head of a
+    pack has 40 yes and 0 no, and the 1:1 cap of a tiny head left a 10-yes head
+    about 10 implied negatives an epoch, so it fired on most images like its
+    own. The option draws ``implied_per_positive`` (20) implied negatives per
+    capped yes, apart from the cap (which stays on the human no, at full
+    weight), and makes each a :class:`_WeightedImpliedNegative` so that their
+    summed weight is::
+
+        implied_mass * positive_mass / (1 + human_no / implied_mass_real_no_scale)
+
+    ``positive_mass`` is the yes the epoch trains, replicas included;
+    ``human_no`` is every human no of the head in the training set. The
+    defaults, 1.0 and 20: the implied side weighs as much as the yes side,
+    which is what the head-only trainer settled on (``implied_negative_mass_
+    alpha``, Bitcrush ISSUE-0773) after implied negatives at full weight and
+    10:1 collapsed recall to about 25%, and what the 1:1 cap gave a tiny head;
+    it is now spread over twenty times as many images. At 20 human no, a
+    useful picture of a head's near misses, it halves; at 100 it is a sixth,
+    and the people's answers lead. One implied negative never weighs more than
+    a human label (1.0), so a small pool gets less than the bound. Rejection
+    and ``implicit_negative_max_prior`` work as before. The stats gain
+    ``implied_weight``, ``implied_mass`` and ``implied_mass_share`` (of the
+    head's planned loss mass).
     """
     policy = label_policy or {}
     soft = str(policy.get("mode") or "masked_unknown") == "soft_implicit_negative"
     implicit_value = _ImpliedNegative(policy.get("implicit_negative_value", 0.1))
     max_prior = policy.get("implicit_negative_max_prior")
+    scaled = soft and bool(policy.get("scaled_implied_negatives"))
+    per_positive = float(policy.get("implied_per_positive", 20.0))
+    implied_mass = float(policy.get("implied_mass", 1.0))
+    real_no_scale = float(policy.get("implied_mass_real_no_scale", 20.0))
     priors: dict[str, float] = {}
 
     eff_binary: list[dict[str, float]] = [{} for _ in samples]
@@ -552,19 +604,16 @@ def _plan_epoch_samples(
         )
         neg_selected = neg if len(neg) <= cap else rng.sample(neg, cap)
         implicit_selected: list[int] = []
-        if soft:
+        if scaled:
+            wanted = math.ceil(per_positive * len(pos))
+            if wanted > 0 and unlabelled:
+                implicit_selected = rng.sample(unlabelled, min(wanted, len(unlabelled)))
+        elif soft:
             headroom = cap - len(neg_selected)
             if headroom > 0 and unlabelled:
                 implicit_selected = rng.sample(
                     unlabelled, min(headroom, len(unlabelled))
                 )
-
-        for i in pos:
-            eff_binary[i][concept] = 1.0
-        for i in neg_selected:
-            eff_binary[i][concept] = 0.0
-        for i in implicit_selected:
-            eff_binary[i][concept] = implicit_value
 
         factor = 1
         if 0 < len(pos) < min_positive_threshold:
@@ -575,6 +624,23 @@ def _plan_epoch_samples(
                     math.ceil(min_positive_threshold / len(pos)),
                 ),
             )
+        implied_label = implicit_value
+        if scaled:
+            positive_mass = len(pos) * factor
+            fade = 1.0 + len(neg) / real_no_scale if real_no_scale > 0 else 1.0
+            bound = implied_mass * positive_mass / fade
+            weight = (
+                min(1.0, bound / len(implicit_selected)) if implicit_selected else 0.0
+            )
+            implied_label = _WeightedImpliedNegative(implicit_value, weight)
+
+        for i in pos:
+            eff_binary[i][concept] = 1.0
+        for i in neg_selected:
+            eff_binary[i][concept] = 0.0
+        for i in implicit_selected:
+            eff_binary[i][concept] = implied_label
+
         for _ in range(factor - 1):
             replicas.extend(_Sample(samples[i].path, {concept: 1.0}, {}) for i in pos)
 
@@ -587,6 +653,14 @@ def _plan_epoch_samples(
             "oversample_factor": factor,
             "prior": priors[concept],
         }
+        if scaled:
+            mass = weight * len(implicit_selected)
+            planned_mass = positive_mass + len(neg_selected) + mass
+            stats[concept].update(
+                implied_weight=weight,
+                implied_mass=mass,
+                implied_mass_share=mass / planned_mass if planned_mass else 0.0,
+            )
     vocab.priors = priors
 
     planned = [
@@ -606,6 +680,8 @@ def _head_pos_weights(
     ``neg_selected / positive_occurrences`` (occurrences count oversample
     replicas), clamped to ``[1, clamp]`` — a complement to the sampling cap,
     never a substitute. Heads with no positives or no negatives get 1.0.
+    Weighted implied negatives (``scaled_implied_negatives``) count by their
+    summed weight, ``implied_mass``, not by how many were drawn.
     """
     weights: dict[str, float] = {}
     for concept, head_stats in stats.items():
@@ -613,7 +689,7 @@ def _head_pos_weights(
             head_stats.get("oversample_factor", 1), 1
         )
         negatives = head_stats.get("neg_explicit", 0) + head_stats.get(
-            "neg_implicit", 0
+            "implied_mass", head_stats.get("neg_implicit", 0)
         )
         if occurrences <= 0 or negatives <= 0:
             weights[concept] = 1.0
@@ -953,6 +1029,7 @@ def _batch_loss(
     label_cols: list[int] = []
     label_values: list[float] = []
     label_implied: list[bool] = []
+    label_weights: list[float] = []
     for row, labels in enumerate(binary_labels):
         for concept, value in labels.items():
             column = column_of.get(concept)
@@ -962,6 +1039,8 @@ def _batch_loss(
             label_cols.append(column)
             label_values.append(value)
             label_implied.append(isinstance(value, _ImpliedNegative))
+            label_weights.append(getattr(value, "weight", 1.0))
+    head_share: torch.Tensor | None = None
     if label_rows:
         logits = nn.functional.linear(
             features, heads.binary_weight, heads.binary_bias
@@ -1003,6 +1082,20 @@ def _batch_loss(
         # Mean over each head's own labelled rows, for the heads that have any.
         counts = labelled.sum(0)
         present = counts > 0
+        if any(weight != 1.0 for weight in label_weights):
+            # Weighted implied negatives (scaled_implied_negatives) count by
+            # their weight, and a head's weights are never divided by less than
+            # one label: a head with only a few of them in the batch adds their
+            # weighted sum, not their mean, and takes that share of a head in
+            # a "mean" reduction. Their epoch total keeps the planned bound.
+            weight_grid = torch.ones_like(targets)
+            weight_grid[index] = torch.tensor(
+                label_weights, device=device, dtype=torch.float32
+            )
+            labelled = labelled * weight_grid
+            mass = labelled.sum(0)
+            counts = mass.clamp(min=1.0)
+            head_share = mass.clamp(max=1.0)[present]
         losses.append((per_label * labelled).sum(0)[present] / counts[present])
 
     group_heads = heads.groups
@@ -1032,6 +1125,10 @@ def _batch_loss(
     stacked = torch.cat(losses)
     if stacked.numel() == 0:  # every label of the batch was a rejected one
         return None
+    if reduction == "mean" and head_share is not None:
+        # The concept heads come first in ``losses``; each group counts as one.
+        heads_counted = head_share.sum() + (stacked.numel() - head_share.numel())
+        return stacked.sum() / heads_counted.clamp(min=1e-6)
     return stacked.mean() if reduction == "mean" else stacked.sum()
 
 

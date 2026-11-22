@@ -184,6 +184,7 @@ def build_request(
     hill_negatives: bool = False,
     reject_rate: float = 0.0,
     mask_common: float | None = None,
+    scaled_implied_negatives: bool = False,
     validation_split: float | None = None,
     backup_every_steps: int = 2000,
     progress_every_steps: int = 50,
@@ -248,9 +249,15 @@ def build_request(
     else:
         config["use_amp"] = True
         config["amp_dtype"] = _AMP_CHOICES[amp]
-    # The three options act on unlabelled images taken as negatives, so asking
-    # for any of them turns those on (see label_policy in backbone_trainer).
-    if soft_negatives or hill_negatives or reject_rate or mask_common is not None:
+    # The options act on unlabelled images taken as negatives, so asking for
+    # any of them turns those on (see label_policy in backbone_trainer).
+    if (
+        soft_negatives
+        or hill_negatives
+        or reject_rate
+        or mask_common is not None
+        or scaled_implied_negatives
+    ):
         config["label_policy"] = {
             "mode": "soft_implicit_negative",
             "implicit_negative_value": 0.1,
@@ -261,6 +268,8 @@ def build_request(
             config["label_policy"]["reject_rate"] = float(reject_rate)
         if mask_common is not None:
             config["label_policy"]["implicit_negative_max_prior"] = float(mask_common)
+        if scaled_implied_negatives:
+            config["label_policy"]["scaled_implied_negatives"] = True
     if validation_split is not None:
         config["validation_split"] = float(validation_split)
     if max_steps is not None:
@@ -762,6 +771,15 @@ def main(argv: list[str] | None = None) -> int:
             "on more than this share of the training images takes none (try 0.05)"
         ),
     )
+    parser.add_argument(
+        "--scaled-implied-negatives",
+        action="store_true",
+        help=(
+            "soft negatives, about 20 per yes and drawn afresh each epoch, each "
+            "weighed down so together they weigh as much as the yes; less as a "
+            "head's human no answers grow"
+        ),
+    )
     parser.add_argument("--validation-split", type=float, default=None)
     parser.add_argument(
         "--backup-every", type=int, default=2000, help="steps between backups"
@@ -823,6 +841,7 @@ def main(argv: list[str] | None = None) -> int:
         hill_negatives=args.hill_negatives,
         reject_rate=args.reject_rate,
         mask_common=args.mask_common,
+        scaled_implied_negatives=args.scaled_implied_negatives,
         validation_split=args.validation_split,
         backup_every_steps=args.backup_every,
         progress_every_steps=args.progress_every,
